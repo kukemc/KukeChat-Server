@@ -1,0 +1,27 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      # 上传文件与 SQLite 数据库都是运行数据，必须持久化
+      - ./uploads:/app/uploads
+      - ./data:/app/data
+    restart: unless-stopped
+    depends_on:
+      - redis
+
+  # 单进程部署可以不用 Redis；多 worker / 多实例时必须启用，
+  # 否则 WebSocket 消息无法跨进程广播。
+  # 启用后在 .env 里设置 REDIS_URL=redis://redis:6379/0
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+
+volumes:
+  redis-data:

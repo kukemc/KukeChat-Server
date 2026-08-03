@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: 测试与启动检查
+    runs-on: ubuntu-latest
+
+    env:
+      # CI 用临时密钥，仓库不含任何真实密钥
+      JWT_SECRET_KEY: ci-only-not-a-real-secret-0123456789abcdef
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest
+
+      - name: 运行测试
+        run: python -m pytest tests/ -q
+
+      - name: 应用能否加载
+        run: python -c "from app.main import app; print('endpoints:', len(app.openapi()['paths']))"
+
+      - name: 缺少 JWT_SECRET_KEY 时必须拒绝启动
+        run: |
+          if JWT_SECRET_KEY="" python -c "from app.main import app" 2>/dev/null; then
+            echo "::error::空的 JWT_SECRET_KEY 没有被拒绝"
+            exit 1
+          fi
+          echo "OK：弱密钥被正确拒绝"
+
+  docker:
+    name: 镜像构建
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false

@@ -1,0 +1,123 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+
+UTC = timezone.utc
+
+from sqlalchemy import DateTime, Enum as SAEnum, Float, ForeignKey, Integer, String, Text
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from app.core.database import Base
+from app.models.enums import ModerationAction, ModerationSource, PasswordResetStatus, ReportStatus, ReportTargetType
+
+
+def utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+class UserReport(Base):
+    __tablename__ = "user_reports"
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    reporter_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    target_type: Mapped[ReportTargetType] = mapped_column(SAEnum(ReportTargetType, native_enum=False), index=True)
+    target_id: Mapped[int] = mapped_column(Integer, index=True)
+    conversation_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    message_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    reported_user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    reason: Mapped[str] = mapped_column(String(120))
+    details: Mapped[str | None] = mapped_column(Text, nullable=True)
+    attachments: Mapped[str | None] = mapped_column(Text, nullable=True)
+    target_snapshot: Mapped[str | None] = mapped_column(Text, nullable=True)
+    evidence_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    status: Mapped[ReportStatus] = mapped_column(
+        SAEnum(ReportStatus, native_enum=False), default=ReportStatus.PENDING, server_default="PENDING", index=True
+    )
+    reviewer_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    review_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    action: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    reporter: Mapped["User"] = relationship(back_populates="submitted_reports", foreign_keys=[reporter_id])
+    reviewer: Mapped["User | None"] = relationship(back_populates="reviewed_reports", foreign_keys=[reviewer_id])
+
+
+class AdminAuditLog(Base):
+    __tablename__ = "admin_audit_logs"
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    actor_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    action: Mapped[str] = mapped_column(String(80), index=True)
+    target_type: Mapped[str | None] = mapped_column(String(40), nullable=True, index=True)
+    target_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    details: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+
+    actor: Mapped["User | None"] = relationship(foreign_keys=[actor_id])
+
+
+class ContentModerationRecord(Base):
+    __tablename__ = "content_moderation_records"
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    source: Mapped[ModerationSource] = mapped_column(SAEnum(ModerationSource, native_enum=False), index=True)
+    message_id: Mapped[int | None] = mapped_column(ForeignKey("messages.id", ondelete="SET NULL"), nullable=True, index=True)
+    post_id: Mapped[int | None] = mapped_column(ForeignKey("posts.id", ondelete="SET NULL"), nullable=True, index=True)
+    post_topic_id: Mapped[int | None] = mapped_column(ForeignKey("post_topics.id", ondelete="SET NULL"), nullable=True, index=True)
+    post_comment_id: Mapped[int | None] = mapped_column(ForeignKey("post_comments.id", ondelete="SET NULL"), nullable=True, index=True)
+    teamup_profile_id: Mapped[int | None] = mapped_column(ForeignKey("teamup_profiles.id", ondelete="SET NULL"), nullable=True, index=True)
+    teamup_comment_id: Mapped[int | None] = mapped_column(ForeignKey("teamup_comments.id", ondelete="SET NULL"), nullable=True, index=True)
+    profile_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    report_id: Mapped[int | None] = mapped_column(ForeignKey("user_reports.id", ondelete="SET NULL"), nullable=True, index=True)
+    conversation_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    content_type: Mapped[str] = mapped_column(String(20), index=True)
+    content_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    content_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    decision: Mapped[str] = mapped_column(String(20), index=True)
+    severity: Mapped[int] = mapped_column(Integer, default=0, server_default="0", index=True)
+    categories: Mapped[str | None] = mapped_column(Text, nullable=True)
+    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    raw_response: Mapped[str | None] = mapped_column(Text, nullable=True)
+    evidence_snapshot: Mapped[str | None] = mapped_column(Text, nullable=True)
+    evidence_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    action_taken: Mapped[ModerationAction] = mapped_column(
+        SAEnum(ModerationAction, native_enum=False), default=ModerationAction.NONE, server_default="NONE", index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+    acted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    message: Mapped["Message | None"] = relationship(foreign_keys=[message_id])
+    post: Mapped["Post | None"] = relationship(foreign_keys=[post_id])
+    post_topic: Mapped["PostTopic | None"] = relationship(foreign_keys=[post_topic_id])
+    post_comment: Mapped["PostComment | None"] = relationship(foreign_keys=[post_comment_id])
+    teamup_profile: Mapped["TeamupProfile | None"] = relationship(foreign_keys=[teamup_profile_id])
+    teamup_comment: Mapped["TeamupComment | None"] = relationship(foreign_keys=[teamup_comment_id])
+    profile_user: Mapped["User | None"] = relationship(foreign_keys=[profile_user_id])
+    report: Mapped["UserReport | None"] = relationship(foreign_keys=[report_id])
+    user: Mapped["User | None"] = relationship(foreign_keys=[user_id])
+
+
+class PasswordResetRequest(Base):
+    __tablename__ = "password_reset_requests"
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    username: Mapped[str] = mapped_column(String(50), index=True)
+    account_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    ccw_profile_url: Mapped[str] = mapped_column(String(500))
+    reason: Mapped[str] = mapped_column(Text)
+    requested_password: Mapped[str] = mapped_column(String(128))
+    request_ip: Mapped[str] = mapped_column(String(45), index=True)
+    account_registration_ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
+    status: Mapped[PasswordResetStatus] = mapped_column(
+        SAEnum(PasswordResetStatus, native_enum=False), default=PasswordResetStatus.PENDING, server_default="PENDING", index=True
+    )
+    reviewer_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    review_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    account_user: Mapped["User | None"] = relationship(foreign_keys=[account_user_id])
+    reviewer: Mapped["User | None"] = relationship(foreign_keys=[reviewer_id])

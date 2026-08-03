@@ -1,0 +1,31 @@
+# 环境变量与密钥
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# 运行数据 —— 不要入库，也不要在部署时覆盖
+*.db
+*.sqlite
+*.sqlite3
+uploads/
+
+# 日志与编辑器状态
+*.log
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

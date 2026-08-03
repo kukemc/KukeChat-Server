@@ -1,0 +1,1398 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import re
+from datetime import datetime, timedelta, timezone
+from pathlib import PurePosixPath
+from typing import Any
+
+UTC = timezone.utc
+
+from fastapi import HTTPException, status
+from sqlalchemy import and_, delete, func, or_, select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import joinedload
+
+from app.core.emoji import validate_reaction_emoji
+from app.models.conversation import Conversation, ConversationMember
+from app.models.enums import ConversationType, MemberRole, MessageType
+from app.models.message import FeaturedMessage, MentionAllUsage, Message, MessageBookmark, MessageReaction, MessageVisibility
+from app.models.report import UserReport
+from app.models.sticker import StickerAsset
+from app.models.user import User
+from app.schemas.message import FeaturedMessageRead, MessageRead, MessageReactionSummary, ReadReceipt
+from app.schemas.user import UserPublic
+from app.services.conversations import clear_expired_member_mute, require_membership
+from app.services import group_activity as group_activity_service
+from app.services.ccw import enrich_metadata_with_previews
+from app.services.storage import delete_objects, storage_key_from_url, thumbnail_key_for_key
+from app.services.upload_paths import require_message_image_upload_url, require_message_or_sticker_image_url, require_message_upload_url
+
+
+STAFF_ROLES = {MemberRole.OWNER, MemberRole.ADMIN}
+MENTION_ALL_DAILY_LIMIT = 20
+MAX_MESSAGE_CONTENT_LENGTH = 2000
+MAX_BOT_MESSAGE_CONTENT_LENGTH = 8000
+MESSAGE_RATE_LIMIT_PER_MINUTE = 20
+MAX_MESSAGES_PER_CONVERSATION = 1000
+PRUNE_CHECK_INTERVAL = 25
+MESSAGE_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+MESSAGE_AUDIO_SUFFIXES = {".webm", ".ogg", ".mp3", ".m4a", ".aac", ".wav"}
+MESSAGE_UPLOAD_SUFFIXES = MESSAGE_IMAGE_SUFFIXES | MESSAGE_AUDIO_SUFFIXES
+
+
+async def _enforce_message_rate_limit(
+    db: AsyncSession,
+    sender: User,
+    now: datetime,
+    conversation_id: int | None = None,
+) -> None:
+    rate_limit_cutoff = now - timedelta(minutes=1)
+    conditions = [
+        Message.sender_id == sender.id,
+        Message.type != MessageType.SYSTEM,
+        Message.created_at >= rate_limit_cutoff,
+    ]
+    if conversation_id is not None:
+        conditions.append(Message.conversation_id == conversation_id)
+    recent_count_result = await db.execute(select(func.count(Message.id)).where(*conditions))
+    recent_count = int(recent_count_result.scalar_one() or 0)
+    if recent_count >= MESSAGE_RATE_LIMIT_PER_MINUTE:
+        detail = (
+            "Bot can send at most 20 messages per minute in this conversation"
+            if sender.is_bot and conversation_id is not None
+            else "You can send at most 20 messages per minute"
+        )
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=detail)
+
+
+def _normalize_emoji(emoji: str) -> str:
+    normalized = emoji.strip()
+    if not normalized:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Emoji is required")
+    if len(normalized) > 32:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Emoji is too long")
+    validate_reaction_emoji(normalized)
+    return normalized
+
+
+
+
+def _metadata_to_json(metadata: dict[str, Any] | None) -> str | None:
+    if metadata is None:
+        return None
+    return json.dumps(metadata, ensure_ascii=False, separators=(",", ":"))
+
+
+def _metadata_from_json(metadata_json: str | None) -> dict[str, Any] | None:
+    if not metadata_json:
+        return None
+    try:
+        metadata = json.loads(metadata_json)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return metadata if isinstance(metadata, dict) else None
+
+
+def _message_upload_path(value: str) -> str | None:
+    return require_message_upload_url(value)
+
+
+def _metadata_image_urls(metadata: dict[str, Any] | None) -> list[str]:
+    if not isinstance(metadata, dict):
+        return []
+    raw_images = metadata.get("images")
+    if not isinstance(raw_images, list):
+        return []
+    return [item.strip() for item in raw_images if isinstance(item, str) and item.strip()]
+
+
+def _upload_paths_from_value(value: Any) -> set[str]:
+    paths: set[str] = set()
+    if isinstance(value, str):
+        path = _message_upload_path(value)
+        if path is not None:
+            paths.add(path)
+        return paths
+    if isinstance(value, list):
+        for item in value:
+            paths.update(_upload_paths_from_value(item))
+        return paths
+    if isinstance(value, dict):
+        for item in value.values():
+            paths.update(_upload_paths_from_value(item))
+    return paths
+
+
+def _message_upload_paths(message: Message) -> set[str]:
+    paths: set[str] = set()
+    if message.type in {MessageType.IMAGE, MessageType.VOICE}:
+        path = _message_upload_path(message.content)
+        if path is not None:
+            paths.add(path)
+
+    metadata = _metadata_from_json(message.metadata_json)
+    if metadata is not None:
+        paths.update(_upload_paths_from_value(metadata))
+    return paths
+
+
+async def _upload_path_still_referenced(db: AsyncSession, relative_path: str) -> bool:
+    path_fragment = f"%{relative_path}%"
+    message_result = await db.execute(
+        select(Message.id)
+        .where(or_(Message.content.like(path_fragment), Message.metadata_json.like(path_fragment)))
+        .limit(1)
+    )
+    if message_result.scalar_one_or_none() is not None:
+        return True
+
+    report_result = await db.execute(
+        select(UserReport.id)
+        .where(or_(UserReport.attachments.like(path_fragment), UserReport.target_snapshot.like(path_fragment)))
+        .limit(1)
+    )
+    if report_result.scalar_one_or_none() is not None:
+        return True
+
+    sticker_result = await db.execute(
+        select(StickerAsset.id)
+        .where(or_(StickerAsset.source_path == relative_path, StickerAsset.storage_path == relative_path))
+        .limit(1)
+    )
+    return sticker_result.scalar_one_or_none() is not None
+
+
+async def _prune_conversation_messages(db: AsyncSession, conversation_id: int) -> list[str]:
+    newest_result = await db.execute(
+        select(Message.id)
+        .where(Message.conversation_id == conversation_id)
+        .order_by(Message.id.desc())
+        .limit(1)
+    )
+    newest_id = newest_result.scalar_one_or_none()
+    if newest_id is None or newest_id % PRUNE_CHECK_INTERVAL != 0:
+        return []
+
+    cutoff_result = await db.execute(
+        select(Message.id)
+        .where(Message.conversation_id == conversation_id)
+        .order_by(Message.id.desc())
+        .offset(MAX_MESSAGES_PER_CONVERSATION)
+        .limit(1)
+    )
+    cutoff_id = cutoff_result.scalar_one_or_none()
+    if cutoff_id is None:
+        return []
+
+    prune_result = await db.execute(
+        select(Message)
+        .where(Message.conversation_id == conversation_id, Message.id <= cutoff_id)
+        .order_by(Message.id.asc())
+    )
+    pruned_messages = list(prune_result.scalars().all())
+    if not pruned_messages:
+        return []
+
+    candidate_paths: set[str] = set()
+    for message in pruned_messages:
+        candidate_paths.update(_message_upload_paths(message))
+        await db.delete(message)
+    await db.flush()
+
+    keys_to_delete: list[str] = []
+    for relative_path in candidate_paths:
+        if await _upload_path_still_referenced(db, relative_path):
+            continue
+        keys_to_delete.append(relative_path)
+        if PurePosixPath(relative_path).suffix.lower() in MESSAGE_IMAGE_SUFFIXES:
+            keys_to_delete.append(thumbnail_key_for_key(relative_path))
+    return keys_to_delete
+
+
+def _delete_upload_files(paths: list[str]) -> None:
+    delete_objects(paths)
+
+
+def schedule_delete_upload_files(paths: list[str]) -> None:
+    if not paths:
+        return
+    asyncio.create_task(asyncio.to_thread(_delete_upload_files, paths))
+
+
+def _value_mentions_all(value: Any) -> bool:
+    if value == "all":
+        return True
+    if isinstance(value, dict):
+        if value.get("all") is True or value.get("mention_all") is True or value.get("mentionAll") is True:
+            return True
+        if value.get("user_id") == "all" or value.get("id") == "all" or value.get("type") == "all":
+            return True
+        return any(_value_mentions_all(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_value_mentions_all(item) for item in value)
+    return False
+
+
+def _metadata_mentions_all(metadata: dict[str, Any] | None) -> bool:
+    if not isinstance(metadata, dict):
+        return False
+    return metadata.get("mention_all") is True or metadata.get("mentionAll") is True or _value_mentions_all(metadata.get("mentions"))
+
+
+async def _enforce_mention_all_limit(
+    db: AsyncSession,
+    conversation: Conversation,
+    membership: ConversationMember,
+    sender_id: int,
+    metadata: dict[str, Any] | None,
+) -> None:
+    if not _metadata_mentions_all(metadata):
+        return
+    if conversation.type != ConversationType.GROUP:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="@all can only be used in group conversations")
+    if membership.role not in STAFF_ROLES:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only group owners or admins can @all")
+
+    today = datetime.now(UTC).date()
+    result = await db.execute(
+        select(MentionAllUsage).where(MentionAllUsage.user_id == sender_id, MentionAllUsage.usage_date == today)
+    )
+    usage = result.scalar_one_or_none()
+    if usage is not None and usage.count >= MENTION_ALL_DAILY_LIMIT:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="@all daily limit exceeded")
+    if usage is None:
+        db.add(MentionAllUsage(user_id=sender_id, usage_date=today, count=1))
+    else:
+        usage.count += 1
+        usage.updated_at = datetime.now(UTC)
+
+
+def _display_name(user: User) -> str:
+    return user.nickname or user.username
+
+
+def _clean_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    text = value.strip()
+    return text or None
+
+
+async def _message_sender_display_names(
+    db: AsyncSession,
+    messages: list[Message],
+) -> dict[int, str]:
+    if not messages:
+        return {}
+
+    pairs = {(message.conversation_id, message.sender_id) for message in messages}
+    if not pairs:
+        return {}
+
+    conditions = [
+        and_(
+            ConversationMember.conversation_id == conversation_id,
+            ConversationMember.user_id == sender_id,
+        )
+        for conversation_id, sender_id in pairs
+    ]
+    result = await db.execute(
+        select(ConversationMember)
+        .options(joinedload(ConversationMember.user))
+        .where(or_(*conditions))
+    )
+    members = {
+        (member.conversation_id, member.user_id): member
+        for member in result.scalars().all()
+    }
+    names: dict[int, str] = {}
+    for message in messages:
+        member = members.get((message.conversation_id, message.sender_id))
+        if member is not None and member.nickname:
+            names[message.id] = member.nickname
+        elif message.sender is not None:
+            names[message.id] = _display_name(message.sender)
+    return names
+
+
+async def _message_sender_titles(
+    db: AsyncSession,
+    messages: list[Message],
+) -> dict[int, str]:
+    if not messages:
+        return {}
+    pairs = {(message.conversation_id, message.sender_id) for message in messages}
+    if not pairs:
+        return {}
+    conditions = [
+        and_(
+            ConversationMember.conversation_id == conversation_id,
+            ConversationMember.user_id == sender_id,
+        )
+        for conversation_id, sender_id in pairs
+    ]
+    result = await db.execute(select(ConversationMember).where(or_(*conditions)))
+    members = {(member.conversation_id, member.user_id): member for member in result.scalars().all()}
+    titles: dict[int, str] = {}
+    for message in messages:
+        title = _clean_text(members.get((message.conversation_id, message.sender_id)).title if members.get((message.conversation_id, message.sender_id)) is not None else None)
+        if title:
+            titles[message.id] = title
+    return titles
+
+
+def _message_read_from_orm(
+    message: Message,
+    reactions: list[MessageReactionSummary],
+    sender_display_name: str | None = None,
+    sender_title: str | None = None,
+    sender_level: int | None = None,
+    bookmarked_by_me: bool = False,
+    featured: bool = False,
+) -> MessageRead:
+    return MessageRead(
+        id=message.id,
+        conversation_id=message.conversation_id,
+        sender_id=message.sender_id,
+        sender=UserPublic.model_validate(message.sender),
+        sender_display_name=sender_display_name,
+        sender_title=sender_title,
+        sender_level=sender_level,
+        type=message.type,
+        content=message.content,
+        metadata=_metadata_from_json(message.metadata_json),
+        created_at=message.created_at,
+        recalled_at=message.recalled_at,
+        recalled_by_id=message.recalled_by_id,
+        reactions=reactions,
+        bookmarked_by_me=bookmarked_by_me,
+        featured=featured,
+    )
+
+
+async def build_reaction_summaries_by_message(
+    db: AsyncSession,
+    message_ids: list[int],
+    current_user_id: int,
+) -> dict[int, list[MessageReactionSummary]]:
+    if not message_ids:
+        return {}
+
+    result = await db.execute(
+        select(MessageReaction)
+        .options(joinedload(MessageReaction.user))
+        .where(MessageReaction.message_id.in_(message_ids))
+        .order_by(MessageReaction.message_id.asc(), MessageReaction.created_at.asc(), MessageReaction.id.asc())
+    )
+
+    grouped: dict[int, dict[str, list[MessageReaction]]] = {message_id: {} for message_id in message_ids}
+    for reaction in result.scalars().all():
+        grouped.setdefault(reaction.message_id, {}).setdefault(reaction.emoji, []).append(reaction)
+
+    summaries: dict[int, list[MessageReactionSummary]] = {}
+    for message_id in message_ids:
+        emoji_groups = grouped.get(message_id, {})
+        summaries[message_id] = [
+            MessageReactionSummary(
+                emoji=emoji,
+                count=len(reactions),
+                reacted_by_me=any(reaction.user_id == current_user_id for reaction in reactions),
+                users=[UserPublic.model_validate(reaction.user) for reaction in reactions if reaction.user is not None],
+            )
+            for emoji, reactions in sorted(emoji_groups.items(), key=lambda item: (-len(item[1]), item[0]))
+        ]
+    return summaries
+
+
+async def build_bookmark_flags_by_message(db: AsyncSession, message_ids: list[int], current_user_id: int) -> set[int]:
+    if not message_ids:
+        return set()
+    result = await db.execute(
+        select(MessageBookmark.message_id).where(
+            MessageBookmark.message_id.in_(message_ids),
+            MessageBookmark.user_id == current_user_id,
+        )
+    )
+    return set(result.scalars().all())
+
+
+async def build_featured_flags_by_message(db: AsyncSession, message_ids: list[int]) -> set[int]:
+    if not message_ids:
+        return set()
+    result = await db.execute(select(FeaturedMessage.message_id).where(FeaturedMessage.message_id.in_(message_ids)))
+    return set(result.scalars().all())
+
+
+async def build_message_read(db: AsyncSession, message: Message, current_user_id: int) -> MessageRead:
+    reads = await build_message_reads(db, [message], current_user_id)
+    return reads[0]
+
+
+def build_new_message_read(message: Message, current_user_id: int) -> MessageRead:
+    sender_name = _clean_text(getattr(message, "_sender_display_name", None))
+    if sender_name is None and message.sender is not None:
+        sender_name = _display_name(message.sender)
+    sender_title = _clean_text(getattr(message, "_sender_title", None))
+    sender_level = getattr(message, "_sender_level", None)
+    return _message_read_from_orm(
+        message,
+        reactions=[],
+        sender_display_name=sender_name,
+        sender_title=sender_title,
+        sender_level=sender_level if isinstance(sender_level, int) else None,
+        bookmarked_by_me=False,
+        featured=False,
+    )
+
+
+async def build_message_reads(db: AsyncSession, messages: list[Message], current_user_id: int) -> list[MessageRead]:
+    message_ids = [message.id for message in messages]
+    summaries = await build_reaction_summaries_by_message(db, message_ids, current_user_id)
+    bookmarked_ids = await build_bookmark_flags_by_message(db, message_ids, current_user_id)
+    featured_ids = await build_featured_flags_by_message(db, message_ids)
+    sender_display_names = await _message_sender_display_names(db, messages)
+    sender_titles = await _message_sender_titles(db, messages)
+    sender_levels = await _message_sender_levels(db, messages)
+    return [
+        _message_read_from_orm(
+            message,
+            summaries.get(message.id, []),
+            sender_display_names.get(message.id),
+            sender_titles.get(message.id),
+            sender_levels.get(message.id),
+            message.id in bookmarked_ids,
+            message.id in featured_ids,
+        )
+        for message in messages
+    ]
+
+
+async def _message_sender_levels(
+    db: AsyncSession,
+    messages: list[Message],
+) -> dict[int, int]:
+    if not messages:
+        return {}
+    conversation_ids = {message.conversation_id for message in messages}
+    conversation_result = await db.execute(
+        select(Conversation.id).where(
+            Conversation.id.in_(conversation_ids),
+            Conversation.type == ConversationType.GROUP,
+        )
+    )
+    group_conversation_ids = set(conversation_result.scalars().all())
+    pairs = {(message.conversation_id, message.sender_id) for message in messages if message.conversation_id in group_conversation_ids}
+    if not pairs:
+        return {}
+    conditions = [
+        and_(
+            ConversationMember.conversation_id == conversation_id,
+            ConversationMember.user_id == sender_id,
+        )
+        for conversation_id, sender_id in pairs
+    ]
+    result = await db.execute(select(ConversationMember).where(or_(*conditions)))
+    members = {(member.conversation_id, member.user_id): member for member in result.scalars().all()}
+    levels: dict[int, int] = {}
+    for message in messages:
+        member = members.get((message.conversation_id, message.sender_id))
+        if member is not None:
+            levels[message.id] = member.level
+    return levels
+
+
+async def get_message_reaction_summaries(
+    db: AsyncSession,
+    message_id: int,
+    current_user_id: int,
+) -> list[MessageReactionSummary]:
+    summaries = await build_reaction_summaries_by_message(db, [message_id], current_user_id)
+    return summaries.get(message_id, [])
+
+
+async def send_message(
+    db: AsyncSession,
+    conversation_id: int,
+    sender: User,
+    content: str,
+    message_type: MessageType = MessageType.TEXT,
+    metadata: dict[str, Any] | None = None,
+) -> Message:
+    max_content_length = MAX_BOT_MESSAGE_CONTENT_LENGTH if sender.is_bot else MAX_MESSAGE_CONTENT_LENGTH
+    if len(content) > max_content_length:
+        detail = (
+            "Bot message content must not exceed 8000 characters"
+            if sender.is_bot
+            else "Message content must not exceed 2000 characters"
+        )
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=detail)
+    if message_type == MessageType.IMAGE:
+        if isinstance(metadata, dict) and metadata.get("sticker") is True:
+            require_message_or_sticker_image_url(content, detail="Sticker message must reference an uploaded image or sticker file")
+        else:
+            require_message_image_upload_url(content, detail="Image message must reference an uploaded image file")
+    if message_type == MessageType.VOICE and _message_upload_path(content) is None:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Voice message must reference an uploaded voice file")
+    for image_url in _metadata_image_urls(metadata):
+        require_message_image_upload_url(image_url, detail="Message images must reference uploaded image files")
+
+    now = datetime.now(UTC)
+    await _enforce_message_rate_limit(db, sender, now, conversation_id if sender.is_bot else None)
+
+    membership = await require_membership(db, conversation_id, sender.id)
+    conversation = await db.get(Conversation, conversation_id)
+    if conversation is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
+    if conversation.type == ConversationType.GROUP and membership.role not in STAFF_ROLES:
+        if conversation.all_muted:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="This group is muted")
+        if membership.muted:
+            if not await clear_expired_member_mute(db, membership, now):
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Muted members cannot send messages")
+        if conversation.message_rate_limit_per_minute > 0:
+            group_rate_cutoff = now - timedelta(minutes=1)
+            group_rate_result = await db.execute(
+                select(func.count(Message.id)).where(
+                    Message.conversation_id == conversation_id,
+                    Message.sender_id == sender.id,
+                    Message.recalled_at.is_(None),
+                    Message.type != MessageType.SYSTEM,
+                    Message.created_at >= group_rate_cutoff,
+                )
+            )
+            group_recent_count = int(group_rate_result.scalar_one() or 0)
+            if group_recent_count >= conversation.message_rate_limit_per_minute:
+                raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Group message rate limit is enabled")
+
+    await _enforce_mention_all_limit(db, conversation, membership, sender.id, metadata)
+    if message_type == MessageType.TEXT:
+        metadata = await enrich_metadata_with_previews(content, metadata)
+
+    message = Message(
+        conversation_id=conversation_id,
+        sender_id=sender.id,
+        type=message_type,
+        content=content,
+        metadata_json=_metadata_to_json(metadata),
+    )
+    db.add(message)
+    await db.flush()
+    message.sender = sender
+    setattr(message, "_sender_display_name", membership.nickname)
+    setattr(message, "_sender_title", membership.title)
+    previous_level = membership.level
+    current_level = membership.level
+    if conversation.type == ConversationType.GROUP and message_type != MessageType.SYSTEM:
+        previous_level, current_level = await group_activity_service.record_message_activity(db, conversation_id, membership, message)
+        setattr(message, "_sender_level", membership.level)
+        setattr(message, "_sender_level_exp", membership.level_exp)
+    setattr(message, "_level_previous", previous_level)
+    setattr(message, "_level_current", current_level)
+    conversation.updated_at = now
+    membership.last_read_message_id = message.id
+    membership.last_read_at = now
+    files_to_delete = await _prune_conversation_messages(db, conversation_id)
+    await db.commit()
+    schedule_delete_upload_files(files_to_delete)
+    return message
+
+
+async def create_system_message(
+    db: AsyncSession,
+    conversation_id: int,
+    sender: User | int,
+    content: str,
+    metadata: dict[str, Any] | None = None,
+) -> Message:
+    conversation = await db.get(Conversation, conversation_id)
+    if conversation is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
+
+    sender_id = sender.id if isinstance(sender, User) else int(sender)
+    now = datetime.now(UTC)
+    message = Message(
+        conversation_id=conversation_id,
+        sender_id=sender_id,
+        type=MessageType.SYSTEM,
+        content=content,
+        metadata_json=_metadata_to_json(metadata),
+    )
+    db.add(message)
+    await db.flush()
+    if isinstance(sender, User):
+        message.sender = sender
+
+    conversation.updated_at = now
+    membership_result = await db.execute(
+        select(ConversationMember).where(
+            ConversationMember.conversation_id == conversation_id,
+            ConversationMember.user_id == sender_id,
+        )
+    )
+    membership = membership_result.scalar_one_or_none()
+    if membership is not None:
+        membership.last_read_message_id = message.id
+        membership.last_read_at = now
+
+    files_to_delete = await _prune_conversation_messages(db, conversation_id)
+    await db.commit()
+    schedule_delete_upload_files(files_to_delete)
+    return message
+
+
+async def recall_message(db: AsyncSession, conversation_id: int, actor_id: int, message_id: int) -> Message:
+    actor = await require_membership(db, conversation_id, actor_id)
+    conversation = await db.get(Conversation, conversation_id)
+    if conversation is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
+
+    result = await db.execute(
+        select(Message)
+        .options(joinedload(Message.sender))
+        .where(Message.id == message_id, Message.conversation_id == conversation_id)
+    )
+    message = result.scalar_one_or_none()
+    if message is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Message not found")
+
+    is_sender = message.sender_id == actor_id
+    if not is_sender:
+        if conversation.type == ConversationType.DIRECT:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only the sender can recall this message")
+        if actor.role not in STAFF_ROLES:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only group owners or admins can recall others' messages")
+
+        sender_member_result = await db.execute(
+            select(ConversationMember).where(
+                ConversationMember.conversation_id == conversation_id,
+                ConversationMember.user_id == message.sender_id,
+            )
+        )
+        sender_member = sender_member_result.scalar_one_or_none()
+        if actor.role == MemberRole.ADMIN and sender_member is not None and sender_member.role in STAFF_ROLES:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admins cannot recall owner or admin messages")
+
+    now = datetime.now(UTC)
+    if message.recalled_at is None:
+        message.recalled_at = now
+        message.recalled_by_id = actor_id
+        conversation.updated_at = now
+        await db.commit()
+    return await get_message(db, message.id)
+
+
+async def get_message(db: AsyncSession, message_id: int) -> Message:
+    result = await db.execute(select(Message).options(joinedload(Message.sender)).where(Message.id == message_id))
+    message = result.scalar_one_or_none()
+    if message is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Message not found")
+    return message
+
+
+async def get_visible_message_for_user(db: AsyncSession, message_id: int, user_id: int) -> Message:
+    message = await get_message(db, message_id)
+    return await _get_visible_message(db, message.conversation_id, user_id, message_id)
+
+
+async def admin_recall_message(db: AsyncSession, actor_id: int, message_id: int, *, commit: bool = True) -> Message:
+    message = await get_message(db, message_id)
+    if message.recalled_at is None:
+        message.recalled_at = datetime.now(UTC)
+        message.recalled_by_id = actor_id
+        conversation = await db.get(Conversation, message.conversation_id)
+        if conversation is not None:
+            conversation.updated_at = message.recalled_at
+        if commit:
+            await db.commit()
+    return await get_message(db, message.id)
+
+
+async def _is_message_hidden(db: AsyncSession, message_id: int, user_id: int) -> bool:
+    result = await db.execute(
+        select(MessageVisibility.id).where(
+            MessageVisibility.message_id == message_id,
+            MessageVisibility.user_id == user_id,
+        )
+    )
+    return result.scalar_one_or_none() is not None
+
+
+async def _get_visible_message(
+    db: AsyncSession,
+    conversation_id: int,
+    actor_id: int,
+    message_id: int,
+    *,
+    allow_recalled: bool = True,
+    check_hidden: bool = True,
+) -> Message:
+    membership = await require_membership(db, conversation_id, actor_id)
+    result = await db.execute(
+        select(Message)
+        .options(joinedload(Message.sender))
+        .where(Message.id == message_id, Message.conversation_id == conversation_id)
+    )
+    message = result.scalar_one_or_none()
+    if message is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Message not found")
+    if membership.cleared_before_message_id is not None and message.id <= membership.cleared_before_message_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Message not found")
+    if check_hidden and await _is_message_hidden(db, message.id, actor_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Message not found")
+    if not allow_recalled and message.recalled_at is not None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot react to recalled messages")
+    return message
+
+
+async def _get_reactable_message(db: AsyncSession, conversation_id: int, actor_id: int, message_id: int) -> Message:
+    return await _get_visible_message(db, conversation_id, actor_id, message_id, allow_recalled=False)
+
+
+async def toggle_message_reaction(
+    db: AsyncSession,
+    conversation_id: int,
+    actor_id: int,
+    message_id: int,
+    emoji: str,
+) -> list[MessageReactionSummary]:
+    emoji = _normalize_emoji(emoji)
+    await _get_reactable_message(db, conversation_id, actor_id, message_id)
+
+    result = await db.execute(
+        select(MessageReaction).where(
+            MessageReaction.message_id == message_id,
+            MessageReaction.user_id == actor_id,
+            MessageReaction.emoji == emoji,
+        )
+    )
+    reaction = result.scalar_one_or_none()
+    if reaction is None:
+        db.add(MessageReaction(message_id=message_id, user_id=actor_id, emoji=emoji))
+    else:
+        await db.delete(reaction)
+    await db.commit()
+    return await get_message_reaction_summaries(db, message_id, actor_id)
+
+
+async def delete_message_reaction(
+    db: AsyncSession,
+    conversation_id: int,
+    actor_id: int,
+    message_id: int,
+    emoji: str,
+) -> list[MessageReactionSummary]:
+    emoji = _normalize_emoji(emoji)
+    await _get_reactable_message(db, conversation_id, actor_id, message_id)
+
+    result = await db.execute(
+        select(MessageReaction).where(
+            MessageReaction.message_id == message_id,
+            MessageReaction.user_id == actor_id,
+            MessageReaction.emoji == emoji,
+        )
+    )
+    reaction = result.scalar_one_or_none()
+    if reaction is not None:
+        await db.delete(reaction)
+        await db.commit()
+    return await get_message_reaction_summaries(db, message_id, actor_id)
+
+
+async def hide_message_for_user(db: AsyncSession, conversation_id: int, actor_id: int, message_id: int) -> Message:
+    message = await _get_visible_message(db, conversation_id, actor_id, message_id, check_hidden=False)
+    existing = await db.execute(
+        select(MessageVisibility).where(
+            MessageVisibility.message_id == message_id,
+            MessageVisibility.user_id == actor_id,
+        )
+    )
+    if existing.scalar_one_or_none() is None:
+        db.add(MessageVisibility(message_id=message_id, user_id=actor_id))
+        await db.commit()
+    return message
+
+
+async def toggle_message_bookmark(db: AsyncSession, conversation_id: int, actor_id: int, message_id: int) -> bool:
+    await _get_visible_message(db, conversation_id, actor_id, message_id, allow_recalled=False)
+    result = await db.execute(
+        select(MessageBookmark).where(
+            MessageBookmark.message_id == message_id,
+            MessageBookmark.user_id == actor_id,
+        )
+    )
+    bookmark = result.scalar_one_or_none()
+    if bookmark is None:
+        db.add(MessageBookmark(message_id=message_id, user_id=actor_id))
+        bookmarked = True
+    else:
+        await db.delete(bookmark)
+        bookmarked = False
+    await db.commit()
+    return bookmarked
+
+
+async def list_bookmarked_messages(db: AsyncSession, conversation_id: int, actor_id: int) -> list[Message]:
+    membership = await require_membership(db, conversation_id, actor_id)
+    hidden_message_ids = select(MessageVisibility.message_id).where(MessageVisibility.user_id == actor_id)
+    stmt = (
+        select(Message)
+        .join(MessageBookmark, MessageBookmark.message_id == Message.id)
+        .options(joinedload(Message.sender))
+        .where(
+            Message.conversation_id == conversation_id,
+            MessageBookmark.user_id == actor_id,
+            Message.id.not_in(hidden_message_ids),
+        )
+        .order_by(MessageBookmark.created_at.desc(), MessageBookmark.id.desc())
+    )
+    if membership.cleared_before_message_id is not None:
+        stmt = stmt.where(Message.id > membership.cleared_before_message_id)
+    result = await db.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def list_all_bookmarked_messages(db: AsyncSession, actor_id: int, limit: int = 100) -> list[Message]:
+    member_rows = await db.execute(
+        select(ConversationMember.conversation_id, ConversationMember.cleared_before_message_id).where(
+            ConversationMember.user_id == actor_id
+        )
+    )
+    cleared_by_conversation = {conversation_id: cleared_before for conversation_id, cleared_before in member_rows.all()}
+    if not cleared_by_conversation:
+        return []
+
+    conversation_ids = list(cleared_by_conversation)
+    hidden_message_ids = select(MessageVisibility.message_id).where(MessageVisibility.user_id == actor_id)
+    stmt = (
+        select(Message)
+        .join(MessageBookmark, MessageBookmark.message_id == Message.id)
+        .options(joinedload(Message.sender))
+        .where(
+            Message.conversation_id.in_(conversation_ids),
+            MessageBookmark.user_id == actor_id,
+            Message.id.not_in(hidden_message_ids),
+        )
+        .order_by(MessageBookmark.created_at.desc(), MessageBookmark.id.desc())
+        .limit(limit)
+    )
+    cleared_filters = [
+        (Message.conversation_id == conversation_id) & (Message.id <= cleared_before)
+        for conversation_id, cleared_before in cleared_by_conversation.items()
+        if cleared_before is not None
+    ]
+    if cleared_filters:
+        stmt = stmt.where(~or_(*cleared_filters))
+    result = await db.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def toggle_featured_message(db: AsyncSession, conversation_id: int, actor_id: int, message_id: int) -> bool:
+    actor = await require_membership(db, conversation_id, actor_id)
+    conversation = await db.get(Conversation, conversation_id)
+    if conversation is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
+    if conversation.type != ConversationType.GROUP:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only group messages can be featured")
+    if actor.role not in STAFF_ROLES:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only group owners or admins can feature messages")
+
+    message = await _get_visible_message(db, conversation_id, actor_id, message_id, allow_recalled=False)
+    result = await db.execute(select(FeaturedMessage.id).where(FeaturedMessage.message_id == message.id).limit(1))
+    if result.scalar_one_or_none() is None:
+        db.add(FeaturedMessage(message_id=message.id, conversation_id=conversation_id, set_by_id=actor_id))
+        featured = True
+    else:
+        await db.execute(delete(FeaturedMessage).where(FeaturedMessage.message_id == message.id))
+        featured = False
+    await db.commit()
+    return featured
+
+
+async def list_featured_messages(db: AsyncSession, conversation_id: int, actor_id: int) -> list[FeaturedMessageRead]:
+    membership = await require_membership(db, conversation_id, actor_id)
+    hidden_message_ids = select(MessageVisibility.message_id).where(MessageVisibility.user_id == actor_id)
+    stmt = (
+        select(FeaturedMessage)
+        .join(Message, FeaturedMessage.message_id == Message.id)
+        .options(
+            joinedload(FeaturedMessage.message).joinedload(Message.sender),
+            joinedload(FeaturedMessage.set_by),
+        )
+        .where(
+            FeaturedMessage.conversation_id == conversation_id,
+            Message.id.not_in(hidden_message_ids),
+        )
+        .order_by(FeaturedMessage.created_at.desc(), FeaturedMessage.id.desc())
+    )
+    if membership.cleared_before_message_id is not None:
+        stmt = stmt.where(Message.id > membership.cleared_before_message_id)
+    result = await db.execute(
+        stmt
+    )
+    featured_messages = list(result.scalars().all())
+    message_reads = await build_message_reads(db, [item.message for item in featured_messages], actor_id)
+    message_by_id = {message.id: message for message in message_reads}
+    return [
+        FeaturedMessageRead(
+            id=item.id,
+            conversation_id=item.conversation_id,
+            message_id=item.message_id,
+            set_by_id=item.set_by_id,
+            set_by=UserPublic.model_validate(item.set_by) if item.set_by is not None else None,
+            created_at=item.created_at,
+            message=message_by_id[item.message_id],
+        )
+        for item in featured_messages
+    ]
+
+async def list_messages(
+    db: AsyncSession,
+    conversation_id: int,
+    user_id: int,
+    before_id: int | None = None,
+    limit: int = 50,
+) -> list[Message]:
+    membership_result = await db.execute(
+        select(ConversationMember).where(
+            ConversationMember.conversation_id == conversation_id,
+            ConversationMember.user_id == user_id,
+        )
+    )
+    membership = membership_result.scalar_one_or_none()
+    if membership is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Message not found")
+    hidden_message_ids = select(MessageVisibility.message_id).where(MessageVisibility.user_id == user_id)
+    stmt = (
+        select(Message)
+        .options(joinedload(Message.sender))
+        .where(Message.conversation_id == conversation_id, Message.id.not_in(hidden_message_ids))
+        .order_by(Message.id.desc())
+        .limit(limit)
+    )
+    if before_id is not None:
+        stmt = stmt.where(Message.id < before_id)
+    if membership.cleared_before_message_id is not None:
+        stmt = stmt.where(Message.id > membership.cleared_before_message_id)
+    result = await db.execute(stmt)
+    return list(reversed(result.scalars().all()))
+
+
+async def list_messages_after(
+    db: AsyncSession,
+    conversation_id: int,
+    user_id: int,
+    after_id: int,
+    limit: int = 50,
+) -> list[Message]:
+    membership_result = await db.execute(
+        select(ConversationMember).where(
+            ConversationMember.conversation_id == conversation_id,
+            ConversationMember.user_id == user_id,
+        )
+    )
+    membership = membership_result.scalar_one_or_none()
+    if membership is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Message not found")
+    hidden_message_ids = select(MessageVisibility.message_id).where(MessageVisibility.user_id == user_id)
+    stmt = (
+        select(Message)
+        .options(joinedload(Message.sender))
+        .where(Message.conversation_id == conversation_id, Message.id > after_id, Message.id.not_in(hidden_message_ids))
+        .order_by(Message.id.asc())
+        .limit(limit)
+    )
+    if membership.cleared_before_message_id is not None:
+        stmt = stmt.where(Message.id > membership.cleared_before_message_id)
+    result = await db.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def get_message_context(
+    db: AsyncSession,
+    conversation_id: int,
+    message_id: int,
+    user_id: int,
+    before: int = 25,
+    after: int = 25,
+) -> list[Message]:
+    membership = await require_membership(db, conversation_id, user_id)
+    hidden_message_ids = select(MessageVisibility.message_id).where(MessageVisibility.user_id == user_id)
+    visibility_filters: list[Any] = [
+        Message.conversation_id == conversation_id,
+        Message.id.not_in(hidden_message_ids),
+    ]
+    if membership.cleared_before_message_id is not None:
+        visibility_filters.append(Message.id > membership.cleared_before_message_id)
+
+    target_result = await db.execute(
+        select(Message.id).where(Message.id == message_id, *visibility_filters).limit(1)
+    )
+    if target_result.scalar_one_or_none() is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Message not found")
+
+    before_result = await db.execute(
+        select(Message)
+        .options(joinedload(Message.sender))
+        .where(Message.id < message_id, *visibility_filters)
+        .order_by(Message.id.desc())
+        .limit(before)
+    )
+    before_messages = list(reversed(before_result.scalars().all()))
+
+    target_message_result = await db.execute(
+        select(Message)
+        .options(joinedload(Message.sender))
+        .where(Message.id == message_id, *visibility_filters)
+    )
+    target_message = target_message_result.scalar_one_or_none()
+    if target_message is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Message not found")
+
+    after_result = await db.execute(
+        select(Message)
+        .options(joinedload(Message.sender))
+        .where(Message.id > message_id, *visibility_filters)
+        .order_by(Message.id.asc())
+        .limit(after)
+    )
+    after_messages = list(after_result.scalars().all())
+    return [*before_messages, target_message, *after_messages]
+
+
+async def search_messages(
+    db: AsyncSession,
+    conversation_id: int,
+    user_id: int,
+    query: str | None = None,
+    category: str = "all",
+    sender_id: int | None = None,
+    start_at: datetime | None = None,
+    end_at: datetime | None = None,
+    before_id: int | None = None,
+    include_recalled: bool = False,
+    limit: int = 30,
+) -> tuple[list[Message], int, bool, int | None]:
+    membership = await require_membership(db, conversation_id, user_id)
+    conversation = await db.get(Conversation, conversation_id)
+    if conversation is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
+
+    if sender_id is not None:
+        if conversation.type != ConversationType.GROUP:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="sender_id filter is only supported in group conversations")
+        sender_result = await db.execute(
+            select(ConversationMember.id).where(
+                ConversationMember.conversation_id == conversation_id,
+                ConversationMember.user_id == sender_id,
+            )
+        )
+        if sender_result.scalar_one_or_none() is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sender is not a group member")
+
+    filters = _message_search_filters(
+        conversation_id=conversation_id,
+        user_id=user_id,
+        membership=membership,
+        query=query,
+        category=category,
+        sender_id=sender_id,
+        start_at=start_at,
+        end_at=end_at,
+        before_id=before_id,
+        include_recalled=include_recalled,
+    )
+    count_result = await db.execute(select(func.count(Message.id)).where(*filters))
+    total = int(count_result.scalar_one() or 0)
+    result = await db.execute(
+        select(Message)
+        .options(joinedload(Message.sender))
+        .where(*filters)
+        .order_by(Message.id.desc())
+        .limit(limit + 1)
+    )
+    rows = list(result.scalars().all())
+    has_more = len(rows) > limit
+    messages = rows[:limit]
+    next_before_id = messages[-1].id if has_more and messages else None
+    return messages, total, has_more, next_before_id
+
+
+def build_search_match(message: Message, query: str | None) -> tuple[str, str | None]:
+    metadata = _metadata_from_json(message.metadata_json) or {}
+    if message.type == MessageType.IMAGE:
+        return ("sticker" if metadata.get("sticker") is True else "image", None)
+    if message.type == MessageType.VOICE:
+        return "voice", None
+    if message.type == MessageType.FORWARD_BUNDLE:
+        snippet = _snippet(_forward_bundle_search_text(metadata, message.content), query)
+        return "forward_bundle", snippet
+    if message.type == MessageType.SYSTEM:
+        return "system", _snippet(message.content, query)
+    if _message_has_link(message):
+        return "link", _snippet(message.content, query)
+    return "text", _snippet(message.content, query)
+
+
+def _message_search_filters(
+    *,
+    conversation_id: int,
+    user_id: int,
+    membership: ConversationMember,
+    query: str | None,
+    category: str,
+    sender_id: int | None,
+    start_at: datetime | None,
+    end_at: datetime | None,
+    before_id: int | None,
+    include_recalled: bool,
+) -> list[Any]:
+    hidden_message_ids = select(MessageVisibility.message_id).where(MessageVisibility.user_id == user_id)
+    filters: list[Any] = [Message.conversation_id == conversation_id, Message.id.not_in(hidden_message_ids)]
+    if membership.cleared_before_message_id is not None:
+        filters.append(Message.id > membership.cleared_before_message_id)
+    if not include_recalled:
+        filters.append(Message.recalled_at.is_(None))
+    if sender_id is not None:
+        filters.append(Message.sender_id == sender_id)
+    if start_at is not None:
+        filters.append(Message.created_at >= start_at)
+    if end_at is not None:
+        filters.append(Message.created_at <= end_at)
+    if before_id is not None:
+        filters.append(Message.id < before_id)
+
+    category_filter = _category_filter(category)
+    if category_filter is not None:
+        filters.append(category_filter)
+
+    if query and query.strip():
+        keyword = f"%{query.strip()}%"
+        filters.append(or_(Message.content.ilike(keyword), Message.metadata_json.ilike(keyword)))
+    return filters
+
+
+def _category_filter(category: str) -> Any | None:
+    if category == "all":
+        return None
+    if category == "text":
+        return Message.type == MessageType.TEXT
+    if category == "image":
+        return and_(Message.type == MessageType.IMAGE, or_(Message.metadata_json.is_(None), Message.metadata_json.not_like('%"sticker"%true%')))
+    if category == "sticker":
+        return and_(Message.type == MessageType.IMAGE, Message.metadata_json.like('%"sticker"%true%'))
+    if category == "voice":
+        return Message.type == MessageType.VOICE
+    if category == "link":
+        return and_(Message.type == MessageType.TEXT, or_(Message.content.ilike("%http://%"), Message.content.ilike("%https://%"), Message.content.ilike("%www.%")))
+    if category == "forward_bundle":
+        return Message.type == MessageType.FORWARD_BUNDLE
+    if category == "system":
+        return Message.type == MessageType.SYSTEM
+    raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid message search category")
+
+
+def _message_has_link(message: Message) -> bool:
+    return message.type == MessageType.TEXT and re.search(r"https?://|www\.", message.content, re.IGNORECASE) is not None
+
+
+def _forward_bundle_search_text(metadata: dict[str, Any], fallback: str) -> str:
+    parts = [fallback]
+    note = metadata.get("note")
+    if isinstance(note, str):
+        parts.append(note)
+    source_title = metadata.get("source_title")
+    if isinstance(source_title, str):
+        parts.append(source_title)
+    for item in metadata.get("items", []):
+        if isinstance(item, dict):
+            sender_name = item.get("sender_display_name")
+            content = item.get("content")
+            if isinstance(sender_name, str):
+                parts.append(sender_name)
+            if isinstance(content, str):
+                parts.append(content)
+    return "\n".join(part for part in parts if part)
+
+
+def _snippet(text: str | None, query: str | None, radius: int = 36) -> str | None:
+    if not text:
+        return None
+    compact = " ".join(text.split())
+    needle = query.strip() if query else ""
+    if not needle:
+        return compact[: radius * 2] + ("..." if len(compact) > radius * 2 else "")
+    index = compact.lower().find(needle.lower())
+    if index < 0:
+        return compact[: radius * 2] + ("..." if len(compact) > radius * 2 else "")
+    start = max(0, index - radius)
+    end = min(len(compact), index + len(needle) + radius)
+    prefix = "..." if start > 0 else ""
+    suffix = "..." if end < len(compact) else ""
+    return f"{prefix}{compact[start:end]}{suffix}"
+
+
+async def admin_message_context(
+    db: AsyncSession,
+    conversation_id: int,
+    message_id: int,
+    before: int = 20,
+    after: int = 20,
+) -> list[Message]:
+    target = await db.get(Message, message_id)
+    if target is None or target.conversation_id != conversation_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Message not found")
+    before_result = await db.execute(
+        select(Message)
+        .options(joinedload(Message.sender))
+        .where(Message.conversation_id == conversation_id, Message.id < message_id)
+        .order_by(Message.id.desc())
+        .limit(before)
+    )
+    after_result = await db.execute(
+        select(Message)
+        .options(joinedload(Message.sender))
+        .where(Message.conversation_id == conversation_id, Message.id > message_id)
+        .order_by(Message.id.asc())
+        .limit(after)
+    )
+    target_result = await db.execute(select(Message).options(joinedload(Message.sender)).where(Message.id == message_id))
+    target_loaded = target_result.scalar_one()
+    before_messages = list(reversed(before_result.scalars().all()))
+    after_messages = list(after_result.scalars().all())
+    return before_messages + [target_loaded] + after_messages
+
+
+async def admin_message_context_by_id(
+    db: AsyncSession,
+    message_id: int,
+    before: int = 20,
+    after: int = 20,
+) -> list[Message]:
+    target = await db.get(Message, message_id)
+    if target is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Message not found")
+    return await admin_message_context(db, target.conversation_id, message_id, before, after)
+
+
+async def _conversation_snapshot_title(db: AsyncSession, conversation: Conversation, actor_id: int) -> str:
+    membership_result = await db.execute(
+        select(ConversationMember).where(
+            ConversationMember.conversation_id == conversation.id,
+            ConversationMember.user_id == actor_id,
+        )
+    )
+    membership = membership_result.scalar_one_or_none()
+    if conversation.type == ConversationType.GROUP:
+        if membership is not None and membership.remark:
+            return membership.remark
+        if conversation.title:
+            return conversation.title
+    if conversation.type == ConversationType.DIRECT:
+        result = await db.execute(
+            select(User)
+            .join(ConversationMember, ConversationMember.user_id == User.id)
+            .where(ConversationMember.conversation_id == conversation.id, User.id != actor_id)
+            .limit(1)
+        )
+        direct_user = result.scalar_one_or_none()
+        if direct_user is not None:
+            return _display_name(direct_user)
+    return f"会话 {conversation.id}"
+
+
+async def create_forward_bundle(
+    db: AsyncSession,
+    target_conversation_id: int,
+    actor: User,
+    source_conversation_id: int,
+    message_ids: list[int],
+    note: str | None = None,
+) -> Message:
+    source_membership = await require_membership(db, source_conversation_id, actor.id)
+    await require_membership(db, target_conversation_id, actor.id)
+    source_conversation = await db.get(Conversation, source_conversation_id)
+    if source_conversation is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Source conversation not found")
+
+    unique_ids = list(dict.fromkeys(message_ids))
+    hidden_message_ids = select(MessageVisibility.message_id).where(MessageVisibility.user_id == actor.id)
+    stmt = (
+        select(Message)
+        .options(joinedload(Message.sender))
+        .where(
+            Message.conversation_id == source_conversation_id,
+            Message.id.in_(unique_ids),
+            Message.recalled_at.is_(None),
+            Message.id.not_in(hidden_message_ids),
+        )
+    )
+    if source_membership.cleared_before_message_id is not None:
+        stmt = stmt.where(Message.id > source_membership.cleared_before_message_id)
+    result = await db.execute(stmt)
+    visible_messages = sorted(result.scalars().all(), key=lambda message: message.id)
+    if not visible_messages:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No visible messages to forward")
+
+    source_title = await _conversation_snapshot_title(db, source_conversation, actor.id)
+    metadata: dict[str, Any] = {
+        "source_conversation_id": source_conversation_id,
+        "source_title": source_title,
+        "items": [
+            {
+                "message_id": message.id,
+                "sender_id": message.sender_id,
+                "sender_display_name": _display_name(message.sender),
+                "sender_avatar_url": message.sender.avatar_url,
+                "type": message.type.value,
+                "content": message.content,
+                "metadata": _metadata_from_json(message.metadata_json),
+                "created_at": message.created_at.isoformat(),
+            }
+            for message in visible_messages
+        ],
+    }
+    if note is not None:
+        metadata["note"] = note
+
+    return await send_message(
+        db,
+        target_conversation_id,
+        actor,
+        f"{source_title} 的聊天记录",
+        MessageType.FORWARD_BUNDLE,
+        metadata,
+    )
+
+
+async def mark_conversation_read(
+    db: AsyncSession,
+    conversation_id: int,
+    user_id: int,
+    last_read_message_id: int | None = None,
+) -> ReadReceipt:
+    membership = await require_membership(db, conversation_id, user_id)
+    if last_read_message_id is None:
+        latest_result = await db.execute(
+            select(Message.id)
+            .where(Message.conversation_id == conversation_id)
+            .order_by(Message.id.desc())
+            .limit(1)
+        )
+        last_read_message_id = latest_result.scalar_one_or_none()
+    else:
+        message = await db.get(Message, last_read_message_id)
+        if message is None or message.conversation_id != conversation_id:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Message does not belong to this conversation")
+
+    now = datetime.now(UTC)
+    membership.last_read_message_id = last_read_message_id
+    membership.last_read_at = now
+    await db.commit()
+    return ReadReceipt(
+        conversation_id=conversation_id,
+        user_id=user_id,
+        last_read_message_id=last_read_message_id,
+        last_read_at=now,
+    )
