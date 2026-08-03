@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src=".github/assets/cover.png" alt="KukeChat Server" width="880">
+
 # KukeChat Server
 
 **KukeChat 的后端服务** · FastAPI + SQLAlchemy 2 (async) + WebSocket
