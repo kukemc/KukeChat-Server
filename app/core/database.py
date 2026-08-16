@@ -20,10 +20,31 @@ AsyncSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_co
 
 
 @event.listens_for(engine.sync_engine, "connect")
-def enable_sqlite_foreign_keys(dbapi_connection, _connection_record) -> None:
-    if settings.database_url.startswith("sqlite"):
-        cursor = dbapi_connection.cursor()
+def configure_sqlite_connection(dbapi_connection, _connection_record) -> None:
+    """SQLite 的默认设置扛不住多进程聊天服务，每条连接都得调一遍。
+
+    默认的 rollback journal（``journal_mode=delete``）每次提交都要对整库加排他
+    锁、建日志文件、fsync 两次再删掉，读写还互相阻塞 —— 多 worker 下发消息会
+    肉眼可见地卡。WAL 让读不挡写、写不挡读，提交也只是往 -wal 追加。
+
+    ``synchronous=NORMAL`` 在 WAL 下依旧不会损坏数据库，最坏情况是断电时丢掉
+    最后几个事务；换来的是省掉每次提交的那次 fsync。
+
+    ``journal_mode`` 是写在库文件头里的，设一次就一直生效，之后每次连接执行它
+    只是一次廉价的读取；``synchronous`` 和 ``busy_timeout`` 是连接级的，必须
+    每条连接都设。
+    """
+    if not settings.database_url.startswith("sqlite"):
+        return
+    cursor = dbapi_connection.cursor()
+    try:
         cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        # 抢锁失败时最多等 10 秒再报 database is locked，别让偶发争用直接 500
+        cursor.execute("PRAGMA busy_timeout=10000")
+        cursor.execute("PRAGMA temp_store=MEMORY")
+    finally:
         cursor.close()
 
 
