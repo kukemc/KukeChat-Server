@@ -20,6 +20,7 @@ from datetime import UTC, datetime
 from fastapi import HTTPException, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import joinedload
 
 from app.models.conversation import Conversation, ConversationMember
 from app.models.enums import ConversationType, MemberRole, MessageType
@@ -128,8 +129,12 @@ async def resolve_game_conversation(db: AsyncSession, conversation_id: int, crea
 
 
 async def _recent_messages(db: AsyncSession, conversation_id: int, viewer_id: int | None) -> list[MessageRead]:
+    # 必须预加载 sender：build_message_reads 会读 message.sender 构造发送者信息，
+    # 异步会话里懒加载会直接抛 MissingGreenlet。本模块之外的所有消息查询
+    # 都带着这个 joinedload，这里漏掉过一次，导致游戏模式接入返回 500。
     stmt = (
         select(Message)
+        .options(joinedload(Message.sender))
         .where(Message.conversation_id == conversation_id, Message.recalled_at.is_(None))
         .order_by(Message.id.desc())
         .limit(GAME_HISTORY_LIMIT)

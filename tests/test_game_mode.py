@@ -184,6 +184,49 @@ class GameModeTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(HTTPException):
                 await game_service.resolve_game_conversation(db, conversation_id, CREATION_OID)
 
+    async def test_session_builds_in_a_fresh_session(self) -> None:
+        """用全新会话构建游戏会话，必须不抛 MissingGreenlet。
+
+        这是一次真实故障的回归用例：_recent_messages 当初漏了
+        joinedload(Message.sender)，build_message_reads 读 message.sender 时
+        触发懒加载，异步会话下直接返回 500。
+
+        其他用例没能抓到，是因为它们在同一个会话里完成建数据与断言，
+        build_message_reads 内部的查询恰好把 sender 载进了 identity map，
+        懒加载得以从缓存命中。生产是每请求一个新会话，这里如实复现。
+        """
+        owner_id, member_id, conversation_id = await self._seed()
+
+        # 会话 A：开启游戏模式并补几条不同发送者的消息
+        async with self.sessions() as db:
+            await game_service.set_game_mode(
+                db,
+                conversation_id,
+                await self._user(db, owner_id),
+                GameModeUpdate(enabled=True, creation_oid=CREATION_OID),
+            )
+            # 关键：一条来自「已退群的人」的历史消息。
+            # build_message_reads 会查 ConversationMember 取昵称/头衔/等级，
+            # 顺带把在群成员的 User 载进 identity map；退群者不在其中，
+            # 于是 message.sender 只能走懒加载 —— 正是线上炸掉的那条路径。
+            former = User(username="former", hashed_password="x", nickname="已退群")
+            db.add(former)
+            await db.flush()
+            db.add_all([
+                Message(conversation_id=conversation_id, sender_id=member_id, content="成员发言"),
+                Message(conversation_id=conversation_id, sender_id=former.id, content="退群者当年的发言"),
+            ])
+            await db.commit()
+
+        # 会话 B：完全冷启动，等同于一次真实请求
+        async with self.sessions() as db:
+            conversation = await game_service.resolve_game_conversation(db, conversation_id, CREATION_OID)
+            session = await game_service.build_game_session(db, conversation, None)
+
+            self.assertEqual(len(session.messages), 3)
+            # 发送者信息必须完整取到，而不是靠懒加载侥幸命中
+            self.assertTrue(all(item.sender is not None for item in session.messages))
+
 
 if __name__ == "__main__":
     unittest.main()
