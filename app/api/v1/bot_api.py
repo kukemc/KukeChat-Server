@@ -4,6 +4,7 @@ import html
 import json
 import re
 import shlex
+from datetime import UTC, datetime, timedelta
 from urllib.parse import urlparse
 from typing import Annotated, Any
 
@@ -12,22 +13,35 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
-from app.api.v1.conversations import online_conversation_member_ids, schedule_realtime_task, send_admin_message_signal, send_conversation_updates, send_message_updates, send_reaction_updates
+from app.api.v1.conversations import display_name, emit_system_message, mute_duration_label, online_conversation_member_ids, schedule_realtime_task, send_admin_message_signal, send_bot_conversation_event, send_conversation_updates, send_message_updates, send_reaction_updates
 from app.api.v1.uploads import UploadRead, save_audio_upload, save_image_upload
 from app.core.database import get_db
 from app.core.dependencies import get_current_bot
 from app.models.bot import Bot, BotInstallation
 from app.models.conversation import ConversationMember
-from app.models.enums import MessageType
+from app.models.enums import GroupJoinRequestStatus, MemberRole, MessageType
 from app.models.message import Message
-from app.schemas.bot import BotConversationInfoRead, BotConversationMembersRead, BotDirectMessageCreate, BotMessageComponentUpdate, BotRuntimeMeRead, BotSendMessageCreate, BotUserPublicInfoRead
-from app.schemas.conversation import ConversationMemberRead, ConversationRead
+from app.schemas.bot import (
+    BotConversationInfoRead,
+    BotConversationMembersRead,
+    BotDirectMessageCreate,
+    BotJoinRequestReview,
+    BotMemberMuteUpdate,
+    BotMemberRoleUpdate,
+    BotMessageComponentUpdate,
+    BotRuntimeMeRead,
+    BotSendMessageCreate,
+    BotUserPublicInfoRead,
+)
+from app.schemas.common import MessageResponse
+from app.schemas.conversation import ConversationMemberRead, ConversationRead, GroupJoinRequestDecision, GroupJoinRequestRead
 from app.schemas.message import MessageReactionCreate, MessageReactionSummary, MessageRead
 from app.schemas.user import OnlineUsersRead, UserPublic
 from app.services import bots as bot_service
 from app.services import conversations as conversation_service
 from app.services import messages as message_service
 from app.services import moderation as moderation_service
+from app.services import response_cache
 from app.services.bots import BotContext
 from app.models.user import User
 from app.websocket.manager import bot_manager, manager
@@ -816,3 +830,211 @@ async def bot_upload_voice(
     _context: Annotated[BotContext, Depends(get_current_bot)],
 ) -> UploadRead:
     return await save_audio_upload(file, "messages", request)
+
+
+# ---------------------------------------------------------------------------
+# 群管理
+#
+# 这里不额外定义权限：机器人在群里就是一个普通成员，能不能踢人 / 禁言完全取决于
+# 群主有没有把它设成管理员。下面直接复用 conversation_service 里那套人类用的
+# 逻辑，角色校验、越权保护（管理员不能动管理员）全部原样生效。
+# ---------------------------------------------------------------------------
+
+
+async def _require_bot_staff(db: AsyncSession, context: BotContext, conversation_id: int) -> ConversationMember:
+    """机器人必须已安装在该群，且自身是管理员或群主。"""
+    await bot_service.validate_bot_can_use_conversation(db, context, conversation_id)
+    member = await conversation_service.require_membership(db, conversation_id, context.user.id)
+    if member.role not in conversation_service.STAFF_ROLES:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Bot must be a group admin to perform this action",
+        )
+    return member
+
+
+@router.patch("/conversations/{conversation_id}/members/{user_id}/mute", response_model=ConversationMemberRead)
+async def bot_update_member_mute(
+    conversation_id: int,
+    user_id: int,
+    payload: BotMemberMuteUpdate,
+    context: Annotated[BotContext, Depends(get_current_bot)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> ConversationMember:
+    await _require_bot_staff(db, context, conversation_id)
+    previous = await conversation_service.get_member(db, conversation_id, user_id)
+    previous_muted = bool(previous.muted)
+    muted_until = None
+    if payload.muted and payload.minutes:
+        muted_until = datetime.now(UTC) + timedelta(minutes=payload.minutes)
+    member = await conversation_service.update_member_mute(
+        db, conversation_id, context.user.id, user_id, payload.muted, muted_until
+    )
+    response_cache.invalidate_conversation_members(conversation_id)
+    member_ids = await online_conversation_member_ids(db, conversation_id)
+    if bool(member.muted) != previous_muted:
+        actor_name = display_name(context.user, f"机器人 {context.user.id}")
+        target_name = display_name(member.user, f"用户 {user_id}")
+        duration_label = mute_duration_label(member.muted_until) if member.muted else ""
+        await emit_system_message(
+            db,
+            conversation_id,
+            context.user,
+            f"{actor_name}{'禁言了' if member.muted else '解除了'} {target_name}{duration_label if member.muted else ' 的禁言'}",
+            member_ids,
+            {
+                "system_event": "group.member.mute_updated",
+                "actor_id": context.user.id,
+                "user_id": user_id,
+                "muted": member.muted,
+                "muted_until": member.muted_until.isoformat() if member.muted_until else None,
+            },
+        )
+    event_data = {
+        "conversation_id": conversation_id,
+        "user_id": user_id,
+        "muted": member.muted,
+        "muted_until": member.muted_until.isoformat() if member.muted_until else None,
+    }
+    await manager.send_to_users(member_ids, "group.member.mute_updated", event_data)
+    await send_bot_conversation_event(db, "group.member.mute_updated", conversation_id, event_data)
+    await send_conversation_updates(db, conversation_id, member_ids)
+    return member
+
+
+@router.patch("/conversations/{conversation_id}/members/{user_id}/role", response_model=ConversationMemberRead)
+async def bot_update_member_role(
+    conversation_id: int,
+    user_id: int,
+    payload: BotMemberRoleUpdate,
+    context: Annotated[BotContext, Depends(get_current_bot)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> ConversationMember:
+    # 改角色是群主专属，_require_bot_staff 只挡住非管理员；真正的群主校验在 service 里
+    await _require_bot_staff(db, context, conversation_id)
+    previous = await conversation_service.get_member(db, conversation_id, user_id)
+    previous_role = previous.role
+    member = await conversation_service.update_member_role(db, conversation_id, context.user.id, user_id, payload.role)
+    response_cache.invalidate_conversation_members(conversation_id)
+    member_ids = await online_conversation_member_ids(db, conversation_id)
+    if member.role != previous_role:
+        actor_name = display_name(context.user, f"机器人 {context.user.id}")
+        target_name = display_name(member.user, f"用户 {user_id}")
+        role_text = "设为管理员" if member.role == MemberRole.ADMIN else "取消管理员"
+        await emit_system_message(
+            db,
+            conversation_id,
+            context.user,
+            f"{actor_name} 将 {target_name} {role_text}",
+            member_ids,
+            {
+                "system_event": "group.member.role_updated",
+                "actor_id": context.user.id,
+                "user_id": user_id,
+                "role": member.role.value,
+            },
+        )
+    event_data = {"conversation_id": conversation_id, "user_id": user_id, "role": member.role}
+    await manager.send_to_users(member_ids, "group.member.role_updated", event_data)
+    await send_bot_conversation_event(db, "group.member.role_updated", conversation_id, event_data)
+    await send_conversation_updates(db, conversation_id, member_ids)
+    return member
+
+
+@router.delete("/conversations/{conversation_id}/members/{user_id}", response_model=MessageResponse)
+async def bot_remove_member(
+    conversation_id: int,
+    user_id: int,
+    context: Annotated[BotContext, Depends(get_current_bot)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> MessageResponse:
+    await _require_bot_staff(db, context, conversation_id)
+    before_ids = set(await online_conversation_member_ids(db, conversation_id))
+    target_member = await conversation_service.get_member(db, conversation_id, user_id)
+    target_name = display_name(target_member.user, f"用户 {user_id}")
+    await conversation_service.remove_member(db, conversation_id, context.user.id, user_id)
+    response_cache.invalidate_conversation_members(conversation_id)
+    remaining_ids = before_ids - {user_id}
+    if remaining_ids:
+        await emit_system_message(
+            db,
+            conversation_id,
+            context.user,
+            f"{display_name(context.user, f'机器人 {context.user.id}')} 将 {target_name} 移出群聊",
+            remaining_ids,
+            {"system_event": "group.member.removed", "actor_id": context.user.id, "user_id": user_id},
+        )
+    event_data = {"conversation_id": conversation_id, "user_id": user_id, "actor_id": context.user.id}
+    await manager.send_to_users(remaining_ids, "group.member.removed", event_data)
+    await send_bot_conversation_event(db, "group.member.removed", conversation_id, event_data)
+    await manager.send_to_user(
+        user_id,
+        "conversation.deleted",
+        {"conversation_id": conversation_id, "actor_id": context.user.id, "reason": "removed"},
+    )
+    if remaining_ids:
+        await send_conversation_updates(db, conversation_id, remaining_ids)
+    return MessageResponse(detail="Removed member")
+
+
+@router.get("/conversations/{conversation_id}/join-requests", response_model=list[GroupJoinRequestRead])
+async def bot_join_requests(
+    conversation_id: int,
+    context: Annotated[BotContext, Depends(get_current_bot)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    pending_only: bool = Query(default=True),
+) -> list[GroupJoinRequestRead]:
+    await _require_bot_staff(db, context, conversation_id)
+    # 复用的是「我能审的所有申请」，这里再按群过滤，避免机器人看到别的群的申请
+    items = await conversation_service.list_incoming_group_join_requests(db, context.user.id)
+    items = [item for item in items if item.conversation_id == conversation_id]
+    if pending_only:
+        items = [item for item in items if item.status == GroupJoinRequestStatus.PENDING]
+    return [await conversation_service.build_group_join_request_read(db, item, context.user.id) for item in items]
+
+
+@router.post("/join-requests/{request_id}/review", response_model=GroupJoinRequestRead)
+async def bot_review_join_request(
+    request_id: int,
+    payload: BotJoinRequestReview,
+    context: Annotated[BotContext, Depends(get_current_bot)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> GroupJoinRequestRead:
+    join_request = await conversation_service.get_group_join_request_for_user(db, request_id, context.user.id)
+    await _require_bot_staff(db, context, join_request.conversation_id)
+    conversation_id = join_request.conversation_id
+    reviewed, added = await conversation_service.review_group_join_request(
+        db,
+        request_id,
+        context.user.id,
+        payload.approved,
+        GroupJoinRequestDecision(decision_note=payload.decision_note),
+    )
+    response = await conversation_service.build_group_join_request_read(db, reviewed, context.user.id)
+    reviewers = await conversation_service.pending_join_request_reviewer_ids(db, conversation_id)
+    recipients = set(reviewers) | {reviewed.requester_id, context.user.id}
+    await manager.send_to_users(
+        recipients,
+        "group.join_request.accepted" if payload.approved else "group.join_request.rejected",
+        response,
+    )
+    if added:
+        response_cache.invalidate_conversation_members(conversation_id)
+        member_ids = await online_conversation_member_ids(db, conversation_id)
+        requester_member = await conversation_service.get_member(db, conversation_id, reviewed.requester_id)
+        requester_name = display_name(requester_member.user, f"用户 {reviewed.requester_id}")
+        await emit_system_message(
+            db,
+            conversation_id,
+            context.user,
+            f"{requester_name} 加入了群聊",
+            member_ids,
+            {"system_event": "group.member.joined", "user_id": reviewed.requester_id},
+        )
+        event_data = {"conversation_id": conversation_id, "user_id": reviewed.requester_id}
+        await manager.send_to_users(member_ids, "group.member.joined", event_data)
+        await send_bot_conversation_event(db, "group.member.joined", conversation_id, event_data)
+        await send_conversation_updates(db, conversation_id, member_ids)
+    else:
+        await send_conversation_updates(db, conversation_id, reviewers)
+    return response

@@ -227,6 +227,48 @@ class GameModeTests(unittest.IsolatedAsyncioTestCase):
             # 发送者信息必须完整取到，而不是靠懒加载侥幸命中
             self.assertTrue(all(item.sender is not None for item in session.messages))
 
+    async def test_broadcast_gate_does_not_depend_on_local_viewers(self) -> None:
+        """投递判据必须是「群开了游戏模式」，而不是本进程有没有观众。
+
+        线上多 worker：观众可能连在 A，消息由 B 处理。若按本地连接数短路，
+        B 会直接跳过投递，导致按 worker 数比例丢消息 —— 这是一次真实故障。
+        """
+        import ast
+        import inspect
+        import textwrap
+
+        from app.api.v1 import conversations as conv_api
+
+        source = textwrap.dedent(inspect.getsource(conv_api.send_game_message_updates))
+        tree = ast.parse(source)
+        func = tree.body[0]
+        # 剥掉 docstring —— 说明文字里会提到 viewer_count，不能算进判据
+        body = func.body[1:] if ast.get_docstring(func) else func.body
+        code = chr(10).join(ast.unparse(node) for node in body)
+
+        self.assertNotIn(
+            "viewer_count",
+            code,
+            "不能用本地连接数做短路，多 worker 下会按 worker 数比例丢消息",
+        )
+        self.assertIn("game_mode_enabled", code, "应按群是否开启游戏模式来决定是否投递")
+
+    async def test_disabled_group_is_not_broadcast(self) -> None:
+        """没开游戏模式的群不应触发游戏通道投递。"""
+        owner_id, _, conversation_id = await self._seed()
+        async with self.sessions() as db:
+            conversation = await db.get(Conversation, conversation_id)
+            self.assertFalse(conversation.game_mode_enabled)
+
+            await game_service.set_game_mode(
+                db,
+                conversation_id,
+                await self._user(db, owner_id),
+                GameModeUpdate(enabled=True, creation_oid=CREATION_OID),
+            )
+            refreshed = await db.get(Conversation, conversation_id)
+            self.assertTrue(refreshed.game_mode_enabled)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -7,7 +7,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.schemas.conversation import ConversationMemberRead, ConversationRead
-from app.models.enums import MessageType
+from app.models.enums import MemberRole, MessageType
 from app.schemas.user import UserPublic
 
 
@@ -348,3 +348,23 @@ class BotMessageComponentUpdate(BaseModel):
 
 class BotConversationMembersRead(BaseModel):
     items: list[ConversationMemberRead]
+
+
+class BotMemberMuteUpdate(BaseModel):
+    """机器人禁言 / 解禁成员。
+
+    用分钟数而不是绝对时间，是因为积木侧只能方便地给出「禁言 10 分钟」这种相对量；
+    留空或 0 表示不设期限（永久禁言，直到手动解除）。
+    """
+
+    muted: bool = True
+    minutes: int | None = Field(default=None, ge=0, le=60 * 24 * 365)
+
+
+class BotMemberRoleUpdate(BaseModel):
+    role: Literal[MemberRole.ADMIN, MemberRole.MEMBER]
+
+
+class BotJoinRequestReview(BaseModel):
+    approved: bool
+    decision_note: str | None = Field(default=None, max_length=200)

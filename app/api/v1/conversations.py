@@ -329,9 +329,15 @@ async def send_game_message_updates(db: AsyncSession, event_type: str, conversat
     """把消息同步给游戏模式的观众。
 
     观众可能未登录，按会话 id 分组订阅，因此不能复用按用户投递的通道。
-    只有开启了游戏模式的群才会有订阅者，未开启时这里是一次无操作的查表。
+
+    **不能用本地连接数做短路。** viewer_count 只统计当前进程的连接，而线上是
+    多 worker：观众连在 A，消息可能由 B 处理，B 看到本地计数为 0 就跳过投递，
+    结果是按 worker 数比例丢消息。判据改为「该群是否开启了游戏模式」——
+    conversation 在发消息路径上刚被加载过，这里通常是一次 identity map 命中，
+    比多发一次 Redis 广播更省。
     """
-    if game_manager.viewer_count(conversation_id) == 0:
+    conversation = await db.get(Conversation, conversation_id)
+    if conversation is None or not conversation.game_mode_enabled:
         return
     await game_manager.send_to_conversation(conversation_id, event_type, data)
 
@@ -508,6 +514,19 @@ async def create_group_join_request(
     reviewer_ids = await conversation_service.pending_join_request_reviewer_ids(db, conversation_id)
     await manager.send_to_users(reviewer_ids, "group.join_request.created", response)
     await manager.send_to_user(current_user.id, "group.join_request.created", response)
+    # 也推给群里的机器人，这样机器人才能做自动审批
+    await send_bot_conversation_event(
+        db,
+        "group.join_request.created",
+        conversation_id,
+        {
+            "conversation_id": conversation_id,
+            "request_id": join_request.id,
+            "user_id": join_request.requester_id,
+            "message": join_request.message,
+            "answer": join_request.answer,
+        },
+    )
     await send_conversation_updates(db, conversation_id, reviewer_ids)
     return response
 
@@ -1368,3 +1387,60 @@ async def read_conversation(
     await manager.send_to_users(member_ids, "conversation.read", receipt)
     await send_conversation_updates(db, conversation_id, {current_user.id})
     return receipt
+
+
+# ---------------------------------------------------------------------------
+# 戳一戳
+#
+# 完全不落库：它只是一条转瞬即逝的互动提示，存下来只会把消息表撑大，
+# 也没人会想翻历史「谁戳过我」。所以只走 WebSocket 广播。
+# ---------------------------------------------------------------------------
+
+POKE_COOLDOWN_SECONDS = 2.0
+# key 是 (发起者, 被戳者)，value 是上次成功的时间戳。进程内缓存即可 ——
+# 多 worker 下最坏情况是冷却被放宽几倍，而这只是防手抖连点，不是安全边界。
+_poke_cooldowns: dict[tuple[int, int], float] = {}
+
+
+def _poke_allowed(actor_id: int, target_id: int) -> bool:
+    now = asyncio.get_running_loop().time()
+    key = (actor_id, target_id)
+    last = _poke_cooldowns.get(key)
+    if last is not None and now - last < POKE_COOLDOWN_SECONDS:
+        return False
+    _poke_cooldowns[key] = now
+    if len(_poke_cooldowns) > 5000:
+        # 简单封顶，别让长期运行的进程无限攒 key
+        stale = [k for k, v in _poke_cooldowns.items() if now - v > 60]
+        for k in stale:
+            _poke_cooldowns.pop(k, None)
+    return True
+
+
+@router.post("/{conversation_id}/members/{user_id}/poke", response_model=MessageResponse)
+async def poke_member(
+    conversation_id: int,
+    user_id: int,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> MessageResponse:
+    if user_id == current_user.id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot poke yourself")
+    await conversation_service.require_membership(db, conversation_id, current_user.id)
+    target = await conversation_service.get_member(db, conversation_id, user_id)
+    if not _poke_allowed(current_user.id, user_id):
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Poking too fast")
+
+    member_ids = await online_conversation_member_ids(db, conversation_id)
+    await manager.send_to_users(
+        member_ids,
+        "conversation.member.poked",
+        {
+            "conversation_id": conversation_id,
+            "actor_id": current_user.id,
+            "actor_name": display_name(current_user, f"用户 {current_user.id}"),
+            "user_id": user_id,
+            "user_name": display_name(target.user, f"用户 {user_id}"),
+        },
+    )
+    return MessageResponse(detail="Poked")
