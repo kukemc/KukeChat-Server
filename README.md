@@ -19,7 +19,7 @@
 
 ## 关于
 
-这是 [KukeChat](https://github.com/kukemc/KukeChat-Client) 的服务端 —— 一个面向 CCW / Scratch 创作社区的实时聊天系统。206 个 REST 端点 + 三条 WebSocket 通道，覆盖私聊、群聊、好友、动态、组队、任务、机器人、举报处置与后台管理。
+这是 [KukeChat](https://github.com/kukemc/KukeChat-Client) 的服务端 —— 一个面向 CCW / Scratch 创作社区的实时聊天系统。214 个 REST 端点 + 三条 WebSocket 通道，覆盖私聊、群聊、好友、动态、组队、任务、机器人、举报处置与后台管理。
 
 配上客户端仓库，你可以完整地自建一套属于自己社区的聊天服务。
 

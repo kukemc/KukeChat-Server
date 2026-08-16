@@ -7,7 +7,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.schemas.conversation import ConversationMemberRead, ConversationRead
-from app.models.enums import MemberRole, MessageType
+from app.models.enums import MessageType
 from app.schemas.user import UserPublic
 
 
@@ -359,10 +359,6 @@ class BotMemberMuteUpdate(BaseModel):
 
     muted: bool = True
     minutes: int | None = Field(default=None, ge=0, le=60 * 24 * 365)
-
-
-class BotMemberRoleUpdate(BaseModel):
-    role: Literal[MemberRole.ADMIN, MemberRole.MEMBER]
 
 
 class BotJoinRequestReview(BaseModel):

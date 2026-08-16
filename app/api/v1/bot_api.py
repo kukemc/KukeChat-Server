@@ -19,7 +19,7 @@ from app.core.database import get_db
 from app.core.dependencies import get_current_bot
 from app.models.bot import Bot, BotInstallation
 from app.models.conversation import ConversationMember
-from app.models.enums import GroupJoinRequestStatus, MemberRole, MessageType
+from app.models.enums import GroupJoinRequestStatus, MessageType
 from app.models.message import Message
 from app.schemas.bot import (
     BotConversationInfoRead,
@@ -27,7 +27,6 @@ from app.schemas.bot import (
     BotDirectMessageCreate,
     BotJoinRequestReview,
     BotMemberMuteUpdate,
-    BotMemberRoleUpdate,
     BotMessageComponentUpdate,
     BotRuntimeMeRead,
     BotSendMessageCreate,
@@ -898,45 +897,6 @@ async def bot_update_member_mute(
     }
     await manager.send_to_users(member_ids, "group.member.mute_updated", event_data)
     await send_bot_conversation_event(db, "group.member.mute_updated", conversation_id, event_data)
-    await send_conversation_updates(db, conversation_id, member_ids)
-    return member
-
-
-@router.patch("/conversations/{conversation_id}/members/{user_id}/role", response_model=ConversationMemberRead)
-async def bot_update_member_role(
-    conversation_id: int,
-    user_id: int,
-    payload: BotMemberRoleUpdate,
-    context: Annotated[BotContext, Depends(get_current_bot)],
-    db: Annotated[AsyncSession, Depends(get_db)],
-) -> ConversationMember:
-    # 改角色是群主专属，_require_bot_staff 只挡住非管理员；真正的群主校验在 service 里
-    await _require_bot_staff(db, context, conversation_id)
-    previous = await conversation_service.get_member(db, conversation_id, user_id)
-    previous_role = previous.role
-    member = await conversation_service.update_member_role(db, conversation_id, context.user.id, user_id, payload.role)
-    response_cache.invalidate_conversation_members(conversation_id)
-    member_ids = await online_conversation_member_ids(db, conversation_id)
-    if member.role != previous_role:
-        actor_name = display_name(context.user, f"机器人 {context.user.id}")
-        target_name = display_name(member.user, f"用户 {user_id}")
-        role_text = "设为管理员" if member.role == MemberRole.ADMIN else "取消管理员"
-        await emit_system_message(
-            db,
-            conversation_id,
-            context.user,
-            f"{actor_name} 将 {target_name} {role_text}",
-            member_ids,
-            {
-                "system_event": "group.member.role_updated",
-                "actor_id": context.user.id,
-                "user_id": user_id,
-                "role": member.role.value,
-            },
-        )
-    event_data = {"conversation_id": conversation_id, "user_id": user_id, "role": member.role}
-    await manager.send_to_users(member_ids, "group.member.role_updated", event_data)
-    await send_bot_conversation_event(db, "group.member.role_updated", conversation_id, event_data)
     await send_conversation_updates(db, conversation_id, member_ids)
     return member
 
