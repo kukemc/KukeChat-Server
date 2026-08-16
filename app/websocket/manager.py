@@ -30,6 +30,13 @@ PRESENCE_USER_KEY_PREFIX = "kukechat:presence:user:"
 BOT_PRESENCE_USERS_KEY = "kukechat:presence:bots"
 BOT_PRESENCE_KEY_PREFIX = "kukechat:presence:bot:"
 
+# 在线用户集合的进程内短缓存时长。
+#
+# 这个集合只用来决定「这条消息往谁广播」，一秒内的陈旧无害：刚上线的人自己会
+# 拉历史消息，刚下线的人本来也收不到。而它在发消息热路径上每条消息要算两次
+# （挑收件人一次、真正投递前再交集一次），不缓存就是每条消息几十次 Redis 往返。
+PRESENCE_CACHE_TTL_SECONDS = 1.0
+
 
 @dataclass
 class _ConnectionState:
@@ -154,7 +161,13 @@ class _QueuedRealtimeManager:
                     await websocket.close(code=1008)
                 await self.disconnect(owner_id, websocket)
 
-    async def _publish(self, action: str, event_type: str, data: Any, owner_ids: set[int] | None = None) -> None:
+    async def _publish(self, action: str, event_type: str, encoded_data: Any, owner_ids: set[int] | None = None) -> None:
+        """把事件转发给其他 worker。
+
+        ``encoded_data`` 必须是已经过 ``jsonable_encoder`` 的结果 —— 调用方为了
+        发给本机连接本来就要编一次，这里再编一次等于每条消息把整个负载递归遍历
+        两遍，纯属浪费 CPU。
+        """
         if not self._redis:
             return
         message = {
@@ -163,7 +176,7 @@ class _QueuedRealtimeManager:
             "action": action,
             "owner_ids": sorted(owner_ids) if owner_ids is not None else None,
             "event_type": event_type,
-            "data": jsonable_encoder(data),
+            "data": encoded_data,
         }
         try:
             await self._redis.publish(settings.realtime_redis_channel, json.dumps(message))
@@ -203,6 +216,11 @@ class ConnectionManager(_QueuedRealtimeManager):
     def __init__(self) -> None:
         super().__init__("user")
         self._presence_task: asyncio.Task[None] | None = None
+        self._online_ids_cache: tuple[float, frozenset[int]] | None = None
+
+    def _invalidate_online_cache(self) -> None:
+        """本进程的连接有变化时立刻作废缓存，别让自己看到自己的陈旧状态。"""
+        self._online_ids_cache = None
 
     async def start(self) -> None:
         await super().start()
@@ -222,10 +240,12 @@ class ConnectionManager(_QueuedRealtimeManager):
         was_online = await self.is_online_global(user_id)
         connection_id = await super().connect(user_id, websocket)
         await self._add_presence(user_id, connection_id)
+        self._invalidate_online_cache()
         return not was_online
 
     async def disconnect(self, user_id: int, websocket: WebSocket) -> bool:
         await super().disconnect(user_id, websocket)
+        self._invalidate_online_cache()
         return not await self.is_online_global(user_id)
 
     async def _after_connection_removed(self, user_id: int, state: _ConnectionState) -> None:
@@ -304,35 +324,56 @@ class ConnectionManager(_QueuedRealtimeManager):
             return
         try:
             now = int(time.time())
+            # 每个本地用户原本要 3 次串行往返，本进程连着几百人时这个心跳自己
+            # 就能占满一整轮；合成一个 pipeline 后是一次往返。
+            pipe = self._redis.pipeline()
             for user_id, connections in list(self._connections.items()):
-                key = self._presence_key(user_id)
                 if not connections:
                     continue
-                await self._redis.sadd(key, *(state.connection_id for state in connections.values()))
-                await self._redis.expire(key, PRESENCE_TTL_SECONDS)
-                await self._redis.sadd(PRESENCE_USERS_KEY, user_id)
-            await self._redis.set("kukechat:presence:last_refresh", now, ex=PRESENCE_TTL_SECONDS)
+                key = self._presence_key(user_id)
+                pipe.sadd(key, *(state.connection_id for state in connections.values()))
+                pipe.expire(key, PRESENCE_TTL_SECONDS)
+                pipe.sadd(PRESENCE_USERS_KEY, user_id)
+            pipe.set("kukechat:presence:last_refresh", now, ex=PRESENCE_TTL_SECONDS)
+            await pipe.execute()
         except Exception:
             logger.exception("Redis presence refresh failed")
 
     async def online_user_ids_global(self) -> set[int]:
         if not self.redis_enabled() or not self._redis:
             return self.online_user_ids()
+
+        cached = self._online_ids_cache
+        if cached is not None and time.monotonic() - cached[0] < PRESENCE_CACHE_TTL_SECONDS:
+            return set(cached[1])
+
         try:
             raw_ids = await self._redis.smembers(PRESENCE_USERS_KEY)
-            online_ids: set[int] = set()
-            stale_ids: list[int] = []
+            user_ids: list[int] = []
             for raw_id in raw_ids:
                 try:
-                    user_id = int(raw_id)
+                    user_ids.append(int(raw_id))
                 except (TypeError, ValueError):
                     continue
-                if await self._redis.exists(self._presence_key(user_id)):
-                    online_ids.add(user_id)
-                else:
-                    stale_ids.append(user_id)
+
+            online_ids: set[int] = set()
+            stale_ids: list[int] = []
+            if user_ids:
+                # 原来是逐个 await EXISTS —— 在线 N 人就是 N 次串行往返，
+                # 而这条路径每发一条消息都要走。pipeline 把它压成一次往返。
+                pipe = self._redis.pipeline()
+                for user_id in user_ids:
+                    pipe.exists(self._presence_key(user_id))
+                alive_flags = await pipe.execute()
+                for user_id, alive in zip(user_ids, alive_flags):
+                    if alive:
+                        online_ids.add(user_id)
+                    else:
+                        stale_ids.append(user_id)
+
             if stale_ids:
                 await self._redis.srem(PRESENCE_USERS_KEY, *stale_ids)
+            self._online_ids_cache = (time.monotonic(), frozenset(online_ids))
             return online_ids
         except Exception:
             logger.exception("Redis presence read failed")
@@ -369,7 +410,7 @@ class ConnectionManager(_QueuedRealtimeManager):
             return
         payload = {"type": event_type, "data": jsonable_encoder(data)}
         await self._send_to_owner_local(user_id, payload)
-        await self._publish("user", event_type, data, {user_id})
+        await self._publish("user", event_type, payload["data"], {user_id})
 
     async def send_to_users(self, user_ids: list[int] | set[int], event_type: str, data: Any) -> None:
         owner_ids = set(user_ids) & await self.online_user_ids_global()
@@ -377,17 +418,17 @@ class ConnectionManager(_QueuedRealtimeManager):
             return
         payload = {"type": event_type, "data": jsonable_encoder(data)}
         await self._send_to_owners_local(owner_ids, payload)
-        await self._publish("users", event_type, data, owner_ids)
+        await self._publish("users", event_type, payload["data"], owner_ids)
 
     async def disconnect_user(self, user_id: int, event_type: str, data: Any) -> None:
         payload = {"type": event_type, "data": jsonable_encoder(data)}
         await self._close_owners_local({user_id}, payload)
-        await self._publish("disconnect", event_type, data, {user_id})
+        await self._publish("disconnect", event_type, payload["data"], {user_id})
 
     async def broadcast(self, event_type: str, data: Any) -> None:
         payload = {"type": event_type, "data": jsonable_encoder(data)}
         await self._broadcast_local(payload)
-        await self._publish("broadcast", event_type, data)
+        await self._publish("broadcast", event_type, payload["data"])
 
 
 class AdminConnectionManager(_QueuedRealtimeManager):
@@ -403,7 +444,7 @@ class AdminConnectionManager(_QueuedRealtimeManager):
     async def broadcast(self, event_type: str, data: Any) -> None:
         payload = {"type": event_type, "data": jsonable_encoder(data)}
         await self._broadcast_local(payload)
-        await self._publish("broadcast", event_type, data)
+        await self._publish("broadcast", event_type, payload["data"])
 
 
 class BotConnectionManager(_QueuedRealtimeManager):
@@ -521,7 +562,7 @@ class BotConnectionManager(_QueuedRealtimeManager):
     async def send_to_bot(self, bot_id: int, event_type: str, data: Any) -> None:
         payload = {"type": event_type, "data": jsonable_encoder(data)}
         await self._send_to_owner_local(bot_id, payload)
-        await self._publish("user", event_type, data, {bot_id})
+        await self._publish("user", event_type, payload["data"], {bot_id})
 
     async def send_to_bots(self, bot_ids: list[int] | set[int], event_type: str, data: Any) -> None:
         owner_ids = set(bot_ids)
@@ -529,7 +570,7 @@ class BotConnectionManager(_QueuedRealtimeManager):
             return
         payload = {"type": event_type, "data": jsonable_encoder(data)}
         await self._send_to_owners_local(owner_ids, payload)
-        await self._publish("users", event_type, data, owner_ids)
+        await self._publish("users", event_type, payload["data"], owner_ids)
 
 
 class GameConnectionManager(_QueuedRealtimeManager):
@@ -554,7 +595,7 @@ class GameConnectionManager(_QueuedRealtimeManager):
     async def send_to_conversation(self, conversation_id: int, event_type: str, data: Any) -> None:
         payload = {"type": event_type, "data": jsonable_encoder(data)}
         await self._send_to_owner_local(conversation_id, payload)
-        await self._publish("user", event_type, data, {conversation_id})
+        await self._publish("user", event_type, payload["data"], {conversation_id})
 
 
 manager = ConnectionManager()
