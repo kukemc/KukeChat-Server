@@ -67,7 +67,7 @@ from app.services import group_activity as group_activity_service
 from app.services import messages as message_service
 from app.services import moderation as moderation_service
 from app.services import response_cache
-from app.websocket.manager import admin_manager, bot_manager, manager
+from app.websocket.manager import admin_manager, bot_manager, game_manager, manager
 
 
 router = APIRouter()
@@ -298,6 +298,7 @@ async def send_message_updates(db: AsyncSession, event_type: str, message: Messa
         if online_ids:
             await manager.send_to_users(online_ids, event_type, data)
         await send_bot_message_updates(db, event_type, message.conversation_id, data, sender_id=message.sender_id)
+        await send_game_message_updates(db, event_type, message.conversation_id, data)
         return
     if event_type == "message.recalled":
         data = {
@@ -315,12 +316,24 @@ async def send_message_updates(db: AsyncSession, event_type: str, message: Messa
             message.conversation_id,
             data,
         )
+        await send_game_message_updates(db, event_type, message.conversation_id, data)
         return
     if not online_ids:
         return
     for user_id in online_ids:
         data = await message_service.build_message_read(db, message, user_id)
         await manager.send_to_user(user_id, event_type, data)
+
+
+async def send_game_message_updates(db: AsyncSession, event_type: str, conversation_id: int, data) -> None:
+    """把消息同步给游戏模式的观众。
+
+    观众可能未登录，按会话 id 分组订阅，因此不能复用按用户投递的通道。
+    只有开启了游戏模式的群才会有订阅者，未开启时这里是一次无操作的查表。
+    """
+    if game_manager.viewer_count(conversation_id) == 0:
+        return
+    await game_manager.send_to_conversation(conversation_id, event_type, data)
 
 
 async def send_bot_message_updates(db: AsyncSession, event_type: str, conversation_id: int, data, *, sender_id: int | None = None) -> None:

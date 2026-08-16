@@ -9,7 +9,7 @@ from app.models.user import User
 from app.services.auth import mark_user_seen
 from app.services import response_cache
 from app.services.bots import authenticate_bot_key
-from app.websocket.manager import admin_manager, bot_manager, manager
+from app.websocket.manager import admin_manager, bot_manager, game_manager, manager
 
 
 router = APIRouter()
@@ -109,3 +109,35 @@ async def bot_websocket_endpoint(websocket: WebSocket, key: str = Query(...)) ->
                 await websocket.send_text("pong")
     except WebSocketDisconnect:
         await bot_manager.disconnect(context.bot.id, websocket)
+
+
+@router.websocket("/game/ws")
+async def game_websocket_endpoint(
+    websocket: WebSocket,
+    conversation_id: int = Query(..., gt=0),
+    creation_oid: str = Query(..., min_length=1, max_length=64),
+) -> None:
+    """游戏模式的匿名订阅通道。
+
+    作品里的游玩者不需要账号就能接收消息，因此这里不校验令牌，
+    只校验「该群确实开启了游戏模式且绑定的正是这个作品」。
+    """
+    from app.core.database import AsyncSessionLocal
+    from app.services import game_mode as game_service
+
+    async with AsyncSessionLocal() as db:
+        try:
+            await game_service.resolve_game_conversation(db, conversation_id, creation_oid)
+        except HTTPException as exc:
+            await websocket.close(code=4403, reason=str(exc.detail)[:120])
+            return
+
+    await game_manager.connect(conversation_id, websocket)
+    try:
+        while True:
+            # 客户端只收不发，这里仅用于保持连接并感知断开
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        await game_manager.disconnect(conversation_id, websocket)

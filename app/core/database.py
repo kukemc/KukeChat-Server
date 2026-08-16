@@ -161,6 +161,8 @@ async def init_db() -> None:
                 ("posts", "repost_of_id", "repost_of_id INTEGER"),
                 ("posts", "pinned_at", "pinned_at DATETIME"),
                 ("posts", "ccw_creations", "ccw_creations TEXT"),
+                ("conversations", "game_mode_enabled", "game_mode_enabled BOOLEAN NOT NULL DEFAULT 0"),
+                ("conversations", "game_creation_oid", "game_creation_oid VARCHAR(64)"),
                 ("post_topics", "moderation_status", "moderation_status VARCHAR(20) NOT NULL DEFAULT 'approved'"),
                 ("post_topics", "created_by_id", "created_by_id INTEGER"),
                 ("post_comments", "moderation_status", "moderation_status VARCHAR(20) NOT NULL DEFAULT 'approved'"),

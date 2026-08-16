@@ -31,6 +31,10 @@ class Conversation(Base):
     join_mode: Mapped[str] = mapped_column(String(20), default="approval", server_default="approval")
     auto_approve: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
     join_question: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    # 游戏模式：把群聊接进一个 CCW 作品，作品内的玩家可实时收发该群消息。
+    # 开启后该群历史消息对所有游玩者可见，因此仅允许公开群开启（见 services/game_mode.py）。
+    game_mode_enabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    game_creation_oid: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     tasks_enabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
     task_creation_permission: Mapped[str] = mapped_column(String(20), default="members", server_default="members")
     direct_key: Mapped[str | None] = mapped_column(String(80), unique=True, nullable=True, index=True)

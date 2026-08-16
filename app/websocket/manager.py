@@ -532,6 +532,32 @@ class BotConnectionManager(_QueuedRealtimeManager):
         await self._publish("users", event_type, data, owner_ids)
 
 
+class GameConnectionManager(_QueuedRealtimeManager):
+    """游戏模式的匿名订阅通道。
+
+    与其它通道不同，这里的连接按「会话 id」分组而不是按用户 —— 作品里的
+    游玩者可能没有登录，只需要收到某个群的消息即可。
+    """
+
+    def __init__(self) -> None:
+        super().__init__("game")
+
+    async def connect(self, conversation_id: int, websocket: WebSocket) -> str:
+        return await super().connect(conversation_id, websocket)
+
+    async def disconnect(self, conversation_id: int, websocket: WebSocket) -> None:
+        await super().disconnect(conversation_id, websocket)
+
+    def viewer_count(self, conversation_id: int) -> int:
+        return len(self._connections.get(conversation_id, {}))
+
+    async def send_to_conversation(self, conversation_id: int, event_type: str, data: Any) -> None:
+        payload = {"type": event_type, "data": jsonable_encoder(data)}
+        await self._send_to_owner_local(conversation_id, payload)
+        await self._publish("user", event_type, data, {conversation_id})
+
+
 manager = ConnectionManager()
 admin_manager = AdminConnectionManager()
 bot_manager = BotConnectionManager()
+game_manager = GameConnectionManager()
