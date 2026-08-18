@@ -18,7 +18,8 @@ def utc_now() -> datetime:
 class Message(Base):
     __tablename__ = "messages"
 
-    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    # 与 rowid 主键重复，不再单独建索引
+    id: Mapped[int] = mapped_column(primary_key=True)
     conversation_id: Mapped[int] = mapped_column(ForeignKey("conversations.id", ondelete="CASCADE"), index=True)
     sender_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     type: Mapped[MessageType] = mapped_column(SAEnum(MessageType, native_enum=False), default=MessageType.TEXT)

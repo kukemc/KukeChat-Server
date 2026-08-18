@@ -45,6 +45,11 @@ class Settings(BaseSettings):
     content_moderation_retry_interval_seconds: int = Field(default=300, ge=10, le=86400)
     content_moderation_retry_min_age_seconds: int = Field(default=120, ge=0, le=86400)
     content_moderation_retry_batch_size: int = Field(default=20, ge=1, le=200)
+    # 审核日志里 allow / error 记录的保留天数。这两类占全表 98%，是「这条没问题」
+    # 和「这次调用失败了」，除了排查当下问题没别的用途，却带着正文和原始响应
+    # 永久堆积 —— 一度撑到 50 万行、占掉整个数据库的 64%。设 0 表示不清理。
+    content_moderation_log_retention_days: int = Field(default=7, ge=0, le=3650)
+    content_moderation_log_cleanup_batch_size: int = Field(default=5000, ge=100, le=100000)
     moderation_alert_email: str | None = None
     moderation_alert_cooldown_minutes: int = Field(default=30, ge=1, le=1440)
     # CCW 账号绑定：用户在指定作品下留言，服务端轮询评论完成校验。

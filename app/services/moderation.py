@@ -7,6 +7,7 @@ import json
 import logging
 import re
 import threading
+import time
 import unicodedata
 from datetime import datetime, timedelta, timezone
 from numbers import Real
@@ -14,7 +15,7 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
@@ -115,7 +116,60 @@ def schedule_teamup_comment_moderation(comment_id: int) -> None:
     _schedule_task(_moderate_teamup_comment_task(comment_id))
 
 
+# 审核日志清理的最小间隔。跟着重试循环搭车执行，但没必要每 5 分钟扫一次，
+# 一小时一遍足够跟上每天几千行的增长。
+MODERATION_LOG_CLEANUP_INTERVAL_SECONDS = 3600
+_last_log_cleanup_at: float = 0.0
+
+
+async def prune_moderation_logs() -> int:
+    """删掉过期的低价值审核记录，返回删除行数。
+
+    永久保留真正有价值的：拦下来的（block）、需要人工复核的（review），以及
+    产生过处置动作的（撤回、封号）。剩下的 allow / error 只留最近若干天 ——
+    它们占全表 98%，admin 页面默认也不显示。
+
+    分批删除：一次性删几十万行会把 WAL 撑得比数据库还大，而且长事务会挡住
+    正常的写入。
+    """
+    retention_days = settings.content_moderation_log_retention_days
+    if retention_days <= 0:
+        return 0
+
+    cutoff = datetime.now(UTC) - timedelta(days=retention_days)
+    batch_size = settings.content_moderation_log_cleanup_batch_size
+    deleted = 0
+    async with AsyncSessionLocal() as db:
+        while True:
+            stale_ids = (
+                await db.execute(
+                    select(ContentModerationRecord.id)
+                    .where(
+                        ContentModerationRecord.created_at < cutoff,
+                        ContentModerationRecord.decision.notin_(("block", "review")),
+                        ContentModerationRecord.action_taken.in_(
+                            (ModerationAction.NONE, ModerationAction.ERROR)
+                        ),
+                    )
+                    .limit(batch_size)
+                )
+            ).scalars().all()
+            if not stale_ids:
+                break
+            await db.execute(
+                delete(ContentModerationRecord).where(ContentModerationRecord.id.in_(list(stale_ids)))
+            )
+            await db.commit()
+            deleted += len(stale_ids)
+            # 让出事件循环，别让清理把请求处理饿着
+            await asyncio.sleep(0)
+    if deleted:
+        logger.info("Pruned %d stale moderation records older than %d days", deleted, retention_days)
+    return deleted
+
+
 async def _moderation_retry_worker() -> None:
+    global _last_log_cleanup_at
     while True:
         try:
             await retry_pending_post_moderation()
@@ -123,6 +177,17 @@ async def _moderation_retry_worker() -> None:
             raise
         except Exception:
             logger.exception("Pending post moderation retry failed")
+
+        now = time.monotonic()
+        if now - _last_log_cleanup_at >= MODERATION_LOG_CLEANUP_INTERVAL_SECONDS:
+            _last_log_cleanup_at = now
+            try:
+                await prune_moderation_logs()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Moderation log cleanup failed")
+
         await asyncio.sleep(settings.content_moderation_retry_interval_seconds)
 
 

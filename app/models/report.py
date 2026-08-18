@@ -60,8 +60,11 @@ class AdminAuditLog(Base):
 class ContentModerationRecord(Base):
     __tablename__ = "content_moderation_records"
 
-    id: Mapped[int] = mapped_column(primary_key=True, index=True)
-    source: Mapped[ModerationSource] = mapped_column(SAEnum(ModerationSource, native_enum=False), index=True)
+    # 这张表每条消息写一行，索引越多写入越慢。下面几列刻意不建索引：
+    # id 与 rowid 主键重复；source / content_type / action_taken / severity
+    # 都只有个位数个不同值，过滤时扫表比走索引还快。
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source: Mapped[ModerationSource] = mapped_column(SAEnum(ModerationSource, native_enum=False))
     message_id: Mapped[int | None] = mapped_column(ForeignKey("messages.id", ondelete="SET NULL"), nullable=True, index=True)
     post_id: Mapped[int | None] = mapped_column(ForeignKey("posts.id", ondelete="SET NULL"), nullable=True, index=True)
     post_topic_id: Mapped[int | None] = mapped_column(ForeignKey("post_topics.id", ondelete="SET NULL"), nullable=True, index=True)
@@ -72,11 +75,11 @@ class ContentModerationRecord(Base):
     report_id: Mapped[int | None] = mapped_column(ForeignKey("user_reports.id", ondelete="SET NULL"), nullable=True, index=True)
     conversation_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
-    content_type: Mapped[str] = mapped_column(String(20), index=True)
+    content_type: Mapped[str] = mapped_column(String(20))
     content_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     content_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     decision: Mapped[str] = mapped_column(String(20), index=True)
-    severity: Mapped[int] = mapped_column(Integer, default=0, server_default="0", index=True)
+    severity: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     categories: Mapped[str | None] = mapped_column(Text, nullable=True)
     confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -84,7 +87,7 @@ class ContentModerationRecord(Base):
     evidence_snapshot: Mapped[str | None] = mapped_column(Text, nullable=True)
     evidence_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     action_taken: Mapped[ModerationAction] = mapped_column(
-        SAEnum(ModerationAction, native_enum=False), default=ModerationAction.NONE, server_default="NONE", index=True
+        SAEnum(ModerationAction, native_enum=False), default=ModerationAction.NONE, server_default="NONE"
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
     acted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
