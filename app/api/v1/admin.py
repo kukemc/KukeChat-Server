@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -13,6 +13,7 @@ from app.models.user import User
 from app.schemas.message import MessageRead
 from app.schemas.post import AdminPostRead
 from app.schemas.report import (
+    AdminBanPage,
     AdminAuditLogRead,
     AdminConversationUpdate,
     AdminConversationRead,
@@ -85,15 +86,23 @@ async def admin_user_detail(
     return await report_service.get_admin_user(db, user_id)
 
 
-@router.get("/bans", response_model=list[AdminUserRead])
+@router.get("/bans", response_model=AdminBanPage)
 async def admin_banned_users(
     _admin: Annotated[User, Depends(get_current_admin)],
     db: Annotated[AsyncSession, Depends(get_db)],
     q: Annotated[str | None, Query(max_length=100)] = None,
-    limit: Annotated[int, Query(ge=1, le=500)] = 100,
+    limit: Annotated[int, Query(ge=1, le=500)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
-) -> list[AdminUserRead]:
-    return await report_service.list_admin_banned_users(db, limit, offset, q)
+    sort: Annotated[Literal["banned_at", "expires", "username", "id", "created_at"], Query()] = "banned_at",
+    order: Annotated[Literal["asc", "desc"], Query()] = "desc",
+    scope: Annotated[Literal["all", "permanent", "temporary", "expiring"], Query()] = "all",
+) -> AdminBanPage:
+    """封禁名单。
+
+    `q` 同时按用户名 / 昵称 / 邮箱模糊匹配和账号 ID 精确匹配（支持 `#123` 写法）。
+    每行会带上这次封禁的来源、操作者和触发它的那条消息。
+    """
+    return await report_service.list_admin_bans(db, limit, offset, q, sort, order, scope)
 
 
 @router.get("/platform-admins", response_model=list[AdminUserRead])

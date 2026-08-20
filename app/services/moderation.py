@@ -1074,6 +1074,7 @@ async def _apply_moderation_action(db: AsyncSession, message: Message, record: C
         else:
             user.status = UserStatus.DISABLED
             user.banned_until = None if action == ModerationAction.PERMANENT_BAN else now + timedelta(hours=24 * 7)
+            user.banned_at = now
             user.ban_reason = _ban_reason(record)
 
     db.add(
@@ -1208,6 +1209,7 @@ async def _apply_user_punishment(db: AsyncSession, user_id: int, record: Content
             return ModerationAction.RECALLED
         user.status = UserStatus.DISABLED
         user.banned_until = None if action == ModerationAction.PERMANENT_BAN else datetime.now(UTC) + timedelta(hours=24 * 7)
+        user.banned_at = datetime.now(UTC)
         user.ban_reason = _ban_reason(record)
         await db.execute(
             update(AuthSession)

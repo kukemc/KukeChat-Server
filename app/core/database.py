@@ -102,6 +102,7 @@ async def init_db() -> None:
                 ("users", "platform_role", "platform_role VARCHAR(5) NOT NULL DEFAULT 'USER'"),
                 ("users", "status", "status VARCHAR(8) NOT NULL DEFAULT 'ACTIVE'"),
                 ("users", "banned_until", "banned_until DATETIME"),
+                ("users", "banned_at", "banned_at DATETIME"),
                 ("users", "ban_reason", "ban_reason TEXT"),
                 ("users", "last_login_ip", "last_login_ip VARCHAR(45)"),
                 ("users", "last_login_at", "last_login_at DATETIME"),

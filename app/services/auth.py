@@ -107,6 +107,7 @@ async def ensure_user_not_disabled(db: AsyncSession, user: User) -> None:
         if banned_until <= now:
             user.status = UserStatus.ACTIVE
             user.banned_until = None
+            user.banned_at = None
             user.ban_reason = None
             await db.commit()
             await db.refresh(user)

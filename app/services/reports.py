@@ -20,7 +20,7 @@ from app.models.message import Message, MessageVisibility
 from app.models.post import Post
 from app.models.report import AdminAuditLog, ContentModerationRecord, PasswordResetRequest, UserReport
 from app.models.user import AuthSession, User
-from app.schemas.report import AdminConversationRead, AdminConversationUpdate, AdminPasswordResetReview, AdminUserCreate, AdminUserPasswordReset, AdminUserRead, ReportConversationContext, ReportCreate, ReportRead, ReportReview, ReportTargetContext
+from app.schemas.report import AdminBanPage, AdminBanRead, AdminConversationRead, AdminConversationUpdate, AdminPasswordResetReview, AdminUserCreate, AdminUserPasswordReset, AdminUserRead, BanEvidence, ReportConversationContext, ReportCreate, ReportRead, ReportReview, ReportTargetContext
 from app.schemas.user import UserPublic
 from app.services.messages import admin_recall_message, get_visible_message_for_user
 from app.services.upload_paths import require_message_image_upload_url
@@ -848,6 +848,7 @@ async def review_report(db: AsyncSession, report_id: int, reviewer_id: int, payl
         assert target_user is not None
         target_user.status = UserStatus.DISABLED
         target_user.banned_until = _resolve_ban_until(payload.ban_until, payload.ban_duration_hours)
+        target_user.banned_at = now
         target_user.ban_reason = payload.review_note or report.reason
         banned_until = target_user.banned_until
         await db.execute(
@@ -908,6 +909,267 @@ async def get_admin_user(db: AsyncSession, user_id: int) -> AdminUserRead:
     return users[0]
 
 
+def _aware_utc(value: datetime) -> datetime:
+    """SQLite 存回来的时间没有时区信息，直接和 aware 的 now 相减会抛异常。"""
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
+# 封禁列表支持的排序方式。写死成白名单而不是直接拼字段名，避免把排序参数
+# 变成一个能碰到任意列的注入面。
+BAN_SORT_COLUMNS = {
+    "banned_at": User.banned_at,
+    "expires": User.banned_until,
+    "username": User.username,
+    "id": User.id,
+    "created_at": User.created_at,
+}
+
+
+def _ban_search_clause(query: str | None):
+    """封禁列表的搜索条件。
+
+    原来只匹配用户名 / 昵称 / 邮箱，想按 ID 找人只能靠肉眼翻页。现在纯数字
+    （以及 "#123" 这种写法）按 ID 精确匹配，其余按文本模糊匹配；数字串同时
+    也当文本匹配一次，这样用户名里含数字的账号照样能搜到。
+    """
+    keyword = (query or "").strip()
+    if not keyword:
+        return None
+    clauses = [
+        User.username.ilike(f"%{keyword}%"),
+        User.nickname.ilike(f"%{keyword}%"),
+        User.email.ilike(f"%{keyword}%"),
+    ]
+    digits = keyword[1:] if keyword.startswith("#") else keyword
+    if digits.isdigit():
+        try:
+            clauses.append(User.id == int(digits))
+        except ValueError:
+            pass
+    return or_(*clauses)
+
+
+def _ban_scope_clauses(scope: str, now: datetime) -> list:
+    """按封禁类型筛选。"""
+    if scope == "permanent":
+        return [User.banned_until.is_(None)]
+    if scope == "temporary":
+        return [User.banned_until.is_not(None)]
+    if scope == "expiring":
+        # 24 小时内到期，方便盯住马上要放出来的账号
+        return [User.banned_until.is_not(None), User.banned_until <= now + timedelta(hours=24)]
+    return []
+
+
+async def list_admin_bans(
+    db: AsyncSession,
+    limit: int = 50,
+    offset: int = 0,
+    query: str | None = None,
+    sort: str = "banned_at",
+    order: str = "desc",
+    scope: str = "all",
+) -> AdminBanPage:
+    """封禁名单。
+
+    相比原来的实现，这里多做三件事：可排序、可筛选、把封禁的来龙去脉一并带上
+    （谁封的、因为哪条消息、命中了什么类别），省得为了看一次原因还要去翻审核
+    记录。
+    """
+    await _release_expired_bans(db)
+    now = datetime.now(UTC)
+
+    conditions = [User.status == UserStatus.DISABLED, *_ban_scope_clauses(scope, now)]
+    search = _ban_search_clause(query)
+    if search is not None:
+        conditions.append(search)
+
+    total = int((await db.execute(select(func.count(User.id)).where(*conditions))).scalar_one() or 0)
+
+    column = BAN_SORT_COLUMNS.get(sort, User.banned_at)
+    direction = column.asc() if order == "asc" else column.desc()
+    # banned_at 是后加的字段，老数据为空；用 id 兜底保证顺序稳定、翻页不跳行
+    stmt = (
+        select(User)
+        .where(*conditions)
+        .order_by(direction, User.id.desc())
+        .offset(offset)
+        .limit(limit)
+    )
+    users = list((await db.execute(stmt)).scalars().all())
+    if not users:
+        return AdminBanPage(items=[], total=total)
+
+    user_ids = [user.id for user in users]
+    evidence_map = await _latest_ban_evidence(db, user_ids)
+    audit_map = await _latest_ban_audit(db, user_ids)
+    ban_counts = await _count_by_user(
+        db,
+        select(ContentModerationRecord.user_id, func.count())
+        .where(
+            ContentModerationRecord.user_id.in_(user_ids),
+            ContentModerationRecord.action_taken.in_([ModerationAction.USER_BANNED, ModerationAction.PERMANENT_BAN]),
+        )
+        .group_by(ContentModerationRecord.user_id),
+    )
+    message_counts = await _count_by_user(
+        db,
+        select(Message.sender_id, func.count()).where(Message.sender_id.in_(user_ids)).group_by(Message.sender_id),
+    )
+
+    items: list[AdminBanRead] = []
+    for user in users:
+        evidence = evidence_map.get(user.id)
+        audit = audit_map.get(user.id)
+        source, operator_id, operator_name, report_id = _resolve_ban_source(evidence, audit)
+        banned_until = _aware_utc(user.banned_until) if user.banned_until else None
+        items.append(
+            AdminBanRead(
+                id=user.id,
+                username=user.username,
+                nickname=user.nickname,
+                avatar_url=user.avatar_url,
+                email=user.email,
+                created_at=user.created_at,
+                status=user.status,
+                banned_at=user.banned_at,
+                banned_until=user.banned_until,
+                ban_reason=user.ban_reason,
+                permanent=user.banned_until is None,
+                expires_in_seconds=None if banned_until is None else max(0, int((banned_until - now).total_seconds())),
+                ban_source=source,
+                operator_id=operator_id,
+                operator_name=operator_name,
+                report_id=report_id,
+                evidence=evidence,
+                ban_count=ban_counts.get(user.id, 0),
+                message_count=message_counts.get(user.id, 0),
+            )
+        )
+    return AdminBanPage(items=items, total=total)
+
+
+def _resolve_ban_source(evidence: BanEvidence | None, audit: AdminAuditLog | None):
+    """判断这次封禁是自动审核触发的还是人工操作的。
+
+    两边都可能留下记录，取时间更晚的那条为准；实在判断不出就老实说 unknown，
+    别硬编一个来源误导人。
+    """
+    audit_at = _aware_utc(audit.created_at) if audit is not None else None
+    evidence_at = _aware_utc(evidence.created_at) if evidence is not None else None
+
+    if evidence_at is not None and (audit_at is None or evidence_at >= audit_at):
+        return "auto", None, None, None
+    if audit is None:
+        return "unknown", None, None, None
+
+    report_id = None
+    if audit.details:
+        try:
+            payload = json.loads(audit.details)
+            if isinstance(payload, dict):
+                raw = payload.get("report_id")
+                report_id = int(raw) if isinstance(raw, (int, str)) and str(raw).isdigit() else None
+        except (TypeError, ValueError, json.JSONDecodeError):
+            report_id = None
+
+    source = "report" if report_id is not None or audit.action.startswith("report.") else "manual"
+    operator = audit.actor
+    operator_name = None
+    if operator is not None:
+        operator_name = operator.nickname or operator.username
+    return source, audit.actor_id, operator_name, report_id
+
+
+async def _latest_ban_evidence(db: AsyncSession, user_ids: list[int]) -> dict[int, BanEvidence]:
+    """每个用户最近一条「导致封号」的审核记录。
+
+    审核日志的保留策略会永久保留产生过处置动作的记录，所以这里的证据不会因为
+    清理而丢失（见 app/services/moderation.py 的 prune_moderation_logs）。
+    """
+    if not user_ids:
+        return {}
+    rows = list(
+        (
+            await db.execute(
+                select(ContentModerationRecord)
+                .where(
+                    ContentModerationRecord.user_id.in_(user_ids),
+                    ContentModerationRecord.action_taken.in_(
+                        [ModerationAction.USER_BANNED, ModerationAction.PERMANENT_BAN]
+                    ),
+                )
+                .order_by(ContentModerationRecord.created_at.desc(), ContentModerationRecord.id.desc())
+            )
+        ).scalars().all()
+    )
+    latest: dict[int, ContentModerationRecord] = {}
+    for row in rows:
+        if row.user_id is not None and row.user_id not in latest:
+            latest[row.user_id] = row
+
+    conversation_ids = {r.conversation_id for r in latest.values() if r.conversation_id}
+    titles: dict[int, str | None] = {}
+    if conversation_ids:
+        title_rows = await db.execute(
+            select(Conversation.id, Conversation.title).where(Conversation.id.in_(conversation_ids))
+        )
+        titles = {cid: title for cid, title in title_rows.all()}
+
+    result: dict[int, BanEvidence] = {}
+    for user_id, row in latest.items():
+        categories: list[str] = []
+        if row.categories:
+            try:
+                parsed = json.loads(row.categories)
+                if isinstance(parsed, list):
+                    categories = [str(item) for item in parsed]
+                elif isinstance(parsed, dict):
+                    categories = [str(key) for key in parsed]
+            except (TypeError, ValueError, json.JSONDecodeError):
+                categories = [row.categories]
+        result[user_id] = BanEvidence(
+            record_id=row.id,
+            message_id=row.message_id,
+            conversation_id=row.conversation_id,
+            conversation_title=titles.get(row.conversation_id) if row.conversation_id else None,
+            content_type=row.content_type,
+            content_text=row.content_text,
+            categories=categories,
+            severity=row.severity,
+            confidence=row.confidence,
+            reason=row.reason,
+            decision=row.decision,
+            created_at=row.created_at,
+        )
+    return result
+
+
+async def _latest_ban_audit(db: AsyncSession, user_ids: list[int]) -> dict[int, AdminAuditLog]:
+    """每个用户最近一条与封禁有关的人工操作记录。"""
+    if not user_ids:
+        return {}
+    rows = list(
+        (
+            await db.execute(
+                select(AdminAuditLog)
+                .options(joinedload(AdminAuditLog.actor))
+                .where(
+                    AdminAuditLog.target_type == "user",
+                    AdminAuditLog.target_id.in_(user_ids),
+                    AdminAuditLog.action.in_(["user.status.update", "report.review", "report.reviewed"]),
+                )
+                .order_by(AdminAuditLog.created_at.desc(), AdminAuditLog.id.desc())
+            )
+        ).scalars().unique().all()
+    )
+    latest: dict[int, AdminAuditLog] = {}
+    for row in rows:
+        if row.target_id is not None and row.target_id not in latest:
+            latest[row.target_id] = row
+    return latest
+
+
 async def list_admin_banned_users(db: AsyncSession, limit: int = 100, offset: int = 0, query: str | None = None) -> list[AdminUserRead]:
     await _release_expired_bans(db)
     return await _list_admin_users(db, limit, offset, query, User.status == UserStatus.DISABLED)
@@ -921,7 +1183,7 @@ async def _release_expired_bans(db: AsyncSession) -> None:
     result = await db.execute(
         update(User)
         .where(User.status == UserStatus.DISABLED, User.banned_until.is_not(None), User.banned_until <= datetime.now(UTC))
-        .values(status=UserStatus.ACTIVE, banned_until=None, ban_reason=None)
+        .values(status=UserStatus.ACTIVE, banned_until=None, banned_at=None, ban_reason=None)
     )
     if result.rowcount:
         await db.commit()
@@ -1145,6 +1407,7 @@ async def update_user_status(
     user.status = UserStatus(user_status)
     if user.status == UserStatus.DISABLED:
         user.banned_until = _resolve_ban_until(banned_until, ban_duration_hours)
+        user.banned_at = datetime.now(UTC)
         user.ban_reason = reason
         await db.execute(
             update(AuthSession)
@@ -1153,6 +1416,7 @@ async def update_user_status(
         )
     else:
         user.banned_until = None
+        user.banned_at = None
         user.ban_reason = None
     db.add(
         AdminAuditLog(

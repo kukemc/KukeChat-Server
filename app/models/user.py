@@ -59,6 +59,8 @@ class User(Base):
         SAEnum(UserStatus, native_enum=False), default=UserStatus.ACTIVE, server_default="ACTIVE"
     )
     banned_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 封禁发生的时刻。没有它就只能拿注册时间给封禁列表排序，而那毫无意义。
+    banned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     ban_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     registration_ip: Mapped[str | None] = mapped_column(String(45), unique=True, index=True, nullable=True)
     last_login_ip: Mapped[str | None] = mapped_column(String(45), nullable=True)

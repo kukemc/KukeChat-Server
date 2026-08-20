@@ -5,7 +5,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 
-from app.models.enums import ModerationAction, ModerationSource, PasswordResetStatus, ReportStatus, ReportTargetType
+from app.models.enums import ModerationAction, ModerationSource, PasswordResetStatus, ReportStatus, ReportTargetType, UserStatus
 from app.schemas.message import MessageRead
 from app.schemas.post import AdminPostRead
 from app.schemas.user import UserPublic
@@ -33,6 +33,62 @@ class AdminUserRead(UserPublic):
     active_session_count: int = 0
     last_session_ip: str | None = None
     last_session_at: datetime | None = None
+
+
+class BanEvidence(BaseModel):
+    """触发这次封禁的那条内容。
+
+    封禁列表原先只有一句自由文本的 ban_reason，看不出到底因为哪条消息被封 ——
+    要判断封得冤不冤，就得翻到审核记录里去比对。这里把证据直接带上来。
+    """
+
+    record_id: int
+    message_id: int | None = None
+    conversation_id: int | None = None
+    conversation_title: str | None = None
+    content_type: str
+    content_text: str | None = None
+    categories: list[str] = []
+    severity: int = 0
+    confidence: float | None = None
+    reason: str | None = None
+    decision: str
+    created_at: datetime
+
+
+class AdminBanRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    username: str
+    nickname: str | None = None
+    avatar_url: str | None = None
+    email: str | None = None
+    created_at: datetime
+
+    status: UserStatus
+    banned_at: datetime | None = None
+    banned_until: datetime | None = None
+    ban_reason: str | None = None
+    # banned_until 为空即永久，单独给个布尔量省得前端到处判空
+    permanent: bool = False
+    # 距离解封还剩多少秒；永久封禁为 None，已到期为 0
+    expires_in_seconds: int | None = None
+
+    ban_source: Literal["auto", "manual", "report", "unknown"] = "unknown"
+    operator_id: int | None = None
+    operator_name: str | None = None
+    report_id: int | None = None
+    evidence: BanEvidence | None = None
+
+    # 这个号历史上被自动封过几次，用来一眼看出惯犯
+    ban_count: int = 0
+    message_count: int = 0
+
+
+class AdminBanPage(BaseModel):
+    items: list[AdminBanRead]
+    total: int
 
 
 class ReportCreate(BaseModel):
