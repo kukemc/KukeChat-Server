@@ -69,6 +69,16 @@ class CaseRead(BaseModel):
     first_report_id: int | None = None
     created_at: datetime
     closed_at: datetime | None = None
+    # 离开委员队列的方式：consensus / no_consensus / timeout / manual；没进过或还在队列里为 null
+    jury_outcome: str | None = None
+    # 不能交给委员的原因，目前只有 sensitive
+    jury_block_reason: str | None = None
+    queued_at: datetime | None = None
+    escalated_at: datetime | None = None
+    # 正在公示栏里的案件才有
+    published_at: datetime | None = None
+    overturned_at: datetime | None = None
+    overturn_note: str | None = None
 
 
 class CasePage(BaseModel):
@@ -83,6 +93,51 @@ class JuryVoteSummary(BaseModel):
     note: str | None = None
     voted_at: datetime | None = None
     juror: UserPublic | None = None
+    alias: str | None = None
+    tier: str | None = None
+
+
+class AdminJuryOpinionReport(BaseModel):
+    id: int
+    reporter: UserPublic | None = None
+    reason: str
+    details: str | None = None
+    # pending / handled / dismissed
+    status: str
+    created_at: datetime | None = None
+
+
+class AdminJuryOpinionRead(BaseModel):
+    """后台看到的观点：带真实作者、原文（即使已删除 / 被折叠）和举报记录。"""
+
+    id: int
+    case_id: int
+    parent_id: int | None = None
+    reply_to_id: int | None = None
+    author_id: int
+    author: UserPublic | None = None
+    alias: str | None = None
+    tier: str | None = None
+    content: str
+    state: Literal["visible", "deleted", "hidden"]
+    is_note: bool = False
+    like_count: int = 0
+    created_at: datetime | None = None
+    deleted_at: datetime | None = None
+    deleted_by_id: int | None = None
+    moderation_note: str | None = None
+    pending_reports: int = 0
+    reports: list[AdminJuryOpinionReport] = Field(default_factory=list)
+
+
+class AdminJuryOpinionPage(BaseModel):
+    items: list[AdminJuryOpinionRead] = Field(default_factory=list)
+    total: int = 0
+
+
+class AdminJuryOpinionModerate(BaseModel):
+    action: Literal["delete", "restore", "dismiss_reports"]
+    note: str | None = Field(default=None, max_length=500)
 
 
 class CaseDetail(CaseRead):
@@ -90,6 +145,25 @@ class CaseDetail(CaseRead):
     snapshot: dict[str, Any] | None = None
     reports: list[ReportRead] = Field(default_factory=list)
     votes: list[JuryVoteSummary] = Field(default_factory=list)
+    opinions: list[AdminJuryOpinionRead] = Field(default_factory=list)
+    # 只在改判接口的返回里有：改判成不违规后内容是否恢复了
+    content_restored: bool | None = None
+
+
+class CaseOverturn(BaseModel):
+    outcome: Literal["violation", "dismiss"]
+    category: str | None = Field(default=None, max_length=40)
+    level: int | None = Field(default=None, ge=0, le=4)
+    # 会出现在公示栏和委员的案件详情里
+    note: str = Field(min_length=1, max_length=2000)
+
+    @model_validator(mode="after")
+    def validate_outcome(self) -> CaseOverturn:
+        if self.outcome == "dismiss" and (self.category or self.level is not None):
+            raise ValueError("改判为不违规时不能带类别和等级")
+        if not self.note.strip():
+            raise ValueError("请写明改判理由")
+        return self
 
 
 class CaseResolve(BaseModel):
@@ -135,6 +209,13 @@ class JuryStats(BaseModel):
     golden_correct: int = 0
 
 
+class JuryRestriction(BaseModel):
+    reason: Literal["muted", "banned"]
+    # 什么时候解除；永久封禁为 null
+    until: datetime | None = None
+    message: str
+
+
 class JuryStatus(BaseModel):
     # none / applied / active / expired / rejected / suspended / retired
     status: str
@@ -145,6 +226,12 @@ class JuryStatus(BaseModel):
     stats: JuryStats | None = None
     daily_limit: int
     voted_today: int
+    # trainee / regular / senior；不是在任委员时为 null
+    tier: str | None = None
+    # 现在能分给我的未结案件数（上限 50）；不是在任委员时为 null
+    available_cases: int | None = None
+    # 在任委员正在受处罚时有值：评审、发观点、点赞都会被拒绝（juror_restricted）
+    restriction: JuryRestriction | None = None
 
 
 class JuryApply(BaseModel):
@@ -158,6 +245,8 @@ class JuryCaseMessage(BaseModel):
     content: str | None = None
     images: list[str] = Field(default_factory=list)
     created_at: str | None = None
+    # 相对被举报消息的位置：目标是 0，之前为负，之后为正
+    offset: int = 0
 
 
 class JuryCasePost(BaseModel):
@@ -171,13 +260,20 @@ class JuryReasonCount(BaseModel):
     count: int
 
 
-class JuryCaseView(BaseModel):
+class JuryCaseContent(BaseModel):
     case_id: int
     kind: Literal["message", "post"]
     reasons: list[JuryReasonCount]
     report_count: int
+    # 快照里的全部上下文（前后最多各 10 条）
     messages: list[JuryCaseMessage] = Field(default_factory=list)
     post: JuryCasePost | None = None
+
+
+class JuryCaseView(JuryCaseContent):
+    # 分到手的时间和让出的时间
+    assigned_at: datetime | None = None
+    expires_at: datetime | None = None
 
 
 class JuryNextCase(BaseModel):
@@ -190,9 +286,54 @@ class JuryVoteCreate(BaseModel):
     note: str | None = Field(default=None, max_length=500)
 
 
+class JuryMyVote(BaseModel):
+    vote: str
+    note: str | None = None
+    voted_at: datetime | None = None
+    # 我在这个案件里的代号；质控题没有
+    alias: str | None = None
+    # 是否与结论一致；未定案或我弃权时为 null
+    agreed: bool | None = None
+
+
+class JuryVerdict(BaseModel):
+    outcome: Literal["violation", "clean"]
+    # jury 委员共识 / panel 资深合议 / admin 管理员 / auto 机器
+    source: str | None = None
+    category: str | None = None
+    category_label: str | None = None
+    level: int | None = None
+    closed_at: datetime | None = None
+    # 举报到定案用了多少小时
+    hours: float | None = None
+    overturned: bool = False
+    overturn_note: str | None = None
+    # 题库里这道题的讲解；只有质控题且管理员写了才有（二期起），一期恒为 null
+    explanation: str | None = None
+
+
+class JuryCaseDetail(JuryCaseContent):
+    """投票之后看到的案件。只有对这个案件投过票的人能读。"""
+
+    # 定案满内容保留期后为 false，此时 messages 为空、post 为 null
+    content_available: bool = True
+    my_vote: JuryMyVote
+    # jury 委员评审中 / panel 资深合议中 / admin 等管理员 / closed 已定案
+    stage: Literal["jury", "panel", "admin", "closed"]
+    # 已有几张有效票（不含弃权）
+    votes_cast: int = 0
+    # 定案后才给：{ none, l1, l2, l3, abstain }
+    tally: dict[str, int] | None = None
+    verdict: JuryVerdict | None = None
+    is_quality_check: bool = False
+    opinions_enabled: bool = True
+    opinion_count: int = 0
+
+
 class JuryVoteResult(BaseModel):
     case_id: int
     settled: bool
+    case: JuryCaseDetail | None = None
 
 
 class JuryHistoryItem(BaseModel):
@@ -213,6 +354,7 @@ class JuryMemberRead(JuryStats):
     reviewed_at: datetime | None = None
     review_note: str | None = None
     term_ends_at: datetime | None = None
+    tier: str = "trainee"
 
 
 class JuryMemberPage(BaseModel):
@@ -221,5 +363,15 @@ class JuryMemberPage(BaseModel):
 
 
 class JuryMemberReview(BaseModel):
-    action: Literal["approve", "reject", "suspend", "retire", "reinstate"]
+    action: Literal["approve", "reject", "suspend", "retire", "reinstate", "set_tier"]
     note: str | None = Field(default=None, max_length=500)
+    # approve / reinstate 时可选（创始任命：直接任命为任意层级）；set_tier 时必填
+    tier: Literal["trainee", "regular", "senior"] | None = None
+
+    @model_validator(mode="after")
+    def validate_tier(self) -> JuryMemberReview:
+        if self.action == "set_tier" and self.tier is None:
+            raise ValueError("set_tier 需要指定 tier")
+        if self.tier is not None and self.action not in {"approve", "reinstate", "set_tier"}:
+            raise ValueError("只有任命、复职和调整层级时可以指定 tier")
+        return self

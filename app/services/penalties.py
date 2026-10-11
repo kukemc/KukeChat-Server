@@ -559,7 +559,13 @@ async def _resync_restrictions(db: AsyncSession, user: User, changed: UserViolat
         user.ban_reason = None
 
 
-async def revoke_violation(db: AsyncSession, violation_id: int, *, actor_id: int | None, reason: str | None) -> UserViolation:
+async def revoke_violation(
+    db: AsyncSession, violation_id: int, *, actor_id: int | None, reason: str | None, sync_case: bool = True
+) -> UserViolation:
+    """撤销一条处罚并回滚它触发的禁言 / 封禁。不提交事务。
+
+    处罚来自举报案件时，案件会跟着改判成不违规（sync_case=False 是案件改判自己撤销处罚时用的，避免来回调用）。
+    """
     violation = await _get_violation(db, violation_id)
     if violation.status != "active":
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Violation is already revoked")
@@ -585,6 +591,11 @@ async def revoke_violation(db: AsyncSession, violation_id: int, *, actor_id: int
             details=_audit_json({"violation_id": violation.id, "reason": violation.revoke_reason}),
         )
     )
+    if sync_case and violation.case_id is not None:
+        # 依赖方向是 cases -> penalties，这里只能在函数里引。
+        from app.services import cases as case_service
+
+        await case_service.sync_case_after_revocation(db, violation, actor_id=actor_id)
     return violation
 
 
@@ -834,3 +845,8 @@ async def notify_violation_updated(db: AsyncSession, violation: UserViolation, a
         )
     except Exception:
         logger.exception("Failed to deliver violation update", extra={"violation_id": violation.id})
+    if db.info.get("overturned_case_ids"):
+        # 撤销处罚连带改判了案件：举报人和投过票的委员也要知道。
+        from app.services import cases as case_service
+
+        await case_service.flush_overturn_notifications(db)

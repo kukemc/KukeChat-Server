@@ -21,6 +21,7 @@ from app.core.database import AsyncSessionLocal, get_db, init_db
 from app.core.request_guard import ClientProofMiddleware
 from app.core.transport_metrics import TransportMetrics, TransportMetricsMiddleware
 from app.services.legacy_uploads import migrate_legacy_upload_response
+from app.services.cases import start_jury_sweep_worker, stop_jury_sweep_worker
 from app.services.ccw import start_ccw_binding_worker, stop_ccw_binding_worker
 from app.services.moderation import start_moderation_retry_worker, stop_moderation_retry_worker
 from app.services.task import start_task_reminder_worker, stop_task_reminder_worker
@@ -82,11 +83,13 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
     start_ccw_binding_worker()
     start_moderation_retry_worker()
     start_task_reminder_worker()
+    start_jury_sweep_worker()
     if transport_metrics is not None:
         await transport_metrics.start()
     try:
         yield
     finally:
+        await stop_jury_sweep_worker()
         await stop_task_reminder_worker()
         await stop_ccw_binding_worker()
         await stop_moderation_retry_worker()

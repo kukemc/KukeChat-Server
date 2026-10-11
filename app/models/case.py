@@ -64,6 +64,22 @@ class ReportCase(Base):
     # 作为风纪委员的质控题：结论已由管理员给出，混在正常案件里发给委员
     is_golden: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
 
+    # 进入委员队列的时间：超时从这里算起，不被后续举报重置。为空表示从没进过委员队列
+    queued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 离开委员队列的方式：consensus（委员定案）/ no_consensus / timeout / manual（管理员接手）
+    jury_outcome: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    escalated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 不能交给委员的原因，目前只有 sensitive（色情低俗 / 涉未成年类）
+    jury_block_reason: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    # 结案时固化：有委员真实投过票、且结论不是机器给的，才可能进公示栏
+    publishable: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    # 建案时固化：只有公开动态的内容可以公示
+    content_publishable: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    # 定案后被改判（管理员改判、撤销处罚、申诉通过）
+    overturned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    overturned_by_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    overturn_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -82,6 +98,8 @@ class JuryMember(Base):
     reviewed_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     review_note: Mapped[str | None] = mapped_column(Text, nullable=True)
     term_ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # trainee（见习）/ regular（正式）/ senior（资深）
+    tier: Mapped[str] = mapped_column(String(12), default="trainee", server_default="trainee")
 
     votes_total: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     # 与最终结论一致 / 已出结论的票数
@@ -110,3 +128,57 @@ class JuryVote(Base):
     voted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # 案件出结论后回填：这一票是否与结论一致
     agreed: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    # 投票时分配的代号（委员 A / 委员 B …），同一案件内稳定；质控题不分配
+    alias: Mapped[str | None] = mapped_column(String(12), nullable=True)
+    # 这次分配是不是质控题。不能用「案件 is_golden 且已结」去猜：真实案件被管理员结案后也会变成 is_golden
+    is_quality_check: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+
+
+class JuryOpinion(Base):
+    """案件观点区的一条观点或回复。只对投过这个案件的委员可见，展示时用代号。"""
+
+    __tablename__ = "jury_opinions"
+    __table_args__ = (Index("ix_jury_opinions_author_created", "author_id", "created_at"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    case_id: Mapped[int] = mapped_column(ForeignKey("report_cases.id", ondelete="CASCADE"), index=True)
+    author_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    # 回复只有一层：parent_id 恒指向根观点，reply_to_id 是实际被回复的那条（回复别人的回复时才有）
+    parent_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    reply_to_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    content: Mapped[str] = mapped_column(Text)
+    # 投票时写的备注
+    is_note: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    like_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # visible / deleted（本人或管理员删除）/ hidden（多人举报后折叠，等管理员处理）
+    state: Mapped[str] = mapped_column(String(12), default="visible", server_default="visible")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    deleted_by_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    moderation_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class JuryOpinionLike(Base):
+    __tablename__ = "jury_opinion_likes"
+    __table_args__ = (UniqueConstraint("opinion_id", "user_id", name="uq_jury_opinion_likes_opinion_user"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    opinion_id: Mapped[int] = mapped_column(ForeignKey("jury_opinions.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class JuryOpinionReport(Base):
+    __tablename__ = "jury_opinion_reports"
+    __table_args__ = (UniqueConstraint("opinion_id", "reporter_id", name="uq_jury_opinion_reports_opinion_reporter"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    opinion_id: Mapped[int] = mapped_column(ForeignKey("jury_opinions.id", ondelete="CASCADE"), index=True)
+    reporter_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    reason: Mapped[str] = mapped_column(String(40))
+    details: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # pending / handled（观点被删除）/ dismissed（举报不成立）
+    status: Mapped[str] = mapped_column(String(12), default="pending", server_default="pending")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    handled_by_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    handled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

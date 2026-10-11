@@ -70,6 +70,35 @@ class Settings(BaseSettings):
     # 邀请链接的落地页。用户打开它即可加入群聊 / 添加好友，
     # 通常指向你部署了 KukeChat 客户端的页面。
     invite_base_url: str = "http://localhost:5173"
+    # 风纪委员（docs/jury-v2.md）。客户端通过 GET /jury/config 读这些数字，不要在别处写死。
+    jury_min_account_age_days: int = Field(default=30, ge=0, le=3650)
+    jury_min_recent_messages: int = Field(default=30, ge=0, le=100000)
+    jury_recent_activity_days: int = Field(default=30, ge=1, le=365)
+    jury_term_days: int = Field(default=30, ge=1, le=3650)
+    jury_daily_vote_limit: int = Field(default=30, ge=1, le=1000)
+    jury_seats_per_case: int = Field(default=5, ge=3, le=15)
+    jury_assignment_ttl_hours: int = Field(default=24, ge=1, le=720)
+    # 每 N 个案件里混入一道已有结论的质控题
+    jury_golden_every: int = Field(default=5, ge=2, le=1000)
+    jury_min_settled_for_review: int = Field(default=20, ge=1, le=10000)
+    jury_min_golden_for_review: int = Field(default=5, ge=1, le=10000)
+    jury_min_accuracy: float = Field(default=0.6, ge=0, le=1)
+    # 进入委员队列后多久没有结论就转给管理员
+    jury_timeout_hours: int = Field(default=72, ge=1, le=24 * 60)
+    jury_sweep_interval_seconds: int = Field(default=600, ge=30, le=86400)
+    # 公开群（join_mode=open）成员数达到这个值后不再按群成员回避，只回避快照里的发言人
+    jury_large_group_members: int = Field(default=200, ge=2, le=1000000)
+    jury_context_near: int = Field(default=3, ge=0, le=10)
+    # 定案后多久内委员还能回看案件内容 / 多久之后进公示栏
+    jury_content_retention_days: int = Field(default=30, ge=1, le=3650)
+    jury_publish_delay_hours: int = Field(default=72, ge=0, le=24 * 365)
+    jury_overview_window_days: int = Field(default=30, ge=1, le=365)
+    jury_overview_min_sample: int = Field(default=5, ge=1, le=10000)
+    jury_opinion_max_length: int = Field(default=500, ge=1, le=5000)
+    jury_opinions_per_case: int = Field(default=20, ge=1, le=1000)
+    jury_opinions_per_minute: int = Field(default=5, ge=1, le=1000)
+    jury_opinions_per_day: int = Field(default=100, ge=1, le=100000)
+    jury_opinion_auto_hide_reports: int = Field(default=2, ge=1, le=100)
     task_reminder_check_interval_seconds: int = Field(default=60, ge=10, le=3600)
     task_reminder_advance_hours: int = Field(default=24, ge=1, le=168)
     smtp_enabled: bool = False

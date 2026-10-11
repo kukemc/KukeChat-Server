@@ -206,6 +206,18 @@ async def init_db() -> None:
                 ("bot_reviews", "deleted_at", "deleted_at DATETIME"),
                 ("bot_review_replies", "moderation_status", "moderation_status VARCHAR(20) NOT NULL DEFAULT 'approved'"),
                 ("bot_review_replies", "deleted_at", "deleted_at DATETIME"),
+                ("jury_members", "tier", "tier VARCHAR(12) NOT NULL DEFAULT 'trainee'"),
+                ("jury_votes", "alias", "alias VARCHAR(12)"),
+                ("jury_votes", "is_quality_check", "is_quality_check BOOLEAN NOT NULL DEFAULT 0"),
+                ("report_cases", "queued_at", "queued_at DATETIME"),
+                ("report_cases", "jury_outcome", "jury_outcome VARCHAR(16)"),
+                ("report_cases", "escalated_at", "escalated_at DATETIME"),
+                ("report_cases", "jury_block_reason", "jury_block_reason VARCHAR(20)"),
+                ("report_cases", "publishable", "publishable BOOLEAN NOT NULL DEFAULT 0"),
+                ("report_cases", "content_publishable", "content_publishable BOOLEAN NOT NULL DEFAULT 0"),
+                ("report_cases", "overturned_at", "overturned_at DATETIME"),
+                ("report_cases", "overturned_by_id", "overturned_by_id INTEGER"),
+                ("report_cases", "overturn_note", "overturn_note TEXT"),
             ):
                 if table_name not in table_names:
                     continue

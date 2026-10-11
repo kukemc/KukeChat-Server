@@ -175,6 +175,9 @@ async def create_report(db: AsyncSession, reporter_id: int, payload: ReportCreat
     await db.flush()
     case, created = await case_service.attach_report(db, report, weight=float(credit["weight"]))
     await db.commit()
+    if getattr(case, "_left_jury_queue", False):
+        # 这条举报让案件变成了敏感类别，已经从委员队列撤出来。
+        await case_service.notify_jury_queue_changed(db)
     result = await get_report(db, report.id)
     # 新案件要先过一遍机器预审，由 API 层在事务提交后调度。
     setattr(result, "_new_case_id", case.id if created else None)

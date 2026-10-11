@@ -50,10 +50,14 @@ from app.schemas.penalty import (
     AdminViolationRevoke,
     PenaltyInput,
 )
-from app.models.case import JuryVote, ReportCase
+from app.models.case import JuryMember, JuryVote, ReportCase
 from app.schemas.case import (
+    AdminJuryOpinionModerate,
+    AdminJuryOpinionPage,
+    AdminJuryOpinionRead,
     CaseDetail,
     CaseMove,
+    CaseOverturn,
     CasePage,
     CaseRead,
     CaseResolve,
@@ -62,8 +66,11 @@ from app.schemas.case import (
     JuryMemberReview,
     JuryVoteSummary,
 )
+from app.schemas.jury import JurySettingsRead, JurySettingsUpdate
 from app.services import cases as case_service
 from app.services import jury as jury_service
+from app.services import jury_opinions as opinion_service
+from app.services import jury_settings
 from app.services import messages as message_service
 from app.services import penalties as penalty_service
 from app.services import moderation as moderation_service
@@ -764,20 +771,29 @@ async def admin_unmute_user(
 # ---------------------------------------------------------------- 举报案件
 
 
-async def _case_detail(db: AsyncSession, case: ReportCase, admin_id: int) -> CaseDetail:
+async def _case_detail(db: AsyncSession, case: ReportCase, admin_id: int, *, content_restored: bool | None = None) -> CaseDetail:
     base = (await case_service.build_case_reads(db, [case]))[0]
     reports = await case_service.case_reports(db, case.id)
     full_reports = [await report_service.get_report(db, report.id) for report in reports]
     votes = (
         await db.execute(
-            select(JuryVote, User).join(User, User.id == JuryVote.juror_id).where(JuryVote.case_id == case.id, JuryVote.voted_at.is_not(None))
+            select(JuryVote, User, JuryMember.tier)
+            .join(User, User.id == JuryVote.juror_id)
+            .outerjoin(JuryMember, JuryMember.user_id == JuryVote.juror_id)
+            .where(JuryVote.case_id == case.id, JuryVote.voted_at.is_not(None))
+            .order_by(JuryVote.voted_at.asc(), JuryVote.id.asc())
         )
     ).all()
     return CaseDetail(
         **base,
         snapshot=await case_service.case_snapshot(db, case) or None,
         reports=await report_service.build_report_reads(db, full_reports, admin_id),
-        votes=[JuryVoteSummary(vote=vote.vote, note=vote.note, voted_at=penalty_service.aware(vote.voted_at), juror=juror) for vote, juror in votes],
+        votes=[
+            JuryVoteSummary(vote=vote.vote, note=vote.note, voted_at=penalty_service.aware(vote.voted_at), juror=juror, alias=vote.alias, tier=tier)
+            for vote, juror, tier in votes
+        ],
+        opinions=[AdminJuryOpinionRead(**item) for item in await opinion_service.case_opinions(db, case.id)],
+        content_restored=content_restored,
     )
 
 
@@ -830,13 +846,33 @@ async def admin_resolve_case(
         note=payload.note,
         malicious_reporter_ids=set(payload.malicious_reporter_ids),
     )
-    # 管理员的结论是委员一致率的基准，也让这个案件进入质控题库。
+    # 管理员的结论是委员一致率的基准，也让这个案件进入质控题库（敏感类别的不能再发给委员）。
     await jury_service.settle_after_admin(db, case)
-    if case.jury_eligible:
+    if case.jury_eligible and case.jury_block_reason is None:
         case.is_golden = True
     await db.commit()
     await admin_manager.broadcast("admin.report.changed", {"case_id": case.id, "action": "reviewed"})
     return await _case_detail(db, case, admin.id)
+
+
+@router.post("/cases/{case_id}/overturn", response_model=CaseDetail)
+async def admin_overturn_case(
+    case_id: int,
+    payload: CaseOverturn,
+    admin: Annotated[User, Depends(get_current_admin)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> CaseDetail:
+    result = await case_service.overturn_case(
+        db,
+        case_id,
+        actor_id=admin.id,
+        upheld=payload.outcome == "violation",
+        category=payload.category,
+        level=payload.level,
+        note=payload.note,
+    )
+    await admin_manager.broadcast("admin.report.changed", {"case_id": case_id, "action": "overturned"})
+    return await _case_detail(db, result["case"], admin.id, content_restored=result["content_restored"])
 
 
 @router.post("/cases/{case_id}/queue", response_model=CaseRead)
@@ -872,8 +908,65 @@ async def admin_review_jury_member(
     admin: Annotated[User, Depends(get_current_admin)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> JuryMemberRead:
-    await jury_service.review_member(db, user_id, action=payload.action, actor_id=admin.id, note=payload.note)
+    await jury_service.review_member(db, user_id, action=payload.action, actor_id=admin.id, note=payload.note, tier=payload.tier)
     items, _total = await jury_service.list_members(db, None, 1, 0, user_id=user_id)
     if not items:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Jury member not found")
     return JuryMemberRead(**items[0])
+
+
+async def _jury_settings_read(db: AsyncSession) -> JurySettingsRead:
+    return JurySettingsRead(switches=await jury_settings.get_switches(db, fresh=True), thresholds=jury_settings.thresholds())
+
+
+@router.get("/jury/settings", response_model=JurySettingsRead)
+async def admin_jury_settings(
+    _admin: Annotated[User, Depends(get_current_admin)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> JurySettingsRead:
+    return await _jury_settings_read(db)
+
+
+@router.put("/jury/settings", response_model=JurySettingsRead)
+async def admin_update_jury_settings(
+    payload: JurySettingsUpdate,
+    admin: Annotated[User, Depends(get_current_admin)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> JurySettingsRead:
+    await jury_settings.update_switches(db, admin.id, payload.model_dump(exclude_none=True))
+    await admin_manager.broadcast("admin.jury.settings.changed", {})
+    return await _jury_settings_read(db)
+
+
+@router.get("/jury/opinions", response_model=AdminJuryOpinionPage)
+async def admin_list_jury_opinions(
+    _admin: Annotated[User, Depends(get_current_admin)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    state: Literal["visible", "deleted", "hidden", ""] | None = None,
+    # true 只看有待处理举报的，false 只看没有的；留空不筛选
+    reported: Literal["true", "false", ""] | None = None,
+    # 和另外两个筛选一样允许留空，所以不直接声明成 int
+    case_id: str | None = Query(default=None, pattern=r"^\d{0,12}$"),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> AdminJuryOpinionPage:
+    items, total = await opinion_service.admin_list(
+        db,
+        state=state or None,
+        reported={"true": True, "false": False}.get(reported or ""),
+        case_id=int(case_id) if case_id else None,
+        limit=limit,
+        offset=offset,
+    )
+    return AdminJuryOpinionPage(items=[AdminJuryOpinionRead(**item) for item in items], total=total)
+
+
+@router.post("/jury/opinions/{opinion_id}/moderate", response_model=AdminJuryOpinionRead)
+async def admin_moderate_jury_opinion(
+    opinion_id: int,
+    payload: AdminJuryOpinionModerate,
+    admin: Annotated[User, Depends(get_current_admin)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> AdminJuryOpinionRead:
+    item = await opinion_service.admin_moderate(db, opinion_id, action=payload.action, actor_id=admin.id, note=payload.note)
+    return AdminJuryOpinionRead(**item)
