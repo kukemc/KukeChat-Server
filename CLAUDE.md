@@ -77,6 +77,12 @@ deploy_start.py Gunicorn + Uvicorn Worker 生产启动
 
 **`services/reports.py` 一半 C 端一半后台**：`create_report` / `list_my_reports` / 快照构造器是用户侧；`review_report` / 封禁 / 角色管理 / 审计日志是后台侧。
 
+**处罚只有一个入口**：`services/penalties.py::record_violation`。自动审核、举报处置、风纪委员、管理员手动封禁全部经过它，由它记分、算阶梯、落地禁言 / 封禁。不要在别处直接改 `user.status` / `banned_until` / `muted_until` —— 那样处罚不进台账（`user_violations`），申诉和撤销都找不到它。
+
+**举报按案件处理**：`services/cases.py` 把同一目标的举报并成 `report_cases`，结论回写给案件内的每条举报。`services/jury.py` 是风纪委员：只能看到群聊消息和公开动态的匿名快照，私聊案件永远不进他们的队列（`ReportCase.jury_eligible`）。这条边界和管理员的消息边界一样是公开承诺，见 README。
+
+接口契约在 `docs/moderation-v2.md`，改了接口要同步改它 —— 客户端和后台都照它写。
+
 **举报证据在提交时固化**进 `target_snapshot`，不是实时查库。改动快照结构要小心，它是申诉与追溯的依据。
 
 ## 已知问题
