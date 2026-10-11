@@ -62,6 +62,9 @@ class User(Base):
     # 封禁发生的时刻。没有它就只能拿注册时间给封禁列表排序，而那毫无意义。
     banned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     ban_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 禁言：能登录能看，不能发。到期靠读取时比较时间，不需要后台任务清理。
+    muted_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    mute_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     registration_ip: Mapped[str | None] = mapped_column(String(45), unique=True, index=True, nullable=True)
     last_login_ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

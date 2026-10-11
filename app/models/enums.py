@@ -101,6 +101,7 @@ class ModerationSource(str, Enum):
 class ModerationAction(str, Enum):
     NONE = "none"
     RECALLED = "recalled"
+    MUTED = "muted"
     USER_BANNED = "user_banned"
     PERMANENT_BAN = "permanent_ban"
     ERROR = "error"

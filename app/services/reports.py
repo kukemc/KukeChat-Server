@@ -25,7 +25,9 @@ from app.schemas.user import UserPublic
 from app.services.messages import admin_recall_message, get_visible_message_for_user
 from app.services.upload_paths import require_message_image_upload_url
 from app.services import messages as message_service
+from app.services import penalties as penalty_service
 from app.services import posts as post_service
+from app.models.penalty import UserViolation
 
 
 async def _can_view_conversation(db: AsyncSession, conversation_id: int, user_id: int) -> bool:
@@ -805,6 +807,10 @@ async def review_report(db: AsyncSession, report_id: int, reviewer_id: int, payl
     now = datetime.now(UTC)
     delete_content = payload.delete_content or payload.action in {"recall_message", "delete_post"}
     disable_user = payload.disable_user or payload.action == "disable_user"
+    violation_category = payload.violation_category
+    if violation_category is not None and violation_category not in penalty_service.CATEGORIES:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Unknown violation category")
+    punish = disable_user or violation_category is not None
     actions: list[str] = []
     banned_until: datetime | None = None
     target_user: User | None = None
@@ -815,7 +821,7 @@ async def review_report(db: AsyncSession, report_id: int, reviewer_id: int, payl
     if payload.action == "delete_post" and report.target_type != ReportTargetType.POST:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Delete action requires a post report")
 
-    if payload.status == ReportStatus.REVIEWED and disable_user:
+    if payload.status == ReportStatus.REVIEWED and punish:
         if report.target_type == ReportTargetType.USER:
             target_user = await db.get(User, report.reported_user_id or report.target_id)
         elif report.target_type == ReportTargetType.MESSAGE:
@@ -828,7 +834,7 @@ async def review_report(db: AsyncSession, report_id: int, reviewer_id: int, payl
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
         if target_user.id == reviewer_id:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot disable yourself")
-        if target_user.platform_role == PlatformRole.ADMIN:
+        if disable_user and target_user.platform_role == PlatformRole.ADMIN:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot disable an admin")
         report.reported_user_id = target_user.id
 
@@ -844,19 +850,37 @@ async def review_report(db: AsyncSession, report_id: int, reviewer_id: int, payl
         else:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This report target has no deletable content")
 
-    if payload.status == ReportStatus.REVIEWED and disable_user:
+    if payload.status == ReportStatus.REVIEWED and punish:
         assert target_user is not None
-        target_user.status = UserStatus.DISABLED
-        target_user.banned_until = _resolve_ban_until(payload.ban_until, payload.ban_duration_hours)
-        target_user.banned_at = now
-        target_user.ban_reason = payload.review_note or report.reason
-        banned_until = target_user.banned_until
-        await db.execute(
-            update(AuthSession)
-            .where(AuthSession.user_id == target_user.id, AuthSession.revoked_at.is_(None))
-            .values(revoked_at=now)
+        category = violation_category or REPORT_REASON_CATEGORIES.get(report.reason, "other")
+        override = None
+        if disable_user:
+            override = penalty_service.Penalty("ban", _ban_hours(payload.ban_until, payload.ban_duration_hours, now))
+        target_type, target_id = _violation_target(report)
+        outcome = await penalty_service.record_violation(
+            db,
+            user_id=target_user.id,
+            category=category,
+            level=payload.violation_level,
+            source="report",
+            target_type=target_type,
+            target_id=target_id,
+            conversation_id=report.conversation_id,
+            report_id=report.id,
+            actor_id=reviewer_id,
+            summary=_report_violation_summary(report),
+            reason=payload.review_note or report.reason,
+            override=override,
         )
-        actions.append("disable_user")
+        if outcome is not None:
+            if outcome.banned:
+                banned_until = penalty_service.aware(target_user.banned_until)
+                # 管理员手动封禁时，用户看到的理由沿用审核备注 / 举报理由的原话。
+                if disable_user:
+                    target_user.ban_reason = payload.review_note or report.reason
+                actions.append("disable_user")
+            elif outcome.penalty.kind != "none":
+                actions.append(f"penalty_{outcome.penalty.kind}")
 
     report.reviewer_id = reviewer_id
     report.review_note = payload.review_note.strip() if payload.review_note else None
@@ -873,6 +897,7 @@ async def review_report(db: AsyncSession, report_id: int, reviewer_id: int, payl
         )
     )
     await db.commit()
+    await penalty_service.flush_notifications(db)
     if deleted_post is not None:
         try:
             await post_service.cleanup_deleted_post_uploads(db, deleted_post)
@@ -881,11 +906,39 @@ async def review_report(db: AsyncSession, report_id: int, reviewer_id: int, payl
     return await get_report(db, report.id)
 
 
-def _resolve_ban_until(ban_until: datetime | None, ban_duration_hours: int | None) -> datetime | None:
+# 举报理由 -> 违规类别。举报人选的理由只是线索，管理员可以在处置时改判类别。
+REPORT_REASON_CATEGORIES = {
+    "辱骂骚扰": "harassment",
+    "垃圾广告": "advertising",
+    "色情低俗": "vulgar",
+    "违法违规": "illegal",
+    "诈骗或钓鱼": "fraud",
+    "其他": "other",
+}
+
+
+def _ban_hours(ban_until: datetime | None, ban_duration_hours: int | None, now: datetime) -> int | None:
+    """管理员给的封禁期限换算成小时；都没给即永久。"""
     if ban_until is not None:
-        return ban_until
-    if ban_duration_hours is not None:
-        return datetime.now(UTC) + timedelta(hours=ban_duration_hours)
+        target = ban_until if ban_until.tzinfo is not None else ban_until.replace(tzinfo=UTC)
+        return max(1, int((target - now).total_seconds() // 3600) + 1)
+    return ban_duration_hours
+
+
+def _violation_target(report: UserReport) -> tuple[str | None, int | None]:
+    if report.target_type == ReportTargetType.MESSAGE:
+        return "message", report.message_id or report.target_id
+    if report.target_type == ReportTargetType.POST:
+        return "post", report.target_id
+    return None, None
+
+
+def _report_violation_summary(report: UserReport) -> str | None:
+    snapshot = _parse_target_snapshot(report)
+    for key in ("message", "post"):
+        item = snapshot.get(key)
+        if isinstance(item, dict) and isinstance(item.get("content"), str) and item["content"].strip():
+            return item["content"].strip()[:120]
     return None
 
 
@@ -1404,20 +1457,23 @@ async def update_user_status(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot disable yourself")
     if user.platform_role == PlatformRole.ADMIN and user_status == UserStatus.DISABLED.value:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot disable an admin")
-    user.status = UserStatus(user_status)
-    if user.status == UserStatus.DISABLED:
-        user.banned_until = _resolve_ban_until(banned_until, ban_duration_hours)
-        user.banned_at = datetime.now(UTC)
-        user.ban_reason = reason
-        await db.execute(
-            update(AuthSession)
-            .where(AuthSession.user_id == user.id, AuthSession.revoked_at.is_(None))
-            .values(revoked_at=datetime.now(UTC))
+    if UserStatus(user_status) == UserStatus.DISABLED:
+        now = datetime.now(UTC)
+        await penalty_service.record_violation(
+            db,
+            user_id=user.id,
+            category="admin_action",
+            level=0,
+            source="admin",
+            actor_id=actor_id,
+            reason=reason,
+            override=penalty_service.Penalty("ban", _ban_hours(banned_until, ban_duration_hours, now)),
         )
+        # 管理员手动封禁时写的理由就是要给用户看的原话，不用台账拼出来的那句。
+        if reason:
+            user.ban_reason = reason
     else:
-        user.banned_until = None
-        user.banned_at = None
-        user.ban_reason = None
+        await penalty_service.lift_ban(db, user, actor_id=actor_id)
     db.add(
         AdminAuditLog(
             actor_id=actor_id,
@@ -1428,6 +1484,7 @@ async def update_user_status(
         )
     )
     await db.commit()
+    await penalty_service.flush_notifications(db)
     await db.refresh(user)
     return user
 
@@ -1720,6 +1777,11 @@ async def admin_stats(db: AsyncSession) -> dict[str, int]:
         ),
         "reports_pending": await _count(db, select(func.count()).select_from(UserReport).where(UserReport.status == ReportStatus.PENDING)),
         "audit_actions_today": await _count(db, select(func.count()).select_from(AdminAuditLog).where(AdminAuditLog.created_at >= today)),
+        "appeals_pending": await _count(db, select(func.count()).select_from(UserViolation).where(UserViolation.appeal_status == "pending")),
+        "penalty_reviews_pending": await _count(
+            db,
+            select(func.count()).select_from(UserViolation).where(UserViolation.review_status == "pending", UserViolation.status == "active"),
+        ),
     }
 
 

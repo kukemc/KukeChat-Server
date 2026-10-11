@@ -19,6 +19,7 @@ from app.models.report import UserReport
 from app.models.user import User
 from app.schemas.post import AdminPostRead, PostCommentRead, PostCreate, PostLikeRead, PostLikeToggleRead, PostNotificationListRead, PostNotificationRead, PostRead, PostReferenceRead, PostStatsRead, PostTopicRead, PostUpdate
 from app.schemas.user import UserPublic
+from app.services.penalties import ensure_can_post
 from app.services.ccw import previews_from_text
 from app.services.storage import delete_objects, storage_key_from_url, thumbnail_key_for_key
 
@@ -328,6 +329,7 @@ def _visible_post_condition(viewer_id: int, friend_ids: list[int]):
 
 
 async def create_post(db: AsyncSession, author: User, payload: PostCreate) -> Post:
+    ensure_can_post(author)
     if any(_post_upload_path(image_url) is None for image_url in payload.image_urls):
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Post images must reference uploaded post images")
     if payload.repost_of_id is not None:
@@ -902,6 +904,7 @@ async def list_likes(db: AsyncSession, post_id: int, viewer_id: int, limit: int)
 
 
 async def create_comment(db: AsyncSession, post_id: int, actor: User, content: str, parent_id: int | None = None, mention_user_ids: list[int] | None = None) -> PostComment:
+    ensure_can_post(actor)
     post = await get_visible_post(db, post_id, actor.id)
     if _status_value(post.moderation_status) != ModerationStatus.APPROVED.value:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Post is pending moderation")

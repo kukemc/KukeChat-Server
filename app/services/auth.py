@@ -51,7 +51,7 @@ async def cookie_login_user(db: AsyncSession, payload: UserLogin, client_ip: str
     user = await get_user_by_username_or_email(db, payload.username_or_email)
     if user is None or not verify_password(payload.password, user.hashed_password):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid username/email or password")
-    await ensure_user_not_disabled(db, user)
+    await ensure_user_not_disabled(db, user, issue_appeal_token=True)
     mark_user_seen(user, client_ip, login=True)
     raw_token, session = await create_cookie_session(db, user, client_ip, user_agent, days)
     return raw_token, CookieSessionRead(access_token=create_access_token(user.id), user=user, expires_at=session.expires_at)
@@ -118,7 +118,13 @@ async def get_user_by_username_or_email(db: AsyncSession, value: str) -> User | 
     return result.scalar_one_or_none()
 
 
-async def ensure_user_not_disabled(db: AsyncSession, user: User) -> None:
+APPEAL_TOKEN_SCOPE = "appeal"
+APPEAL_TOKEN_MINUTES = 30
+
+
+async def ensure_user_not_disabled(db: AsyncSession, user: User, *, issue_appeal_token: bool = False) -> None:
+    """issue_appeal_token 只能在刚验证过密码的登录路径上打开：被封的人拿不到正常令牌，
+    需要一张只能查看处罚和提交申诉的短期令牌。"""
     if user.status != UserStatus.DISABLED:
         return
     now = datetime.now(UTC)
@@ -132,16 +138,18 @@ async def ensure_user_not_disabled(db: AsyncSession, user: User) -> None:
             await db.commit()
             await db.refresh(user)
             return
-    raise HTTPException(
-        status_code=status.HTTP_403_FORBIDDEN,
-        detail={
-            "code": "account_suspended",
-            "message": "账号已被封禁",
-            "reason": user.ban_reason,
-            "banned_until": ensure_aware_utc(user.banned_until).isoformat() if user.banned_until else None,
-            "permanent": user.banned_until is None,
-        },
-    )
+    detail: dict[str, object] = {
+        "code": "account_suspended",
+        "message": "账号已被封禁",
+        "reason": user.ban_reason,
+        "banned_until": ensure_aware_utc(user.banned_until).isoformat() if user.banned_until else None,
+        "permanent": user.banned_until is None,
+    }
+    if issue_appeal_token:
+        detail["appeal_token"] = create_access_token(
+            user.id, timedelta(minutes=APPEAL_TOKEN_MINUTES), scope=APPEAL_TOKEN_SCOPE
+        )
+    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=detail)
 
 
 def ensure_aware_utc(value: datetime) -> datetime:
@@ -209,7 +217,7 @@ async def login_user(db: AsyncSession, payload: UserLogin, client_ip: str) -> To
     user = await get_user_by_username_or_email(db, payload.username_or_email)
     if user is None or not verify_password(payload.password, user.hashed_password):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid username/email or password")
-    await ensure_user_not_disabled(db, user)
+    await ensure_user_not_disabled(db, user, issue_appeal_token=True)
     mark_user_seen(user, client_ip, login=True)
     await db.commit()
     await db.refresh(user)

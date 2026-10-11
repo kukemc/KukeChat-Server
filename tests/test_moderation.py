@@ -1,13 +1,14 @@
 import unittest
 
-from app.models.enums import ModerationAction, ModerationSource
+from app.models.enums import ModerationSource
 from app.models.report import ContentModerationRecord
 from app.services.moderation import (
     _ensure_moderation_response_usable,
     _local_text_moderation_result,
     _needs_action,
     _normalized_text_variant,
-    _punishment_for_record,
+    _verdict_for_record,
+    _violation_source,
     _worst_record,
 )
 
@@ -51,23 +52,60 @@ class ModerationGuardTests(unittest.TestCase):
         self.assertIsNone(_local_text_moderation_result(_normalized_text_variant("今天一起做平台射击游戏吗")))
 
 
-class ImageActionPolicyTests(unittest.TestCase):
-    def test_image_review_is_not_actionable(self) -> None:
+class ActionPolicyTests(unittest.TestCase):
+    def test_only_block_is_actionable_by_default(self) -> None:
         self.assertFalse(_needs_action(_record("image", "review", 1)))
-        self.assertTrue(_needs_action(_record("image", "block", 2)))
-        self.assertTrue(_needs_action(_record("text", "review", 1)))
+        self.assertFalse(_needs_action(_record("text", "review", 1)))
         self.assertFalse(_needs_action(_record("text", "allow", 0)))
+        self.assertTrue(_needs_action(_record("image", "block", 2)))
+        self.assertTrue(_needs_action(_record("text", "block", 1)))
 
-    def test_image_block_never_bans_permanently(self) -> None:
-        self.assertEqual(_punishment_for_record(_record("image", "block", 2)), ModerationAction.USER_BANNED)
-        self.assertEqual(_punishment_for_record(_record("image", "block", 1)), ModerationAction.RECALLED)
-
-    def test_worst_record_prefers_actionable_over_image_review(self) -> None:
+    def test_worst_record_prefers_actionable_over_review(self) -> None:
         image_review = _record("image", "review", 1)
-        text_review = _record("text", "review", 1)
-        self.assertIs(_worst_record([image_review, text_review]), text_review)
-        self.assertIs(_worst_record([_record("text", "allow", 0), image_review]), image_review)
+        text_block = _record("text", "block", 1)
+        self.assertIs(_worst_record([image_review, text_block]), text_block)
         self.assertFalse(_needs_action(_worst_record([_record("text", "allow", 0), image_review])))
+
+
+class VerdictMappingTests(unittest.TestCase):
+    def test_review_and_allow_are_never_violations(self) -> None:
+        self.assertIsNone(_verdict_for_record(_record("text", "review", 1, '["fraud"]')))
+        self.assertIsNone(_verdict_for_record(_record("image", "review", 1)))
+        self.assertIsNone(_verdict_for_record(_record("text", "allow", 0)))
+
+    def test_image_block_is_serious_but_not_red_line(self) -> None:
+        self.assertEqual(_verdict_for_record(_record("image", "block", 2)), ("sexual", 3))
+        self.assertEqual(_verdict_for_record(_record("image", "block", 2, '["minor_sexual"]')), ("minor_sexual", 4))
+        # 外链图片送审不了：撤回但不记违规
+        self.assertEqual(_verdict_for_record(_record("image", "block", 1)), ("unverified_media", 0))
+
+    def test_legacy_text_categories(self) -> None:
+        self.assertEqual(_verdict_for_record(_record("text", "block", 2, '["fraud", "illegal"]')), ("fraud", 3))
+        self.assertEqual(_verdict_for_record(_record("text", "block", 2, '["drug", "illegal"]')), ("drugs", 3))
+        self.assertEqual(_verdict_for_record(_record("text", "block", 2, '["political_sensitive"]')), ("political", 2))
+        self.assertEqual(_verdict_for_record(_record("text", "block", 1, '["harassment"]')), ("profanity", 1))
+        self.assertEqual(_verdict_for_record(_record("text", "block", 2, '["sexual", "spam"]')), ("sexual", 3))
+
+    def test_low_severity_block_is_downgraded(self) -> None:
+        self.assertEqual(_verdict_for_record(_record("text", "block", 1, '["sexual"]')), ("vulgar", 2))
+        self.assertEqual(_verdict_for_record(_record("text", "block", 1, '["privacy"]')), ("privacy", 2))
+        self.assertEqual(_verdict_for_record(_record("text", "block", 1)), ("other", 1))
+
+    def test_new_service_verdict_is_used_verbatim(self) -> None:
+        record = _record("image", "block", 2)
+        record.raw_response = '{"category": "suggestive", "level": 1, "model": "v2"}'
+        self.assertEqual(_verdict_for_record(record), ("suggestive", 1))
+        record.raw_response = '{"category": "not-a-category", "level": 4}'
+        self.assertEqual(_verdict_for_record(record), ("sexual", 3))
+
+    def test_source_reflects_who_judged(self) -> None:
+        rule = _record("text", "block", 2)
+        rule.raw_response = '{"model": "rules-first"}'
+        ai = _record("text", "block", 2)
+        ai.raw_response = '{"model": "Gandi-AIHub"}'
+        self.assertEqual(_violation_source(rule), "auto_rule")
+        self.assertEqual(_violation_source(ai), "auto_ai")
+        self.assertEqual(_violation_source(_record("image", "block", 2)), "auto_image")
 
 
 if __name__ == "__main__":

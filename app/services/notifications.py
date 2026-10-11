@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import and_, func, or_, select
@@ -12,10 +13,14 @@ from app.models.enums import FriendRequestStatus, GroupJoinRequestStatus, Member
 from app.models.friend import FriendRequest
 from app.models.bot import Bot, BotReview
 from app.models.message import Message
+from app.models.penalty import UserViolation
 from app.models.post import PostNotification
 from app.models.teamup import TeamupComment, TeamupProfile
 from app.schemas.notification import UnifiedNotificationListRead, UnifiedNotificationRead
 from app.schemas.user import UserPublic
+from app.services import penalties as penalty_service
+
+UTC = timezone.utc
 
 
 STAFF_ROLES = {MemberRole.OWNER, MemberRole.ADMIN}
@@ -274,13 +279,48 @@ async def _managed_group_system_notifications(db: AsyncSession, user_id: int) ->
     return items
 
 
+async def _moderation_notifications(db: AsyncSession, user_id: int) -> list[UnifiedNotificationRead]:
+    """处罚通知。走 system 类别的通用样式，旧客户端不用升级也能看到说明。"""
+    cutoff = datetime.now(UTC) - timedelta(days=30)
+    result = await db.execute(
+        select(UserViolation)
+        .where(
+            UserViolation.user_id == user_id,
+            UserViolation.penalty_kind != "none",
+            UserViolation.created_at >= cutoff,
+        )
+        .order_by(UserViolation.id.desc())
+        .limit(30)
+    )
+    items: list[UnifiedNotificationRead] = []
+    for violation in result.scalars().all():
+        title, body = penalty_service.describe_violation(violation)
+        items.append(
+            UnifiedNotificationRead(
+                id=f"violation:{violation.id}",
+                category="system",
+                type="moderation_penalty",
+                title=title,
+                body=body,
+                time=violation.created_at,
+                unread=False,
+                pending=False,
+                conversation_id=violation.conversation_id if violation.target_type == "message" else None,
+                action="none",
+                payload={"violation": penalty_service.violation_payload(violation)},
+            )
+        )
+    return items
+
+
 async def list_unified_notifications(db: AsyncSession, user_id: int, limit: int = 100) -> UnifiedNotificationListRead:
     groups = await _group_join_notifications(db, user_id)
     friends = await _friend_request_notifications(db, user_id)
     posts = await _post_notifications(db, user_id)
     interactions = await _interaction_notifications(db, user_id)
     systems = await _managed_group_system_notifications(db, user_id)
-    items = [*friends, *groups, *posts, *interactions, *systems]
+    penalties = await _moderation_notifications(db, user_id)
+    items = [*friends, *groups, *posts, *interactions, *systems, *penalties]
     items.sort(key=lambda item: item.time, reverse=True)
     items = items[:limit]
     counts = {"all": len(items), "friend": 0, "group": 0, "post": 0, "interact": 0, "system": 0}

@@ -19,6 +19,7 @@ from app.models.message import FeaturedMessage, MentionAllUsage, Message, Messag
 from app.models.user import User
 from app.schemas.message import FeaturedMessageRead, MessageRead, MessageReactionSummary, ReadReceipt
 from app.schemas.user import UserPublic
+from app.services.penalties import ensure_can_post
 from app.services.conversations import _member_mute_expired, clear_expired_member_mute, require_membership
 from app.services import group_activity as group_activity_service
 from app.services.ccw import enrich_metadata_with_previews, extract_creation_refs
@@ -434,6 +435,7 @@ async def send_message(
     message_type: MessageType = MessageType.TEXT,
     metadata: dict[str, Any] | None = None,
 ) -> Message:
+    ensure_can_post(sender)
     max_content_length = MAX_BOT_MESSAGE_CONTENT_LENGTH if sender.is_bot else MAX_MESSAGE_CONTENT_LENGTH
     if len(content) > max_content_length:
         detail = (
@@ -1233,6 +1235,7 @@ async def create_forward_bundle(
     message_ids: list[int],
     note: str | None = None,
 ) -> Message:
+    ensure_can_post(actor)
     source_membership = await require_membership(db, source_conversation_id, actor.id)
     await require_membership(db, target_conversation_id, actor.id)
     source_conversation = await db.get(Conversation, source_conversation_id)

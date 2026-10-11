@@ -35,7 +35,19 @@ from app.schemas.report import (
     ReportRead,
     ReportReview,
 )
+from app.models.penalty import UserViolation
+from app.models.report import AdminAuditLog
+from app.schemas.penalty import (
+    AdminAppealReview,
+    AdminViolationCreate,
+    AdminViolationPage,
+    AdminViolationRead,
+    AdminViolationReview,
+    AdminViolationRevoke,
+    PenaltyInput,
+)
 from app.services import messages as message_service
+from app.services import penalties as penalty_service
 from app.services import moderation as moderation_service
 from app.services import reports as report_service
 from app.services import announcements as announcement_service
@@ -569,3 +581,138 @@ async def admin_delete_announcement(
     await announcement_service.admin_delete(db, admin.id, announcement_id)
     await admin_manager.broadcast("admin.announcement.changed", {"id": announcement_id, "action": "deleted"})
     return MessageResponse(detail="Announcement deleted")
+
+
+# ---------------------------------------------------------------- 违规台账
+
+
+def _penalty_from_input(value: PenaltyInput) -> penalty_service.Penalty:
+    if value.kind in {"none", "notice", "warning"}:
+        return penalty_service.Penalty(value.kind, 0)
+    return penalty_service.Penalty(value.kind, None if value.permanent else value.hours)
+
+
+async def _admin_violation_read(db: AsyncSession, violation: UserViolation) -> AdminViolationRead:
+    return AdminViolationRead(**(await penalty_service.build_admin_reads(db, [violation]))[0])
+
+
+@router.get("/violations", response_model=AdminViolationPage)
+async def admin_list_violations(
+    _admin: Annotated[User, Depends(get_current_admin)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    user_id: int | None = Query(default=None, gt=0),
+    status_filter: Literal["active", "revoked"] | None = Query(default=None, alias="status"),
+    appeal_status: Literal["none", "pending", "accepted", "rejected"] | None = None,
+    review_status: Literal["none", "pending", "confirmed", "adjusted"] | None = None,
+    source: Literal["auto", "auto_rule", "auto_ai", "auto_image", "report", "jury", "admin"] | None = None,
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> AdminViolationPage:
+    items, total = await penalty_service.list_violations(
+        db,
+        user_id=user_id,
+        status_filter=status_filter,
+        appeal_status=appeal_status,
+        review_status=review_status,
+        source=source,
+        limit=limit,
+        offset=offset,
+    )
+    return AdminViolationPage(
+        items=[AdminViolationRead(**item) for item in await penalty_service.build_admin_reads(db, items)],
+        total=total,
+    )
+
+
+@router.post("/violations", response_model=AdminViolationRead, status_code=201)
+async def admin_create_violation(
+    payload: AdminViolationCreate,
+    admin: Annotated[User, Depends(get_current_admin)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> AdminViolationRead:
+    if payload.category not in penalty_service.CATEGORIES:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Unknown violation category")
+    target = await db.get(User, payload.user_id)
+    if target is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    if target.id == admin.id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot penalize yourself")
+    outcome = await penalty_service.record_violation(
+        db,
+        user_id=target.id,
+        category=payload.category,
+        level=payload.level,
+        source="admin",
+        actor_id=admin.id,
+        summary=payload.summary,
+        reason=payload.reason,
+        override=_penalty_from_input(payload.penalty) if payload.penalty is not None else None,
+    )
+    assert outcome is not None
+    await db.commit()
+    await penalty_service.flush_notifications(db)
+    return await _admin_violation_read(db, outcome.violation)
+
+
+@router.post("/violations/{violation_id}/revoke", response_model=AdminViolationRead)
+async def admin_revoke_violation(
+    violation_id: int,
+    payload: AdminViolationRevoke,
+    admin: Annotated[User, Depends(get_current_admin)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> AdminViolationRead:
+    violation = await penalty_service.revoke_violation(db, violation_id, actor_id=admin.id, reason=payload.reason)
+    await db.commit()
+    await penalty_service.notify_violation_updated(db, violation, "revoked")
+    return await _admin_violation_read(db, violation)
+
+
+@router.post("/violations/{violation_id}/review", response_model=AdminViolationRead)
+async def admin_review_violation(
+    violation_id: int,
+    payload: AdminViolationReview,
+    admin: Annotated[User, Depends(get_current_admin)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> AdminViolationRead:
+    penalty = _penalty_from_input(payload.penalty) if payload.action == "adjust" and payload.penalty is not None else None
+    violation = await penalty_service.adjust_penalty(db, violation_id, actor_id=admin.id, penalty=penalty, note=payload.note)
+    await db.commit()
+    await penalty_service.notify_violation_updated(db, violation, "reviewed")
+    if violation.penalty_kind == "ban":
+        user = await db.get(User, violation.user_id)
+        if user is not None and user.status.value == "disabled":
+            await manager.disconnect_user(user.id, "account.suspended", _account_suspension_data(user))
+    return await _admin_violation_read(db, violation)
+
+
+@router.post("/violations/{violation_id}/appeal", response_model=AdminViolationRead)
+async def admin_review_appeal(
+    violation_id: int,
+    payload: AdminAppealReview,
+    admin: Annotated[User, Depends(get_current_admin)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> AdminViolationRead:
+    violation = await penalty_service.review_appeal(db, violation_id, reviewer_id=admin.id, accept=payload.accept, note=payload.note)
+    await penalty_service.notify_violation_updated(db, violation, "appeal_accepted" if payload.accept else "appeal_rejected")
+    return await _admin_violation_read(db, violation)
+
+
+@router.post("/users/{user_id}/unmute", response_model=AdminUserRead)
+async def admin_unmute_user(
+    user_id: int,
+    admin: Annotated[User, Depends(get_current_admin)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> AdminUserRead:
+    user = await db.get(User, user_id)
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    await penalty_service.lift_mute(db, user)
+    db.add(AdminAuditLog(actor_id=admin.id, action="user.unmute", target_type="user", target_id=user.id))
+    await db.commit()
+    await manager.send_to_user(
+        user.id,
+        "moderation.violation.updated",
+        {"action": "unmuted", "violation": None, "standing": await penalty_service.user_standing(db, user)},
+    )
+    await admin_manager.broadcast("admin.user.changed", {"user_id": user.id, "action": "unmuted"})
+    return await report_service.get_admin_user(db, user.id)

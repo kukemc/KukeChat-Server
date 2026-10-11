@@ -15,19 +15,20 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
 from app.models.conversation import Conversation, ConversationMember
-from app.models.enums import MessageType, ModerationAction, ModerationSource, ModerationStatus, PlatformRole, UserStatus
+from app.models.enums import MessageType, ModerationAction, ModerationSource, ModerationStatus, UserStatus
 from app.models.message import Message
 from app.models.post import Post, PostComment, PostTopic
 from app.models.report import AdminAuditLog, ContentModerationRecord
 from app.models.teamup import TeamupComment, TeamupProfile
-from app.models.user import AuthSession, User
+from app.models.user import User
+from app.services import penalties as penalty_service
 from app.services.email import send_email_internal
 from app.services.storage import get_object, storage_key_from_url
 from app.websocket.manager import admin_manager, manager
@@ -36,8 +37,6 @@ from app.websocket.manager import admin_manager, manager
 logger = logging.getLogger(__name__)
 UTC = timezone.utc
 PERMANENT_BAN_HOURS = 24 * 365 * 100
-SEVERE_TEXT_CATEGORIES = {"minor_sexual", "illegal", "fraud", "hate", "privacy"}
-PERMANENT_TEXT_CATEGORIES = {"minor_sexual"}
 HIGH_CONFIDENCE_ABUSE_PATTERNS = tuple(
     re.compile(pattern)
     for pattern in (
@@ -323,9 +322,11 @@ async def _moderate_message_task(
                 record.acted_at = datetime.now(UTC)
 
         await session.commit()
+        await penalty_service.flush_notifications(session)
         await _broadcast_moderation_action(session, message, action)
     except Exception as exc:
         await session.rollback()
+        penalty_service.discard_notifications(session)
         await _record_moderation_error(session, message_id, source, report_id, exc)
     finally:
         if owns_session:
@@ -357,6 +358,7 @@ async def _moderate_post_task(post_id: int) -> None:
                 if action != ModerationAction.NONE:
                     record.acted_at = datetime.now(UTC)
             await db.commit()
+            await penalty_service.flush_notifications(db)
             await _broadcast_post_moderation_action(db, post, action)
         except Exception as exc:
             await db.rollback()
@@ -392,6 +394,7 @@ async def _moderate_post_comment_task(comment_id: int) -> None:
                 if action != ModerationAction.NONE:
                     record.acted_at = datetime.now(UTC)
             await db.commit()
+            await penalty_service.flush_notifications(db)
             await _broadcast_post_comment_moderation_action(db, comment, action)
         except Exception as exc:
             await db.rollback()
@@ -453,11 +456,12 @@ async def _moderate_profile_cover_task(user_id: int) -> None:
             else:
                 user.profile_cover_pending_url = None
                 user.profile_cover_moderation_status = ModerationStatus.REJECTED.value
-                action = await _apply_user_punishment(db, user.id, record)
+                action = await _apply_user_punishment(db, user.id, record, target_type="profile_cover", target_id=user.id)
             record.action_taken = action
             if action != ModerationAction.NONE:
                 record.acted_at = datetime.now(UTC)
             await db.commit()
+            await penalty_service.flush_notifications(db)
             await admin_manager.broadcast("admin.moderation.changed", {"profile_user_id": user.id, "action": action.value, "moderation_status": user.profile_cover_moderation_status})
             if action in {ModerationAction.USER_BANNED, ModerationAction.PERMANENT_BAN}:
                 await _disconnect_suspended_user(db, user.id)
@@ -496,6 +500,7 @@ async def _moderate_teamup_profile_task(profile_id: int) -> None:
                 if action != ModerationAction.NONE:
                     record.acted_at = datetime.now(UTC)
             await db.commit()
+            await penalty_service.flush_notifications(db)
             await _broadcast_teamup_profile_moderation_action(db, profile, action)
         except Exception as exc:
             await db.rollback()
@@ -531,6 +536,7 @@ async def _moderate_teamup_comment_task(comment_id: int) -> None:
                 if action != ModerationAction.NONE:
                     record.acted_at = datetime.now(UTC)
             await db.commit()
+            await penalty_service.flush_notifications(db)
             await _broadcast_teamup_comment_moderation_action(db, comment, action)
         except Exception as exc:
             await db.rollback()
@@ -1068,16 +1074,14 @@ async def _apply_moderation_action(db: AsyncSession, message: Message, record: C
         if conversation is not None:
             conversation.updated_at = now
 
-    action = _punishment_for_record(record)
-    user = await db.get(User, message.sender_id)
-    if action in {ModerationAction.USER_BANNED, ModerationAction.PERMANENT_BAN} and user is not None:
-        if user.platform_role == PlatformRole.ADMIN:
-            action = ModerationAction.RECALLED
-        else:
-            user.status = UserStatus.DISABLED
-            user.banned_until = None if action == ModerationAction.PERMANENT_BAN else now + timedelta(hours=24 * 7)
-            user.banned_at = now
-            user.ban_reason = _ban_reason(record)
+    action = await _apply_user_punishment(
+        db,
+        message.sender_id,
+        record,
+        target_type="message",
+        target_id=message.id,
+        conversation_id=message.conversation_id,
+    )
 
     db.add(
         AdminAuditLog(
@@ -1110,7 +1114,7 @@ async def _apply_post_moderation_action(db: AsyncSession, post: Post, record: Co
     post.moderation_status = ModerationStatus.REJECTED.value
     if post.deleted_at is None:
         post.deleted_at = now
-    action = await _apply_user_punishment(db, post.author_id, record)
+    action = await _apply_user_punishment(db, post.author_id, record, target_type="post", target_id=post.id)
     db.add(
         AdminAuditLog(
             actor_id=None,
@@ -1131,7 +1135,7 @@ async def _apply_post_comment_moderation_action(db: AsyncSession, comment: PostC
     comment.moderation_status = ModerationStatus.REJECTED.value
     if comment.deleted_at is None:
         comment.deleted_at = now
-    action = await _apply_user_punishment(db, comment.author_id, record)
+    action = await _apply_user_punishment(db, comment.author_id, record, target_type="post_comment", target_id=comment.id)
     db.add(
         AdminAuditLog(
             actor_id=None,
@@ -1152,7 +1156,7 @@ async def _apply_teamup_profile_moderation_action(db: AsyncSession, profile: Tea
     profile.moderation_status = ModerationStatus.REJECTED.value
     if profile.deleted_at is None:
         profile.deleted_at = now
-    action = await _apply_user_punishment(db, profile.user_id, record)
+    action = await _apply_user_punishment(db, profile.user_id, record, target_type="teamup_profile", target_id=profile.id)
     db.add(
         AdminAuditLog(
             actor_id=None,
@@ -1173,7 +1177,7 @@ async def _apply_teamup_comment_moderation_action(db: AsyncSession, comment: Tea
     comment.moderation_status = ModerationStatus.REJECTED.value
     if comment.deleted_at is None:
         comment.deleted_at = now
-    action = await _apply_user_punishment(db, comment.author_id, record)
+    action = await _apply_user_punishment(db, comment.author_id, record, target_type="teamup_comment", target_id=comment.id)
     db.add(
         AdminAuditLog(
             actor_id=None,
@@ -1203,22 +1207,43 @@ async def _apply_post_topic_moderation_action(db: AsyncSession, topic: PostTopic
     return ModerationAction.RECALLED
 
 
-async def _apply_user_punishment(db: AsyncSession, user_id: int, record: ContentModerationRecord) -> ModerationAction:
-    action = _punishment_for_record(record)
-    user = await db.get(User, user_id)
-    if action in {ModerationAction.USER_BANNED, ModerationAction.PERMANENT_BAN} and user is not None:
-        if user.platform_role == PlatformRole.ADMIN:
-            return ModerationAction.RECALLED
-        user.status = UserStatus.DISABLED
-        user.banned_until = None if action == ModerationAction.PERMANENT_BAN else datetime.now(UTC) + timedelta(hours=24 * 7)
-        user.banned_at = datetime.now(UTC)
-        user.ban_reason = _ban_reason(record)
-        await db.execute(
-            update(AuthSession)
-            .where(AuthSession.user_id == user.id, AuthSession.revoked_at.is_(None))
-            .values(revoked_at=datetime.now(UTC))
-        )
-    return action
+async def _apply_user_punishment(
+    db: AsyncSession,
+    user_id: int,
+    record: ContentModerationRecord,
+    *,
+    target_type: str,
+    target_id: int,
+    conversation_id: int | None = None,
+) -> ModerationAction:
+    """内容已经处理掉了，这里只决定要不要给人记违规。处罚轻重交给统一处罚引擎。"""
+    verdict = _verdict_for_record(record)
+    if verdict is None:
+        return ModerationAction.RECALLED
+    category, level = verdict
+    await db.flush()
+    summary = (record.content_text or "").strip()[:120] or ("[图片]" if record.content_type == "image" else None)
+    outcome = await penalty_service.record_violation(
+        db,
+        user_id=user_id,
+        category=category,
+        level=level,
+        source=_violation_source(record),
+        target_type=target_type,
+        target_id=target_id,
+        conversation_id=conversation_id,
+        moderation_record_id=record.id,
+        confidence=record.confidence,
+        summary=summary,
+        reason=record.reason,
+    )
+    if outcome is None:
+        return ModerationAction.RECALLED
+    if outcome.penalty.kind == "ban":
+        return ModerationAction.PERMANENT_BAN if outcome.penalty.permanent else ModerationAction.USER_BANNED
+    if outcome.penalty.kind == "mute":
+        return ModerationAction.MUTED
+    return ModerationAction.RECALLED
 
 
 def _action_details(action: ModerationAction, user_id: int, record: ContentModerationRecord) -> dict[str, Any]:
@@ -1234,36 +1259,71 @@ def _action_details(action: ModerationAction, user_id: int, record: ContentModer
 
 
 def _needs_action(record: ContentModerationRecord) -> bool:
+    if record.decision == "block":
+        return True
     if record.decision == "allow" and record.severity <= 0:
         return False
-    # 图片的 review 是模型「拿不准」，不是违规结论。线上被撤回的图片里绝大多数
-    # 都落在这一档，所以只留记录等人工看，不撤回也不处罚。
-    if record.content_type == "image" and record.decision != "block":
+    # 剩下的都是模型「拿不准」，不是违规结论，只留记录等人工看。图片在这一档的
+    # 误判最多，永远不动；文本是否先撤回由配置决定。无论哪种都不记违规。
+    if record.content_type == "image":
         return False
-    return True
+    return settings.content_moderation_text_review_recall
 
 
 def _worst_record(records: list[ContentModerationRecord]) -> ContentModerationRecord:
     return max(records, key=lambda item: (_needs_action(item), item.severity, _decision_rank(item.decision)))
 
 
-def _punishment_for_record(record: ContentModerationRecord) -> ModerationAction:
+# 旧版审核服务只给 decision / severity / categories，这里把它翻译成统一的
+# (类别, 等级)。新版服务直接在结果里带 category / level，见 _verdict_for_record。
+_LEGACY_TEXT_CATEGORIES: tuple[tuple[str, str, int], ...] = (
+    ("minor_sexual", "minor_sexual", 4),
+    ("sexual", "sexual", 3),
+    ("fraud", "fraud", 3),
+    ("gambling", "gambling", 3),
+    ("drug", "drugs", 3),
+    ("privacy", "privacy", 3),
+    ("violence", "threat", 3),
+    ("hate", "hate", 3),
+    ("illegal", "illegal", 3),
+    ("political_sensitive", "political", 2),
+    ("spam", "advertising", 2),
+    ("harassment", "profanity", 1),
+)
+_RULE_MODELS = {"rules-first", "kukechat-local-safety", "fast-safe-rules"}
+
+
+def _verdict_for_record(record: ContentModerationRecord) -> tuple[str, int] | None:
+    """返回这条审核记录对应的 (违规类别, 等级)；None 表示不构成违规认定。"""
+    if record.decision != "block":
+        return None
+    raw = _json_object(record.raw_response)
+    category, level = raw.get("category"), raw.get("level")
+    if isinstance(category, str) and category in penalty_service.CATEGORIES and isinstance(level, int) and not isinstance(level, bool):
+        return category, max(0, min(4, level))
+
     categories = set(_json_list(record.categories))
-    # 图片模型误判率高，机器不单独对图片下永封：先封 7 天，是否升级由管理员复核决定。
-    if record.content_type == "image" and record.decision == "block" and record.severity >= 2:
-        return ModerationAction.USER_BANNED
-    if categories & PERMANENT_TEXT_CATEGORIES:
-        return ModerationAction.PERMANENT_BAN
-    if record.decision == "block" and (record.severity >= 2 or categories & SEVERE_TEXT_CATEGORIES):
-        return ModerationAction.USER_BANNED
-    return ModerationAction.RECALLED
+    if record.content_type == "image":
+        if "minor_sexual" in categories:
+            return "minor_sexual", 4
+        # severity 1 的图片 block 是「送审不了」（外链），撤回即可，不算违规。
+        return ("sexual", 3) if record.severity >= 2 else ("unverified_media", 0)
+
+    matched = [(name, level) for legacy, name, level in _LEGACY_TEXT_CATEGORIES if legacy in categories]
+    if not matched:
+        return ("other", 2) if record.severity >= 2 else ("other", 1)
+    name, level = max(matched, key=lambda item: item[1])
+    # 旧服务用 severity 1 表示「违规但不严重」，不能和明确的严重违规同罚。
+    if level == 3 and record.severity <= 1:
+        return ("vulgar", 2) if name == "sexual" else (name, 2)
+    return name, level
 
 
-def _ban_reason(record: ContentModerationRecord) -> str:
-    categories = ", ".join(_json_list(record.categories)) or "content_policy"
-    if record.action_taken == ModerationAction.PERMANENT_BAN or _punishment_for_record(record) == ModerationAction.PERMANENT_BAN:
-        return f"内容安全系统判定严重违规：{categories}"
-    return f"内容安全系统判定违规：{categories}"
+def _violation_source(record: ContentModerationRecord) -> str:
+    if record.content_type == "image":
+        return "auto_image"
+    model = _json_object(record.raw_response).get("model")
+    return "auto_rule" if model in _RULE_MODELS else "auto_ai"
 
 
 async def _broadcast_moderation_action(db: AsyncSession, message: Message, action: ModerationAction) -> None:

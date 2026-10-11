@@ -167,10 +167,16 @@ class ReportReview(BaseModel):
     disable_user: bool = False
     ban_until: datetime | None = None
     ban_duration_hours: int | None = Field(default=None, ge=1, le=24 * 365)
+    # 认定违规：给出类别（等级缺省取类别默认值），处罚由统一阶梯计算。
+    # 同时带 disable_user 时，以管理员指定的封禁时长为准。
+    violation_category: str | None = Field(default=None, max_length=40)
+    violation_level: int | None = Field(default=None, ge=0, le=4)
 
     @model_validator(mode="after")
     def validate_action(self) -> ReportReview:
-        if self.status == ReportStatus.REJECTED and (self.action != "none" or self.delete_content or self.disable_user):
+        if self.status == ReportStatus.REJECTED and (
+            self.action != "none" or self.delete_content or self.disable_user or self.violation_category
+        ):
             raise ValueError("Rejected reports cannot perform actions")
         return self
 
@@ -279,6 +285,8 @@ class AdminStats(BaseModel):
     private_messages_total: int
     reports_pending: int
     audit_actions_today: int
+    appeals_pending: int = 0
+    penalty_reviews_pending: int = 0
 
 
 class AdminAuditLogRead(BaseModel):

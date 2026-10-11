@@ -56,9 +56,12 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
         return False
 
 
-def create_access_token(subject: str | int, expires_delta: timedelta | None = None) -> str:
+def create_access_token(subject: str | int, expires_delta: timedelta | None = None, scope: str | None = None) -> str:
     expire = datetime.now(UTC) + (expires_delta or timedelta(minutes=settings.access_token_expire_minutes))
     payload: dict[str, Any] = {"sub": str(subject), "exp": expire}
+    # 带 scope 的令牌只能用于对应的受限接口（如封禁期间申诉），普通鉴权一律拒绝。
+    if scope:
+        payload["scope"] = scope
     return jwt.encode(payload, settings.jwt_secret_key, algorithm=settings.jwt_algorithm)
 
 

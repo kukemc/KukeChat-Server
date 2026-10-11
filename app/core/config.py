@@ -52,6 +52,9 @@ class Settings(BaseSettings):
     # 永久堆积 —— 一度撑到 50 万行、占掉整个数据库的 64%。设 0 表示不清理。
     content_moderation_log_retention_days: int = Field(default=7, ge=0, le=3650)
     content_moderation_log_cleanup_batch_size: int = Field(default=5000, ge=100, le=100000)
+    # 审核服务对文本「拿不准」（review）时要不要先撤回。默认不撤，只留记录等人工；
+    # 图片的 review 无论如何都不撤回。两种情况都不会记违规。
+    content_moderation_text_review_recall: bool = False
     moderation_alert_email: str | None = None
     moderation_alert_cooldown_minutes: int = Field(default=30, ge=1, le=1440)
     # CCW 账号绑定：用户在指定作品下留言，服务端轮询评论完成校验。

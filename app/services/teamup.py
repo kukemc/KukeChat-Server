@@ -26,6 +26,7 @@ from app.schemas.teamup import (
     TeamupSkillStat,
 )
 from app.schemas.user import UserPublic
+from app.services.penalties import ensure_can_post
 from app.services.ccw import previews_from_text
 from app.services.storage import delete_objects, storage_key_from_url, thumbnail_key_for_key
 
@@ -301,6 +302,7 @@ async def get_my_profile(db: AsyncSession, user_id: int, event_id: int | None, i
 
 
 async def upsert_profile(db: AsyncSession, author: User, payload: TeamupProfileSave) -> TeamupProfile:
+    ensure_can_post(author)
     if any(_teamup_upload_path(image_url) is None for image_url in payload.image_urls):
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="名片配图必须是已上传的组队图片")
     if payload.background_url is not None and _teamup_upload_path(payload.background_url) is None:
@@ -643,6 +645,7 @@ async def build_profile_read(db: AsyncSession, profile: TeamupProfile, viewer_id
 
 
 async def create_comment(db: AsyncSession, profile_id: int, actor: User, content: str, parent_id: int | None = None) -> TeamupComment:
+    ensure_can_post(actor)
     profile = await get_visible_profile(db, profile_id, actor.id)
     if _status_value(profile.moderation_status) != ModerationStatus.APPROVED.value:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Profile is pending moderation")

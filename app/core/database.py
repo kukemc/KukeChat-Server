@@ -104,6 +104,8 @@ async def init_db() -> None:
                 ("users", "banned_until", "banned_until DATETIME"),
                 ("users", "banned_at", "banned_at DATETIME"),
                 ("users", "ban_reason", "ban_reason TEXT"),
+                ("users", "muted_until", "muted_until DATETIME"),
+                ("users", "mute_reason", "mute_reason TEXT"),
                 ("users", "last_login_ip", "last_login_ip VARCHAR(45)"),
                 ("users", "last_login_at", "last_login_at DATETIME"),
                 ("users", "last_seen_ip", "last_seen_ip VARCHAR(45)"),
