@@ -495,14 +495,20 @@ async def fetch_creation_preview(oid: str, access_key: str = "") -> dict[str, An
 
 
 async def previews_from_text(text: str, limit: int = 3) -> list[dict[str, Any]]:
-    previews: list[dict[str, Any]] = []
-    for ref in extract_creation_refs(text, limit=limit):
+    # At most three independent eight-second lookups; gather preserves URL order.
+    refs = extract_creation_refs(text, limit=min(3, limit)) if limit > 0 else []
+    if not refs:
+        return []
+
+    async def resolve(ref: dict[str, str]) -> dict[str, Any] | None:
         try:
-            previews.append(await fetch_creation_preview(ref["oid"], ref.get("access_key", "")))
+            return await fetch_creation_preview(ref["oid"], ref.get("access_key", ""))
         except (HTTPError, URLError, TimeoutError, ValueError, json.JSONDecodeError, OSError) as exc:
             logger.warning("Failed to resolve CCW creation preview oid=%s access_key=%s: %s", ref["oid"], bool(ref.get("access_key")), exc)
-            continue
-    return previews
+            return None
+
+    results = await asyncio.gather(*(resolve(ref) for ref in refs))
+    return [preview for preview in results if preview is not None]
 
 
 async def enrich_metadata_with_previews(content: str, metadata: dict[str, Any] | None, limit: int = 3) -> dict[str, Any] | None:

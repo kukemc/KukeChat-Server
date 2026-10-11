@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import re
 from datetime import datetime, timedelta, timezone
-from pathlib import PurePosixPath
 from typing import Any
 
 UTC = timezone.utc
@@ -18,15 +16,12 @@ from app.core.emoji import validate_reaction_emoji
 from app.models.conversation import Conversation, ConversationMember
 from app.models.enums import ConversationType, MemberRole, MessageType
 from app.models.message import FeaturedMessage, MentionAllUsage, Message, MessageBookmark, MessageReaction, MessageVisibility
-from app.models.report import UserReport
-from app.models.sticker import StickerAsset
 from app.models.user import User
 from app.schemas.message import FeaturedMessageRead, MessageRead, MessageReactionSummary, ReadReceipt
 from app.schemas.user import UserPublic
-from app.services.conversations import clear_expired_member_mute, require_membership
+from app.services.conversations import _member_mute_expired, clear_expired_member_mute, require_membership
 from app.services import group_activity as group_activity_service
-from app.services.ccw import enrich_metadata_with_previews
-from app.services.storage import delete_objects, storage_key_from_url, thumbnail_key_for_key
+from app.services.ccw import enrich_metadata_with_previews, extract_creation_refs
 from app.services.upload_paths import require_message_image_upload_url, require_message_or_sticker_image_url, require_message_upload_url
 
 
@@ -36,10 +31,7 @@ MAX_MESSAGE_CONTENT_LENGTH = 2000
 MAX_BOT_MESSAGE_CONTENT_LENGTH = 8000
 MESSAGE_RATE_LIMIT_PER_MINUTE = 20
 MAX_MESSAGES_PER_CONVERSATION = 1000
-PRUNE_CHECK_INTERVAL = 25
-MESSAGE_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
-MESSAGE_AUDIO_SUFFIXES = {".webm", ".ogg", ".mp3", ".m4a", ".aac", ".wav"}
-MESSAGE_UPLOAD_SUFFIXES = MESSAGE_IMAGE_SUFFIXES | MESSAGE_AUDIO_SUFFIXES
+PRUNE_BATCH_SIZE = 25
 
 
 async def _enforce_message_rate_limit(
@@ -108,73 +100,15 @@ def _metadata_image_urls(metadata: dict[str, Any] | None) -> list[str]:
     return [item.strip() for item in raw_images if isinstance(item, str) and item.strip()]
 
 
-def _upload_paths_from_value(value: Any) -> set[str]:
-    paths: set[str] = set()
-    if isinstance(value, str):
-        path = _message_upload_path(value)
-        if path is not None:
-            paths.add(path)
-        return paths
-    if isinstance(value, list):
-        for item in value:
-            paths.update(_upload_paths_from_value(item))
-        return paths
-    if isinstance(value, dict):
-        for item in value.values():
-            paths.update(_upload_paths_from_value(item))
-    return paths
+async def _prune_conversation_messages(db: AsyncSession, conversation_id: int) -> int:
+    """Remove at most one bounded batch, independently of global message ids.
 
-
-def _message_upload_paths(message: Message) -> set[str]:
-    paths: set[str] = set()
-    if message.type in {MessageType.IMAGE, MessageType.VOICE}:
-        path = _message_upload_path(message.content)
-        if path is not None:
-            paths.add(path)
-
-    metadata = _metadata_from_json(message.metadata_json)
-    if metadata is not None:
-        paths.update(_upload_paths_from_value(metadata))
-    return paths
-
-
-async def _upload_path_still_referenced(db: AsyncSession, relative_path: str) -> bool:
-    path_fragment = f"%{relative_path}%"
-    message_result = await db.execute(
-        select(Message.id)
-        .where(or_(Message.content.like(path_fragment), Message.metadata_json.like(path_fragment)))
-        .limit(1)
-    )
-    if message_result.scalar_one_or_none() is not None:
-        return True
-
-    report_result = await db.execute(
-        select(UserReport.id)
-        .where(or_(UserReport.attachments.like(path_fragment), UserReport.target_snapshot.like(path_fragment)))
-        .limit(1)
-    )
-    if report_result.scalar_one_or_none() is not None:
-        return True
-
-    sticker_result = await db.execute(
-        select(StickerAsset.id)
-        .where(or_(StickerAsset.source_path == relative_path, StickerAsset.storage_path == relative_path))
-        .limit(1)
-    )
-    return sticker_result.scalar_one_or_none() is not None
-
-
-async def _prune_conversation_messages(db: AsyncSession, conversation_id: int) -> list[str]:
-    newest_result = await db.execute(
-        select(Message.id)
-        .where(Message.conversation_id == conversation_id)
-        .order_by(Message.id.desc())
-        .limit(1)
-    )
-    newest_id = newest_result.scalar_one_or_none()
-    if newest_id is None or newest_id % PRUNE_CHECK_INTERVAL != 0:
-        return []
-
+    The existing (conversation_id, id) index finds the 1001st newest row without
+    scanning unrelated chats. Older backlogs drain 25 at a time on subsequent
+    sends instead of holding SQLite's single writer lock for a huge ORM cascade.
+    Keep uploaded objects: URLs also survive in report/moderation snapshots and
+    forwards, and an online reference check cannot prove exclusive ownership.
+    """
     cutoff_result = await db.execute(
         select(Message.id)
         .where(Message.conversation_id == conversation_id)
@@ -184,41 +118,21 @@ async def _prune_conversation_messages(db: AsyncSession, conversation_id: int) -
     )
     cutoff_id = cutoff_result.scalar_one_or_none()
     if cutoff_id is None:
-        return []
+        return 0
 
-    prune_result = await db.execute(
-        select(Message)
+    ids_result = await db.execute(
+        select(Message.id)
         .where(Message.conversation_id == conversation_id, Message.id <= cutoff_id)
         .order_by(Message.id.asc())
+        .limit(PRUNE_BATCH_SIZE)
     )
-    pruned_messages = list(prune_result.scalars().all())
-    if not pruned_messages:
-        return []
-
-    candidate_paths: set[str] = set()
-    for message in pruned_messages:
-        candidate_paths.update(_message_upload_paths(message))
-        await db.delete(message)
-    await db.flush()
-
-    keys_to_delete: list[str] = []
-    for relative_path in candidate_paths:
-        if await _upload_path_still_referenced(db, relative_path):
-            continue
-        keys_to_delete.append(relative_path)
-        if PurePosixPath(relative_path).suffix.lower() in MESSAGE_IMAGE_SUFFIXES:
-            keys_to_delete.append(thumbnail_key_for_key(relative_path))
-    return keys_to_delete
-
-
-def _delete_upload_files(paths: list[str]) -> None:
-    delete_objects(paths)
-
-
-def schedule_delete_upload_files(paths: list[str]) -> None:
-    if not paths:
-        return
-    asyncio.create_task(asyncio.to_thread(_delete_upload_files, paths))
+    old_ids = ids_result.scalars().all()
+    if not old_ids:
+        return 0
+    # FK ON DELETE actions remove reactions/bookmarks/features and detach
+    # moderation references. SQLite enables foreign_keys on each connection.
+    await db.execute(delete(Message).where(Message.id.in_(old_ids)))
+    return len(old_ids)
 
 
 def _value_mentions_all(value: Any) -> bool:
@@ -541,16 +455,16 @@ async def send_message(
     now = datetime.now(UTC)
     await _enforce_message_rate_limit(db, sender, now, conversation_id if sender.is_bot else None)
 
-    membership = await require_membership(db, conversation_id, sender.id)
+    # Membership checks must not flush expired-mute updates before external previews.
+    membership = await require_membership(db, conversation_id, sender.id, clear_expired_mute=False)
     conversation = await db.get(Conversation, conversation_id)
     if conversation is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
     if conversation.type == ConversationType.GROUP and membership.role not in STAFF_ROLES:
         if conversation.all_muted:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="This group is muted")
-        if membership.muted:
-            if not await clear_expired_member_mute(db, membership, now):
-                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Muted members cannot send messages")
+        if membership.muted and not _member_mute_expired(membership, now):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Muted members cannot send messages")
         if conversation.message_rate_limit_per_minute > 0:
             group_rate_cutoff = now - timedelta(minutes=1)
             group_rate_result = await db.execute(
@@ -566,9 +480,20 @@ async def send_message(
             if group_recent_count >= conversation.message_rate_limit_per_minute:
                 raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Group message rate limit is enabled")
 
-    await _enforce_mention_all_limit(db, conversation, membership, sender.id, metadata)
-    if message_type == MessageType.TEXT:
+    # Reject unauthorized @all before touching the network; its usage row must
+    # only be inserted after the external request has finished.
+    if _metadata_mentions_all(metadata):
+        if conversation.type != ConversationType.GROUP:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="@all can only be used in group conversations")
+        if membership.role not in STAFF_ROLES:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only group owners or admins can @all")
+    if message_type == MessageType.TEXT and extract_creation_refs(content):
         metadata = await enrich_metadata_with_previews(content, metadata)
+    await _enforce_mention_all_limit(db, conversation, membership, sender.id, metadata)
+    # A prior expired mute may need persistence; do not acquire a write lock until
+    # the network lookup has completed.
+    if membership.muted:
+        await clear_expired_member_mute(db, membership, now)
 
     message = Message(
         conversation_id=conversation_id,
@@ -593,9 +518,8 @@ async def send_message(
     conversation.updated_at = now
     membership.last_read_message_id = message.id
     membership.last_read_at = now
-    files_to_delete = await _prune_conversation_messages(db, conversation_id)
+    await _prune_conversation_messages(db, conversation_id)
     await db.commit()
-    schedule_delete_upload_files(files_to_delete)
     return message
 
 
@@ -636,9 +560,8 @@ async def create_system_message(
         membership.last_read_message_id = message.id
         membership.last_read_at = now
 
-    files_to_delete = await _prune_conversation_messages(db, conversation_id)
+    await _prune_conversation_messages(db, conversation_id)
     await db.commit()
-    schedule_delete_upload_files(files_to_delete)
     return message
 
 

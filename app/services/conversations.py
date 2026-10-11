@@ -1258,59 +1258,59 @@ async def build_conversation_reads(db: AsyncSession, conversations: list[Convers
         return [await build_conversation_read(db, conversation, current_user_id) for conversation in conversations]
 
     hidden_message_ids = select(MessageVisibility.message_id).where(MessageVisibility.user_id == current_user_id)
-    last_message_ids = (
-        select(
-            Message.conversation_id.label("conversation_id"),
-            func.max(Message.id).label("message_id"),
-        )
-        .join(
-            ConversationMember,
-            and_(
-                ConversationMember.conversation_id == Message.conversation_id,
-                ConversationMember.user_id == current_user_id,
-            ),
-        )
+    # 逐会话索引倒序探测最新可见消息。原来的 GROUP BY/MAX 会读取每个会话
+    # 的全部历史消息，即使列表只需要最后一条；此处仍保持 hide/clear 游标语义。
+    visible_latest_id = (
+        select(Message.id)
         .where(
-            Message.conversation_id.in_(conversation_ids),
+            Message.conversation_id == Conversation.id,
             Message.id.not_in(hidden_message_ids),
             or_(
                 ConversationMember.cleared_before_message_id.is_(None),
                 Message.id > ConversationMember.cleared_before_message_id,
             ),
         )
-        .group_by(Message.conversation_id)
-        .subquery()
+        .order_by(Message.id.desc())
+        .limit(1)
+        .correlate(Conversation, ConversationMember)
+        .scalar_subquery()
+    )
+    latest_per_conversation = (
+        select(visible_latest_id)
+        .select_from(Conversation)
+        .join(
+            ConversationMember,
+            and_(ConversationMember.conversation_id == Conversation.id, ConversationMember.user_id == current_user_id),
+        )
+        .where(Conversation.id.in_(conversation_ids))
     )
     last_message_result = await db.execute(
         select(Message)
         .options(joinedload(Message.sender))
-        .join(last_message_ids, last_message_ids.c.message_id == Message.id)
+        .where(Message.id.in_(latest_per_conversation))
     )
     last_messages = {message.conversation_id: message for message in last_message_result.scalars().all()}
 
-    unread_result = await db.execute(
-        select(Message.conversation_id, func.count(Message.id))
-        .join(
-            ConversationMember,
-            and_(
-                ConversationMember.conversation_id == Message.conversation_id,
-                ConversationMember.user_id == current_user_id,
-            ),
-        )
+    unread_count = (
+        select(func.count(Message.id))
         .where(
-            Message.conversation_id.in_(conversation_ids),
+            Message.conversation_id == ConversationMember.conversation_id,
             Message.sender_id != current_user_id,
             Message.id.not_in(hidden_message_ids),
-            or_(
-                ConversationMember.last_read_message_id.is_(None),
-                Message.id > ConversationMember.last_read_message_id,
-            ),
-            or_(
-                ConversationMember.cleared_before_message_id.is_(None),
-                Message.id > ConversationMember.cleared_before_message_id,
+            Message.id > func.max(
+                func.coalesce(ConversationMember.last_read_message_id, 0),
+                func.coalesce(ConversationMember.cleared_before_message_id, 0),
             ),
         )
-        .group_by(Message.conversation_id)
+        .correlate(ConversationMember)
+        .scalar_subquery()
+    )
+    unread_result = await db.execute(
+        select(ConversationMember.conversation_id, unread_count)
+        .where(
+            ConversationMember.conversation_id.in_(conversation_ids),
+            ConversationMember.user_id == current_user_id,
+        )
     )
     unread_counts = {conversation_id: int(count) for conversation_id, count in unread_result.all()}
 

@@ -21,6 +21,7 @@ from app.services.ccw import CHALLENGE_ALPHABET, fetch_comment_page
 
 
 OFFICIAL_GROUP_ID = 1
+COOKIE_SESSION_SEEN_INTERVAL = timedelta(seconds=60)
 
 
 def hash_session_token(token: str) -> str:
@@ -73,12 +74,31 @@ async def get_cookie_session_user(db: AsyncSession, session_token: str | None, c
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="No active session")
 
     await ensure_user_not_disabled(db, user)
-    mark_user_seen(user, client_ip)
-    session.last_used_at = now
-    session.client_ip = client_ip
-    session.user_agent = user_agent[:500] if user_agent else session.user_agent
-    await db.commit()
-    await db.refresh(user)
+    # A missing User-Agent historically leaves the stored value unchanged.
+    current_user_agent = user_agent[:500] if user_agent else session.user_agent
+    session_seen_recently = (
+        session.last_used_at is not None
+        and timedelta(0) <= now - ensure_aware_utc(session.last_used_at) < COOKIE_SESSION_SEEN_INTERVAL
+    )
+    user_seen_recently = (
+        user.last_seen_at is not None
+        and timedelta(0) <= now - ensure_aware_utc(user.last_seen_at) < COOKIE_SESSION_SEEN_INTERVAL
+    )
+    # Always validate both rows above, but only write when their persisted presence
+    # needs advancing. No-write responses expose the freshly loaded DB user fields.
+    if (
+        not session_seen_recently
+        or not user_seen_recently
+        or session.client_ip != client_ip
+        or session.user_agent != current_user_agent
+        or user.last_seen_ip != client_ip
+    ):
+        mark_user_seen(user, client_ip)
+        session.last_used_at = now
+        session.client_ip = client_ip
+        session.user_agent = current_user_agent
+        await db.commit()
+        await db.refresh(user)
     return CookieSessionRead(access_token=create_access_token(user.id), user=user, expires_at=session.expires_at)
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import json
+import logging
 import re
 import shlex
 from datetime import UTC, datetime, timedelta
@@ -46,6 +47,7 @@ from app.models.user import User
 from app.websocket.manager import bot_manager, manager
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 BOT_MARKDOWN_MAX_LENGTH = 8000
 BOT_MAX_ELEMENTS = 50
 BOT_ELEMENT_MESSAGE_MAX_LENGTH = 8000
@@ -654,6 +656,14 @@ async def bot_messages(
     return await message_service.build_message_reads(db, items, context.user.id)
 
 
+async def _deliver_realtime_update(coro: Any) -> None:
+    """Finish request-scoped DB work before returning; keep committed-send semantics."""
+    try:
+        await coro
+    except Exception:
+        logger.exception("Realtime task failed")
+
+
 @router.post("/conversations/{conversation_id}/messages", response_model=MessageRead, status_code=status.HTTP_201_CREATED)
 async def bot_send_message(
     conversation_id: int,
@@ -667,7 +677,7 @@ async def bot_send_message(
     message = await message_service.send_message(db, conversation_id, context.user, content, message_type, metadata)
     message_data = message_service.build_new_message_read(message, context.user.id)
     member_ids = await online_conversation_member_ids(db, conversation_id)
-    schedule_realtime_task(send_message_updates(db, "message.created", message, member_ids))
+    await _deliver_realtime_update(send_message_updates(db, "message.created", message, member_ids))
     schedule_realtime_task(send_admin_message_signal("admin.message.changed", message, "created"))
     if not context.user.content_moderation_whitelisted:
         moderation_service.schedule_message_moderation(message.id)
@@ -684,13 +694,13 @@ async def bot_send_direct_message(
     if user_id == context.user.id:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot create a direct conversation with yourself")
     conversation = await conversation_service.get_or_create_direct_conversation(db, context.user, user_id, True)
-    response_recipients = await conversation_service.conversation_member_ids(db, conversation.id)
-    schedule_realtime_task(send_conversation_updates(db, conversation.id, response_recipients))
     content, message_type, metadata = normalize_bot_message_payload(payload, context.bot.id, context.bot.owner_id)
     message = await message_service.send_message(db, conversation.id, context.user, content, message_type, metadata)
     message_data = message_service.build_new_message_read(message, context.user.id)
+    response_recipients = await conversation_service.conversation_member_ids(db, conversation.id)
+    await _deliver_realtime_update(send_conversation_updates(db, conversation.id, response_recipients))
     member_ids = await online_conversation_member_ids(db, conversation.id)
-    schedule_realtime_task(send_message_updates(db, "message.created", message, member_ids))
+    await _deliver_realtime_update(send_message_updates(db, "message.created", message, member_ids))
     schedule_realtime_task(send_admin_message_signal("admin.message.changed", message, "created"))
     if not context.user.content_moderation_whitelisted:
         moderation_service.schedule_message_moderation(message.id)

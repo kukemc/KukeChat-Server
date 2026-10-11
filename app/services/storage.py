@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path, PurePosixPath
@@ -41,8 +42,20 @@ IMAGE_FORMAT_CONTENT_TYPES = {
 }
 MAX_IMAGE_UPLOAD_BYTES = 3 * 1024 * 1024
 MAX_AUDIO_UPLOAD_BYTES = 2 * 1024 * 1024
+# Pixel caps apply before verify/load, including GIF first-frame thumbnails and
+# old local files; Pillow's default decompression warning is not a hard limit.
+MAX_IMAGE_PIXELS = 12_000_000
+MAX_LEGACY_IMAGE_BYTES = 12 * 1024 * 1024
+# A worker retains at most one decoded image at a time. Threads already running
+# remain counted if their awaiting request is cancelled.
+IMAGE_WORKERS = asyncio.Semaphore(2)
 JPEG_CONTENT_TYPE = "image/jpeg"
 S3_CONFIG = Config(connect_timeout=3, read_timeout=10, retries={"max_attempts": 2, "mode": "standard"})
+# Match the local /uploads cache policy; never cache unrelated or private objects.
+_PUBLIC_IMAGE_FOLDERS = frozenset({"avatars", "profile-covers", "messages", "posts", "teamup", "announcements", "stickers"})
+_PUBLIC_IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".png", ".webp", ".gif"})
+_PUBLIC_AUDIO_SUFFIXES = frozenset({".webm", ".ogg", ".mp3", ".m4a", ".aac", ".wav"})
+_PUBLIC_CACHE_CONTROL = "public, max-age=3600"
 _S3_CLIENT = None
 
 
@@ -162,16 +175,33 @@ def _s3_client():
     return _S3_CLIENT
 
 
+def _is_public_media_key(key: str) -> bool:
+    parts = PurePosixPath(key).parts
+    if len(parts) == 2:
+        folder, filename = parts
+    elif len(parts) == 3 and parts[1] == "thumbs":
+        folder, _, filename = parts
+    else:
+        return False
+    suffix = PurePosixPath(filename).suffix.lower()
+    return (folder in _PUBLIC_IMAGE_FOLDERS and suffix in _PUBLIC_IMAGE_SUFFIXES) or (
+        folder == "messages" and len(parts) == 2 and suffix in _PUBLIC_AUDIO_SUFFIXES
+    )
+
+
 def put_object(key: str, data: bytes | BinaryIO, content_type: str) -> str:
     normalized = _normalize_key(key)
     if settings.storage_backend == "s3":
         body = data if hasattr(data, "read") else BytesIO(data)
+        extra_args = {"ContentType": content_type}
+        if _is_public_media_key(normalized):
+            extra_args["CacheControl"] = _PUBLIC_CACHE_CONTROL
         try:
             _s3_client().upload_fileobj(
                 body,
                 settings.s3_bucket,
                 normalized,
-                ExtraArgs={"ContentType": content_type},
+                ExtraArgs=extra_args,
             )
         except (BotoCoreError, ClientError) as exc:
             raise _storage_error() from exc
@@ -189,23 +219,39 @@ def put_object(key: str, data: bytes | BinaryIO, content_type: str) -> str:
     return normalized
 
 
-def get_object(key: str) -> StoredObject:
+def get_object(key: str, max_bytes: int | None = None) -> StoredObject:
     normalized = _normalize_key(key)
     if settings.storage_backend == "s3":
         try:
             response = _s3_client().get_object(Bucket=settings.s3_bucket, Key=normalized)
-            body = response["Body"].read()
+            stream = response["Body"]
+            try:
+                if max_bytes is not None and (response.get("ContentLength") or 0) > max_bytes:
+                    raise HTTPException(status_code=413, detail="Stored image exceeds 12MB")
+                body = stream.read(max_bytes + 1 if max_bytes is not None else -1)
+            finally:
+                stream.close()
         except (BotoCoreError, ClientError) as exc:
             local_file = local_path_for_key(normalized)
             if local_file is None:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Stored object was not found") from exc
-            return StoredObject(data=local_file.read_bytes(), content_type=_content_type_for_key(normalized))
+            return StoredObject(data=_read_local_object(local_file, max_bytes), content_type=_content_type_for_key(normalized))
+        if max_bytes is not None and len(body) > max_bytes:
+            raise HTTPException(status_code=413, detail="Stored image exceeds 12MB")
         return StoredObject(data=body, content_type=response.get("ContentType") or _content_type_for_key(normalized))
 
     file_path = local_path_for_key(normalized)
     if file_path is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Stored object was not found")
-    return StoredObject(data=file_path.read_bytes(), content_type=_content_type_for_key(normalized))
+    return StoredObject(data=_read_local_object(file_path, max_bytes), content_type=_content_type_for_key(normalized))
+
+
+def _read_local_object(file_path: Path, max_bytes: int | None) -> bytes:
+    with file_path.open("rb") as stream:
+        data = stream.read(max_bytes + 1 if max_bytes is not None else -1)
+    if max_bytes is not None and len(data) > max_bytes:
+        raise HTTPException(status_code=413, detail="Stored image exceeds 12MB")
+    return data
 
 
 def delete_objects(keys: list[str]) -> None:
@@ -283,12 +329,10 @@ def local_response_for_key(key: str) -> FileResponse | None:
         return None
     try:
         with Image.open(source_file) as image:
-            if image.format == "GIF":
-                image.seek(0)
-            thumbnail_data = _encode_jpeg(image, settings.image_thumbnail_max_dimension)
+            thumbnail_data = _encode_jpeg(image, settings.image_thumbnail_max_dimension, quality=min(settings.image_quality, 65))
         target_file.parent.mkdir(parents=True, exist_ok=True)
         target_file.write_bytes(thumbnail_data)
-    except (OSError, UnidentifiedImageError):
+    except (OSError, UnidentifiedImageError, HTTPException, Image.DecompressionBombError):
         return None
     return FileResponse(target_file, media_type=JPEG_CONTENT_TYPE)
 
@@ -326,34 +370,71 @@ def object_exists(key: str) -> bool:
     return local_path_for_key(normalized) is not None
 
 
+def _check_image_pixels(image: Image.Image) -> None:
+    width, height = image.size
+    if width * height > MAX_IMAGE_PIXELS:
+        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="Image pixel count exceeds 12 million")
+
+
 def _prepare_image_for_jpeg(image: Image.Image, max_dimension: int) -> Image.Image:
-    image = ImageOps.exif_transpose(image)
+    _check_image_pixels(image)
+    # JPEG draft decoding reduces the intermediate raster for large JPEGs.
+    if image.format == "JPEG":
+        image.draft("RGB", (max_dimension, max_dimension))
+    # Resize before EXIF transpose to avoid copying a full-resolution raster.
     image.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
+    image = ImageOps.exif_transpose(image)
     if image.mode in {"RGBA", "LA", "P"} or "transparency" in image.info:
+        rgba = image.convert("RGBA")
         background = Image.new("RGB", image.size, (255, 255, 255))
-        background.paste(image.convert("RGBA"), mask=image.convert("RGBA").getchannel("A"))
+        background.paste(rgba, mask=rgba.getchannel("A"))
         return background
     return image.convert("RGB")
 
 
-def _encode_jpeg(image: Image.Image, max_dimension: int) -> bytes:
+def _encode_jpeg(image: Image.Image, max_dimension: int, *, quality: int | None = None) -> bytes:
     output = BytesIO()
     _prepare_image_for_jpeg(image, max_dimension).save(
         output,
         format="JPEG",
-        quality=settings.image_quality,
+        quality=quality if quality is not None else settings.image_quality,
         optimize=True,
         progressive=True,
     )
     return output.getvalue()
 
 
+async def run_image_worker(function, *args):
+    """Hold the decode slot until its thread finishes, even on cancellation.
+
+    asyncio.to_thread cannot interrupt Pillow or blocking S3 calls; shielding the
+    wait prevents cancellation from admitting a third worker while one continues.
+    """
+    await IMAGE_WORKERS.acquire()
+    try:
+        worker = asyncio.create_task(asyncio.to_thread(function, *args))
+    except BaseException:
+        IMAGE_WORKERS.release()
+        raise
+    def _finish(completed: asyncio.Task) -> None:
+        IMAGE_WORKERS.release()
+        # Retrieve failures even if the HTTP request was cancelled.
+        try:
+            completed.exception()
+        except asyncio.CancelledError:
+            pass
+
+    worker.add_done_callback(_finish)
+    return await asyncio.shield(worker)
+
+
 def _verified_image(content: bytes) -> tuple[str, str]:
     try:
         with Image.open(BytesIO(content)) as image:
+            _check_image_pixels(image)
             image.verify()
             image_format = image.format or ""
-    except (UnidentifiedImageError, OSError) as exc:
+    except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Uploaded file is not a valid image") from exc
 
     content_type = IMAGE_FORMAT_CONTENT_TYPES.get(image_format.upper())
@@ -368,27 +449,29 @@ def process_image_upload(content: bytes, folder: str, object_id: str) -> Process
     if len(content) > MAX_IMAGE_UPLOAD_BYTES:
         raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="Image size must not exceed 3MB")
 
+    return _process_verified_image(content, folder, object_id)
+
+
+def _process_verified_image(content: bytes, folder: str, object_id: str) -> ProcessedImageUpload:
     image_format, _detected_content_type = _verified_image(content)
     folder = _normalize_key(folder)
-    if image_format == "GIF":
-        key = _join_key(folder, f"{object_id}.gif")
-        data = content
-        content_type = "image/gif"
-    else:
-        key = _join_key(folder, f"{object_id}.jpg")
-        with Image.open(BytesIO(content)) as image:
-            data = _encode_jpeg(image, settings.image_max_dimension)
-        content_type = JPEG_CONTENT_TYPE
-
-    thumbnail_key = thumbnail_key_for_key(key)
+    key = _join_key(folder, f"{object_id}.gif" if image_format == "GIF" else f"{object_id}.jpg")
     try:
         with Image.open(BytesIO(content)) as image:
+            _check_image_pixels(image)
+            # Preserve every GIF frame; only the first frame is decoded for its thumbnail.
             if image_format == "GIF":
-                image.seek(0)
-            thumbnail_data = _encode_jpeg(image, settings.image_thumbnail_max_dimension)
-    except (UnidentifiedImageError, OSError) as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Image thumbnail could not be generated") from exc
+                data = content
+                content_type = "image/gif"
+            else:
+                data = _encode_jpeg(image, settings.image_max_dimension, quality=min(settings.image_quality, 78))
+                content_type = JPEG_CONTENT_TYPE
+        with Image.open(BytesIO(content)) as image:
+            thumbnail_data = _encode_jpeg(image, settings.image_thumbnail_max_dimension, quality=min(settings.image_quality, 65))
+    except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError) as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Image could not be decoded") from exc
 
+    thumbnail_key = thumbnail_key_for_key(key)
     return ProcessedImageUpload(
         key=key,
         data=data,
@@ -403,37 +486,9 @@ def process_image_upload(content: bytes, folder: str, object_id: str) -> Process
 def process_legacy_image(content: bytes, folder: str, object_id: str) -> ProcessedImageUpload:
     if not content:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Uploaded file is empty")
-
-    image_format, _detected_content_type = _verified_image(content)
-    folder = _normalize_key(folder)
-    if image_format == "GIF":
-        key = _join_key(folder, f"{object_id}.gif")
-        data = content
-        content_type = "image/gif"
-    else:
-        key = _join_key(folder, f"{object_id}.jpg")
-        with Image.open(BytesIO(content)) as image:
-            data = _encode_jpeg(image, settings.image_max_dimension)
-        content_type = JPEG_CONTENT_TYPE
-
-    thumbnail_key = thumbnail_key_for_key(key)
-    try:
-        with Image.open(BytesIO(content)) as image:
-            if image_format == "GIF":
-                image.seek(0)
-            thumbnail_data = _encode_jpeg(image, settings.image_thumbnail_max_dimension)
-    except (UnidentifiedImageError, OSError) as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Image thumbnail could not be generated") from exc
-
-    return ProcessedImageUpload(
-        key=key,
-        data=data,
-        content_type=content_type,
-        thumbnail_key=thumbnail_key,
-        thumbnail_data=thumbnail_data,
-        thumbnail_content_type=JPEG_CONTENT_TYPE,
-        filename=PurePosixPath(key).name,
-    )
+    if len(content) > MAX_LEGACY_IMAGE_BYTES:
+        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="Legacy image exceeds 12MB")
+    return _process_verified_image(content, folder, object_id)
 
 
 def store_processed_image(image: ProcessedImageUpload) -> None:
@@ -461,14 +516,19 @@ def store_processed_audio(audio: ProcessedAudioUpload) -> None:
     put_object(audio.key, audio.data, audio.content_type)
 
 
-def create_compressed_sticker(source_key: str, object_id: str) -> tuple[str, str]:
-    source = get_object(source_key)
-    _verified_image(source.data)
+def create_compressed_sticker(source_data: bytes, object_id: str) -> tuple[str, str]:
+    # The caller already fetched the bounded source in the same image worker.
+    if len(source_data) > MAX_LEGACY_IMAGE_BYTES:
+        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="Sticker source exceeds 12MB")
+    _verified_image(source_data)
     storage_key = _join_key("stickers", f"{object_id}.jpg")
-    with Image.open(BytesIO(source.data)) as image:
-        data = _encode_jpeg(image, settings.image_max_dimension)
-    with Image.open(BytesIO(source.data)) as image:
-        thumbnail_data = _encode_jpeg(image, settings.image_thumbnail_max_dimension)
+    try:
+        with Image.open(BytesIO(source_data)) as image:
+            data = _encode_jpeg(image, settings.image_max_dimension, quality=min(settings.image_quality, 78))
+        with Image.open(BytesIO(source_data)) as image:
+            thumbnail_data = _encode_jpeg(image, settings.image_thumbnail_max_dimension, quality=min(settings.image_quality, 65))
+    except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError) as exc:
+        raise HTTPException(status_code=400, detail="Sticker image could not be decoded") from exc
     put_object(storage_key, data, JPEG_CONTENT_TYPE)
     put_object(thumbnail_key_for_key(storage_key), thumbnail_data, JPEG_CONTENT_TYPE)
     return storage_key, JPEG_CONTENT_TYPE

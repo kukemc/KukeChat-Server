@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import html
 import json
+import logging
 import re
 import shlex
 from datetime import datetime, timezone
@@ -71,6 +72,13 @@ from app.websocket.manager import admin_manager, bot_manager, game_manager, mana
 
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
+# Probe one extra member so small conversations never enumerate global presence.
+DIRECT_PRESENCE_MEMBER_LIMIT = 128
+# SQLite installations may still have the legacy 999-variable limit (one bind is the conversation ID).
+MEMBERSHIP_IN_BATCH_SIZE = 800
+REALTIME_TASK_LIMIT = 256
+_realtime_tasks: set[asyncio.Task] = set()
 _BOT_MARKDOWN_INTERACTION_TAG_RE = re.compile(r"<\s*(button|btn|link)\b([^<>]*?)(?:/\s*>|>(.*?)<\s*/\s*\1\s*>)", re.IGNORECASE | re.DOTALL)
 
 
@@ -245,11 +253,28 @@ async def send_conversation_updates(db: AsyncSession, conversation_id: int, user
 
 
 async def online_conversation_member_ids(db: AsyncSession, conversation_id: int) -> list[int]:
-    return await conversation_service.conversation_member_ids_in(
-        db,
-        conversation_id,
-        await manager.online_user_ids_global(),
+    # The unique (conversation_id, user_id) index makes this a bounded index scan.
+    # For a small group, checking its members directly avoids reading every online
+    # user globally or binding thousands of unrelated IDs in SQL.
+    result = await db.execute(
+        select(ConversationMember.user_id)
+        .where(ConversationMember.conversation_id == conversation_id)
+        .limit(DIRECT_PRESENCE_MEMBER_LIMIT + 1)
     )
+    member_ids = list(result.scalars().all())
+    if len(member_ids) <= DIRECT_PRESENCE_MEMBER_LIMIT:
+        return list(await manager.online_user_ids_among(member_ids))
+
+    # Large groups: scanning global presence can be cheaper than testing every
+    # member. Still authorize every recipient against the database, in safe batches
+    # for SQLite's older 999-bind deployments.
+    online_ids = sorted(await manager.online_user_ids_global(fresh=True) | manager.online_user_ids())
+    authorized: list[int] = []
+    for offset in range(0, len(online_ids), MEMBERSHIP_IN_BATCH_SIZE):
+        authorized.extend(await conversation_service.conversation_member_ids_in(
+            db, conversation_id, set(online_ids[offset:offset + MEMBERSHIP_IN_BATCH_SIZE]),
+        ))
+    return authorized
 
 
 async def send_conversation_patch(
@@ -258,7 +283,7 @@ async def send_conversation_patch(
     user_ids: list[int] | set[int],
     extra: dict | None = None,
 ) -> None:
-    online_ids = set(user_ids) & await manager.online_user_ids_global()
+    online_ids = set(user_ids) & await manager.online_user_ids_global(fresh=True)
     response_cache.invalidate_user_conversations(online_ids)
     if not online_ids:
         return
@@ -289,7 +314,10 @@ async def send_conversation_patch(
 
 
 async def send_message_updates(db: AsyncSession, event_type: str, message: Message, user_ids: list[int] | set[int]) -> None:
-    online_ids = set(user_ids) & await manager.online_user_ids_global()
+    # Callers supply conversation-authorized recipients (often already filtered by a
+    # fresh presence read). A second global Redis scan adds O(online users) work and
+    # can drop someone who connected between the two reads.
+    online_ids = set(user_ids)
     if event_type == "message.created" and message.sender is not None:
         if getattr(message, "_sender_display_name", None) is None:
             data = await message_service.build_message_read(db, message, message.sender_id)
@@ -362,21 +390,28 @@ async def send_admin_message_signal(event_type: str, message: Message, action: s
 
 
 def schedule_realtime_task(coro) -> None:
+    """Only schedule DB-free delivery; never pass a request-bound AsyncSession here."""
+    if len(_realtime_tasks) >= REALTIME_TASK_LIMIT:
+        coro.close()
+        logger.error("Realtime task limit reached; dropping optional signal")
+        return
     task = asyncio.create_task(coro)
+    _realtime_tasks.add(task)
 
-    def consume_exception(done_task: asyncio.Task) -> None:
-        try:
-            done_task.result()
-        except Exception:
-            pass
+    def report_exception(done_task: asyncio.Task) -> None:
+        _realtime_tasks.discard(done_task)
+        if not done_task.cancelled():
+            exc = done_task.exception()
+            if exc is not None:
+                logger.error("Realtime task failed", exc_info=(type(exc), exc, exc.__traceback__))
 
-    task.add_done_callback(consume_exception)
+    task.add_done_callback(report_exception)
 
 
 async def send_reaction_updates(db: AsyncSession, conversation_id: int, message_id: int, user_ids: list[int] | set[int]) -> None:
     reactions = await message_service.get_message_reaction_summaries(db, message_id, 0)
     event_data = {"conversation_id": conversation_id, "message_id": message_id, "reactions": reactions}
-    online_ids = set(user_ids) & await manager.online_user_ids_global()
+    online_ids = set(user_ids) & await manager.online_user_ids_global(fresh=True)
     if online_ids:
         await manager.send_to_users(online_ids, "message.reaction.updated", event_data)
     await send_bot_conversation_event(db, "message.reaction.updated", conversation_id, event_data)
@@ -1210,7 +1245,10 @@ async def send_message(
     message_data = message_service.build_new_message_read(message, current_user.id)
     member_ids = await online_conversation_member_ids(db, conversation_id)
     response_cache.invalidate_user_conversations(set(member_ids) | {current_user.id})
-    schedule_realtime_task(send_message_updates(db, "message.created", message, member_ids))
+    try:
+        await send_message_updates(db, "message.created", message, member_ids)
+    except Exception:
+        logger.exception("Committed message %s realtime delivery failed", message.id)
     schedule_realtime_task(send_admin_message_signal("admin.message.changed", message, "created"))
     previous_level = getattr(message, "_level_previous", None)
     current_level = getattr(message, "_level_current", None)
@@ -1250,7 +1288,10 @@ async def forward_bundle(
     message_data = message_service.build_new_message_read(message, current_user.id)
     member_ids = await online_conversation_member_ids(db, target_conversation_id)
     response_cache.invalidate_user_conversations(set(member_ids) | {current_user.id})
-    schedule_realtime_task(send_message_updates(db, "message.created", message, member_ids))
+    try:
+        await send_message_updates(db, "message.created", message, member_ids)
+    except Exception:
+        logger.exception("Committed message %s realtime delivery failed", message.id)
     schedule_realtime_task(send_admin_message_signal("admin.message.changed", message, "created"))
     previous_level = getattr(message, "_level_previous", None)
     current_level = getattr(message, "_level_current", None)

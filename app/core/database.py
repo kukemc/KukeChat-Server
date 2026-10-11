@@ -315,6 +315,16 @@ async def init_db() -> None:
                 ),
                 (
                     "conversation_members",
+                    "ix_conversation_members_last_read_message_id",
+                    "CREATE INDEX ix_conversation_members_last_read_message_id ON conversation_members (last_read_message_id)",
+                ),
+                (
+                    "conversation_members",
+                    "ix_conversation_members_cleared_before_message_id",
+                    "CREATE INDEX ix_conversation_members_cleared_before_message_id ON conversation_members (cleared_before_message_id)",
+                ),
+                (
+                    "conversation_members",
                     "ix_conversation_members_user_pinned",
                     "CREATE INDEX ix_conversation_members_user_pinned ON conversation_members (user_id, pinned)",
                 ),

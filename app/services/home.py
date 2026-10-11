@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
 import math
 import random
 from datetime import UTC, datetime, timedelta
+
+from app.core.config import settings
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -19,28 +22,32 @@ from app.services import conversations as conversation_service
 from app.services.users import list_ccw_creators
 
 
-def _pick_weighted_groups(rows: list[tuple[Conversation, int, int]], limit: int, seed: int) -> list[tuple[Conversation, int, int, int]]:
-    now = datetime.now(UTC)
-    pool: list[tuple[Conversation, int, int, int]] = []
-    for conversation, member_count, recent_message_count in rows:
-        updated_at = conversation.updated_at
-        if updated_at.tzinfo is None:
-            updated_at = updated_at.replace(tzinfo=UTC)
-        freshness = max(0, 14 - (now - updated_at).days)
-        heat_score = int(member_count * 4 + recent_message_count * 7 + freshness * 2)
-        pool.append((conversation, member_count, recent_message_count, heat_score))
-
-    rng = random.Random(seed)
-    selected: list[tuple[Conversation, int, int, int]] = []
-    while pool and len(selected) < limit:
-        weights = [max(1.0, math.pow(max(item[3], 1), 0.72)) for item in pool]
-        index = rng.choices(range(len(pool)), weights=weights, k=1)[0]
-        selected.append(pool.pop(index))
-    return selected
+# 只缓存公开聚合；绝不缓存用户的入群状态、申请状态或推荐结果。所有 worker 使用
+# 同一 Redis TTL；未配置或故障时实时查询，避免进程内缓存发生跨 worker 漂移。
+_STATS_CACHE_KEY = "home:public-stats:v1"
+_STATS_CACHE_TTL = 15
+_stats_redis = None
 
 
-async def get_home(db: AsyncSession, current_user_id: int, seed: int, group_limit: int = 6, creator_limit: int = 6) -> HomeRead:
-    since = datetime.now(UTC) - timedelta(days=7)
+async def _home_stats(db: AsyncSession, since: datetime) -> HomeStatsRead:
+    global _stats_redis
+    redis = None
+    if settings.redis_url:
+        try:
+            if _stats_redis is None:
+                import redis.asyncio as redis_module
+
+                _stats_redis = redis_module.from_url(
+                    settings.redis_url, socket_connect_timeout=0.2, socket_timeout=0.2
+                )
+            redis = _stats_redis
+            cached = await redis.get(_STATS_CACHE_KEY)
+            if cached is not None:
+                return HomeStatsRead.model_validate(json.loads(cached))
+        except Exception:
+            # 缓存不是统计正确性的前提；Redis 出错时立即退回数据库。
+            redis = None
+
     stat_result = await db.execute(select(
         select(func.count()).select_from(User).where(User.is_bot.is_(False)).scalar_subquery(),
         select(func.count()).select_from(Message).where(Message.recalled_at.is_(None)).scalar_subquery(),
@@ -66,6 +73,37 @@ async def get_home(db: AsyncSession, current_user_id: int, seed: int, group_limi
         friendships=int(friendships) // 2,
         post_likes=int(post_likes),
     )
+    if redis is not None:
+        try:
+            await redis.set(_STATS_CACHE_KEY, stats.model_dump_json(), ex=_STATS_CACHE_TTL)
+        except Exception:
+            pass
+    return stats
+
+
+def _pick_weighted_groups(rows: list[tuple[Conversation, int, int]], limit: int, seed: int) -> list[tuple[Conversation, int, int, int]]:
+    now = datetime.now(UTC)
+    pool: list[tuple[Conversation, int, int, int]] = []
+    for conversation, member_count, recent_message_count in rows:
+        updated_at = conversation.updated_at
+        if updated_at.tzinfo is None:
+            updated_at = updated_at.replace(tzinfo=UTC)
+        freshness = max(0, 14 - (now - updated_at).days)
+        heat_score = int(member_count * 4 + recent_message_count * 7 + freshness * 2)
+        pool.append((conversation, member_count, recent_message_count, heat_score))
+
+    rng = random.Random(seed)
+    selected: list[tuple[Conversation, int, int, int]] = []
+    while pool and len(selected) < limit:
+        weights = [max(1.0, math.pow(max(item[3], 1), 0.72)) for item in pool]
+        index = rng.choices(range(len(pool)), weights=weights, k=1)[0]
+        selected.append(pool.pop(index))
+    return selected
+
+
+async def get_home(db: AsyncSession, current_user_id: int, seed: int, group_limit: int = 6, creator_limit: int = 6) -> HomeRead:
+    since = datetime.now(UTC) - timedelta(days=7)
+    stats = await _home_stats(db, since)
 
     member_counts = (
         select(ConversationMember.conversation_id, func.count(ConversationMember.id).label("member_count"))

@@ -12,6 +12,8 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     app_name: str = "KukeChat API"
+    # Opt in for bounded, anonymized HTTP ASGI byte/latency logs per worker.
+    transport_metrics_enabled: bool = False
     database_url: str = "sqlite+aiosqlite:///./kukechat.db"
     # 没有默认值：缺失或仍是占位值时启动即失败，见下方 validator。
     # 一个可预测的签名密钥等于任何人都能伪造任意用户的令牌。

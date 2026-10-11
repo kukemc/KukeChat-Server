@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import os
-import time
 import base64
 from html import escape
 from contextlib import asynccontextmanager
 from collections.abc import AsyncGenerator
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import HTMLResponse, Response
@@ -20,17 +19,22 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import AsyncSessionLocal, get_db, init_db
 from app.core.request_guard import ClientProofMiddleware
+from app.core.transport_metrics import TransportMetrics, TransportMetricsMiddleware
 from app.services.legacy_uploads import migrate_legacy_upload_response
 from app.services.ccw import start_ccw_binding_worker, stop_ccw_binding_worker
 from app.services.moderation import start_moderation_retry_worker, stop_moderation_retry_worker
 from app.services.task import start_task_reminder_worker, stop_task_reminder_worker
 from app.services.task_assistant import ensure_task_assistant_bot
 from app.services.system_settings import export_public_download_metadata, get_public_download_settings
-from app.websocket.manager import admin_manager, bot_manager, manager
+from app.websocket.manager import admin_manager, bot_manager, game_manager, manager, shared_realtime_subscriber
 from app.websocket.routes import router as websocket_router
 
 
 DOWNLOAD_ICON_URL = "https://m.ccw.site/gandi_application/user_assets/640168abc245d7bf4c6a6a23b03cd29c.png"
+transport_metrics = TransportMetrics() if settings.transport_metrics_enabled else None
+# The sole switch and 60-second task cover HTTP ASGI and all local WS/Redis publishers.
+for _realtime_manager in (manager, admin_manager, bot_manager, game_manager):
+    _realtime_manager.transport_metrics = transport_metrics
 
 
 def _html_text(value: str | None) -> str:
@@ -73,37 +77,49 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
     await manager.start()
     await admin_manager.start()
     await bot_manager.start()
+    await game_manager.start()
+    await shared_realtime_subscriber.start()
     start_ccw_binding_worker()
     start_moderation_retry_worker()
     start_task_reminder_worker()
+    if transport_metrics is not None:
+        await transport_metrics.start()
     try:
         yield
     finally:
         await stop_task_reminder_worker()
         await stop_ccw_binding_worker()
         await stop_moderation_retry_worker()
+        await shared_realtime_subscriber.stop()
+        await game_manager.stop()
         await bot_manager.stop()
         await admin_manager.stop()
         await manager.stop()
+        if transport_metrics is not None:
+            await transport_metrics.stop()
+
+
+class UploadAwareGZipMiddleware(GZipMiddleware):
+    """Keep local, already-encoded upload media byte-identical (including Range)."""
+
+    async def __call__(self, scope, receive, send):
+        path = scope.get("path", "")
+        if (
+            scope["type"] == "http"
+            and settings.storage_backend == "local"
+            and path.startswith("/uploads/")
+            and CachedUploadFiles.is_public_media_path(path[len("/uploads/"):])
+        ):
+            await self.app(scope, receive, send)
+            return
+        await super().__call__(scope, receive, send)
 
 
 app = FastAPI(title=settings.app_name, lifespan=lifespan)
 Path(settings.upload_dir).mkdir(parents=True, exist_ok=True)
-app.add_middleware(GZipMiddleware, minimum_size=1_000_000)
+app.add_middleware(UploadAwareGZipMiddleware, minimum_size=1024, compresslevel=4)
 app.add_middleware(ClientProofMiddleware)
 
-
-@app.middleware("http")
-async def slow_request_logger(request: Request, call_next):
-    started = time.perf_counter()
-    response = await call_next(request)
-    elapsed_ms = (time.perf_counter() - started) * 1000
-    if elapsed_ms >= 300:
-        print(
-            f"[slow_request] {request.method} {request.url.path} "
-            f"status={response.status_code} duration_ms={elapsed_ms:.1f}"
-        )
-    return response
 
 app.add_middleware(
     CORSMiddleware,
@@ -113,6 +129,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# Last registered means outermost: records ASGI body bytes *after* gzip/CORS.
+# With the default disabled, no per-request observer or background task exists.
+if transport_metrics is not None:
+    app.add_middleware(TransportMetricsMiddleware, metrics=transport_metrics)
 
 
 @app.get("/health", tags=["health"])
@@ -595,10 +615,41 @@ async def login_page() -> str:
 """
 
 
+class CachedUploadFiles(StaticFiles):
+    """Cache only public image/voice files, without altering Starlette's 304/Range handling."""
+
+    _image_folders = {"avatars", "profile-covers", "messages", "posts", "teamup", "announcements", "stickers"}
+    _image_suffixes = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+    _audio_suffixes = {".webm", ".ogg", ".mp3", ".m4a", ".aac", ".wav"}
+
+    @classmethod
+    def is_public_media_path(cls, path: str) -> bool:
+        # StaticFiles.get_path uses the OS separator (backslash on Windows).
+        parts = PurePosixPath(path.replace("\\", "/")).parts
+        if len(parts) == 2:
+            folder, filename = parts
+        elif len(parts) == 3 and parts[1] == "thumbs":
+            folder, _, filename = parts
+        else:
+            return False
+        suffix = PurePosixPath(filename).suffix.lower()
+        return (folder in cls._image_folders and suffix in cls._image_suffixes) or (
+            folder == "messages" and len(parts) == 2 and suffix in cls._audio_suffixes
+        )
+
+    async def get_response(self, path: str, scope: dict) -> Response:
+        response = await super().get_response(path, scope)
+        if self.is_public_media_path(path):
+            # Historic names and deleted/replaced uploads may still resolve at the same URL.
+            # A short TTL is safer than claiming immutable, including for UUID-named media.
+            response.headers["Cache-Control"] = "public, max-age=3600"
+        return response
+
+
 app.include_router(api_router)
 app.include_router(websocket_router)
 if settings.storage_backend == "local":
-    app.mount("/uploads", StaticFiles(directory=settings.upload_dir), name="uploads")
+    app.mount("/uploads", CachedUploadFiles(directory=settings.upload_dir), name="uploads")
 else:
     @app.get("/uploads/{path:path}", include_in_schema=False)
     async def legacy_upload(path: str, request: Request, db: AsyncSession = Depends(get_db)) -> Response:

@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import HTTPException, status
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
@@ -681,10 +681,10 @@ async def _post_task_card(
         logger.exception("Failed to post task card for task %s", task.id)
         return None
     try:
-        from app.api.v1.conversations import schedule_realtime_task, send_message_updates
+        from app.api.v1.conversations import send_message_updates
 
         member_ids = await conversation_member_ids(db, conversation.id)
-        schedule_realtime_task(send_message_updates(db, "message.created", message, member_ids))
+        await send_message_updates(db, "message.created", message, member_ids)
     except Exception:
         logger.exception("Failed to broadcast task card for task %s", task.id)
     return {"message_id": message.id}
@@ -1012,60 +1012,36 @@ async def scan_and_send_reminders(db: AsyncSession) -> int:
     now = _now()
     advance = now + timedelta(hours=settings.task_reminder_advance_hours)
     sent = 0
-
-    # due / overdue
-    due_rows = await db.execute(
-        select(Task).where(
-            Task.deleted_at.is_(None),
-            Task.status.in_(OPEN_STATUSES),
-            Task.due_at.is_not(None),
-            Task.due_at <= now,
-            Task.reminder_due_sent_at.is_(None),
-        ).limit(100)
+    reminder_types = (
+        (Task.reminder_due_sent_at, Task.due_at <= now, "due_reminder", "任务已到期："),
+        (Task.reminder_soon_sent_at, and_(Task.due_at > now, Task.due_at <= advance), "due_soon", "任务即将到期："),
+        (Task.reminder_custom_sent_at, Task.remind_at <= now, "remind", "任务提醒："),
     )
-    for task in due_rows.scalars().all():
-        task.reminder_due_sent_at = now
-        recipients = await _assignee_ids_for(db, task.id) | {task.creator_id}
-        await db.commit()
-        await _notify(db, task, recipients, None, f"任务已到期：{task.title}", "due_reminder", None,
-                      {"due_at": _as_utc(task.due_at).isoformat() if task.due_at else None})
-        sent += 1
-
-    # soon (within advance window, still in the future)
-    soon_rows = await db.execute(
-        select(Task).where(
-            Task.deleted_at.is_(None),
-            Task.status.in_(OPEN_STATUSES),
-            Task.due_at.is_not(None),
-            Task.due_at > now,
-            Task.due_at <= advance,
-            Task.reminder_soon_sent_at.is_(None),
-        ).limit(100)
-    )
-    for task in soon_rows.scalars().all():
-        task.reminder_soon_sent_at = now
-        recipients = await _assignee_ids_for(db, task.id) | {task.creator_id}
-        await db.commit()
-        await _notify(db, task, recipients, None, f"任务即将到期：{task.title}", "due_soon", None,
-                      {"due_at": _as_utc(task.due_at).isoformat() if task.due_at else None})
-        sent += 1
-
-    # custom remind_at
-    custom_rows = await db.execute(
-        select(Task).where(
-            Task.deleted_at.is_(None),
-            Task.status.in_(OPEN_STATUSES),
-            Task.remind_at.is_not(None),
-            Task.remind_at <= now,
-            Task.reminder_custom_sent_at.is_(None),
-        ).limit(100)
-    )
-    for task in custom_rows.scalars().all():
-        task.reminder_custom_sent_at = now
-        recipients = await _assignee_ids_for(db, task.id) | {task.creator_id}
-        await db.commit()
-        await _notify(db, task, recipients, None, f"任务提醒：{task.title}", "remind", None,
-                      {"due_at": _as_utc(task.due_at).isoformat() if task.due_at else None})
-        sent += 1
-
+    for marker, window, event_type, label in reminder_types:
+        # Fetch scalar ids, not ORM objects: bounded memory even with a large backlog.
+        criteria = (Task.deleted_at.is_(None), Task.status.in_(OPEN_STATUSES), marker.is_(None), window)
+        rows = await db.execute(select(Task.id).where(*criteria).order_by(Task.id).limit(100))
+        for task_id in rows.scalars().all():
+            try:
+                # Atomic conditional claim: workers may select the same id, but only
+                # one can change its NULL marker. Commit before any assistant writes.
+                claim = await db.execute(update(Task).where(Task.id == task_id, *criteria).values({marker.key: now}))
+                if claim.rowcount != 1:
+                    await db.rollback()
+                    continue
+                await db.commit()
+                task = await db.get(Task, task_id, populate_existing=True)
+                recipients = await _assignee_ids_for(db, task_id) | {task.creator_id}
+                await _notify(db, task, recipients, None, f"{label}{task.title}", event_type, None,
+                              {"due_at": _as_utc(task.due_at).isoformat() if task.due_at else None})
+                sent += 1
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Failed to send %s for task %s", event_type, task_id)
+                await db.rollback()
+                # A failed notification may already have reached a recipient. Clearing
+                # the claim permits retry; exact-once requires a durable outbox.
+                await db.execute(update(Task).where(Task.id == task_id, marker == now).values({marker.key: None}))
+                await db.commit()
     return sent

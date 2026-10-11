@@ -14,6 +14,7 @@ from typing import Any
 class CacheEntry:
     expires_at: float
     value: Any
+    size_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -36,6 +37,14 @@ MAX_USER_FRIEND_ENTRIES = 1024
 MAX_CCW_CREATION_ENTRIES = 512
 # 每次写入顺带检查的条目数。取小值是为了让写入保持 O(1) 量级。
 _SWEEP_PER_WRITE = 8
+# 每 worker 单项和分区字节预算（缓存实体字节；Python 对象开销另受条目数限制）。
+_MAX_ENTRY_BYTES = 512 * 1024
+_CACHE_BYTE_BUDGETS = {
+    "members": 8 * 1024 * 1024,
+    "conversations": 16 * 1024 * 1024,
+    "friends": 4 * 1024 * 1024,
+    "creations": 4 * 1024 * 1024,
+}
 
 _lock = Lock()
 _conversation_member_cache: OrderedDict[tuple[int, int | None, int, str], CacheEntry] = OrderedDict()
@@ -43,19 +52,48 @@ _user_conversations_cache: OrderedDict[int, CacheEntry] = OrderedDict()
 _user_friends_cache: OrderedDict[int, CacheEntry] = OrderedDict()
 _online_users_cache: CacheEntry | None = None
 _ccw_creation_cache: OrderedDict[str, CacheEntry] = OrderedDict()
+_cache_bytes: dict[int, int] = {}
 
 
-def _store(cache: OrderedDict, key: Any, entry: CacheEntry, max_entries: int) -> None:
-    """写入并维持容量上限；调用方必须已持有 _lock。"""
-    # 顺带清掉最老的一小撮过期条目：不设后台任务也能保证过期条目不会永久驻留
+def _drop(cache: OrderedDict, key: Any) -> None:
+    removed = cache.pop(key, None)
+    if removed is not None:
+        _cache_bytes[id(cache)] = _cache_bytes.get(id(cache), 0) - removed.size_bytes
+
+
+def _clear(cache: OrderedDict) -> None:
+    cache.clear()
+    _cache_bytes[id(cache)] = 0
+
+
+def _value_size(value: Any) -> int:
+    if isinstance(value, CachedJson):
+        return len(value.plain) + len(value.gzip)
+    if isinstance(value, (bytes, str)):
+        return len(value)
+    # 第三方作品预览等非 JSON 缓存：保守估算，同时拒绝过大条目。
+    try:
+        return len(json.dumps(value, ensure_ascii=False, default=str).encode("utf-8"))
+    except (TypeError, ValueError):
+        return _MAX_ENTRY_BYTES + 1
+
+
+def _store(cache: OrderedDict, key: Any, entry: CacheEntry, max_entries: int, budget: int) -> None:
+    """写入并维持数量与字节上限；调用方必须已持有 _lock。"""
+    _drop(cache, key)
+    if entry.size_bytes > min(budget, _MAX_ENTRY_BYTES) or entry.expires_at <= time.monotonic():
+        return
+    # 通过访问顺序摊还清扫，不生成所有 key/value 的临时列表。
     now = time.monotonic()
-    for stale_key in [k for k, v in list(cache.items())[:_SWEEP_PER_WRITE] if v.expires_at <= now]:
-        cache.pop(stale_key, None)
-
+    for stale_key in list(cache)[:_SWEEP_PER_WRITE]:
+        if cache[stale_key].expires_at <= now:
+            _drop(cache, stale_key)
     cache[key] = entry
-    cache.move_to_end(key)
-    while len(cache) > max_entries:
-        cache.popitem(last=False)
+    current_bytes = _cache_bytes.get(id(cache), 0) + entry.size_bytes
+    while len(cache) > max_entries or current_bytes > budget:
+        _, removed = cache.popitem(last=False)
+        current_bytes -= removed.size_bytes
+    _cache_bytes[id(cache)] = current_bytes
 
 
 def _fetch(cache: OrderedDict, key: Any) -> Any | None:
@@ -64,7 +102,7 @@ def _fetch(cache: OrderedDict, key: Any) -> Any | None:
     if entry is None:
         return None
     if entry.expires_at <= time.monotonic():
-        cache.pop(key, None)
+        _drop(cache, key)
         return None
     cache.move_to_end(key)
     return entry.value
@@ -91,8 +129,9 @@ def set_conversation_members(conversation_id: int, value: Any, ttl_seconds: floa
         _store(
             _conversation_member_cache,
             key,
-            CacheEntry(expires_at=time.monotonic() + ttl_seconds, value=value),
+            CacheEntry(expires_at=time.monotonic() + ttl_seconds, value=value, size_bytes=_value_size(value)),
             MAX_CONVERSATION_MEMBER_ENTRIES,
+            _CACHE_BYTE_BUDGETS["members"],
         )
 
 
@@ -106,8 +145,9 @@ def set_user_conversations(user_id: int, value: Any, ttl_seconds: float = 5.0) -
         _store(
             _user_conversations_cache,
             user_id,
-            CacheEntry(expires_at=time.monotonic() + ttl_seconds, value=value),
+            CacheEntry(expires_at=time.monotonic() + ttl_seconds, value=value, size_bytes=_value_size(value)),
             MAX_USER_CONVERSATION_ENTRIES,
+            _CACHE_BYTE_BUDGETS["conversations"],
         )
 
 
@@ -121,8 +161,9 @@ def set_user_friends(user_id: int, value: Any, ttl_seconds: float = 10.0) -> Non
         _store(
             _user_friends_cache,
             user_id,
-            CacheEntry(expires_at=time.monotonic() + ttl_seconds, value=value),
+            CacheEntry(expires_at=time.monotonic() + ttl_seconds, value=value, size_bytes=_value_size(value)),
             MAX_USER_FRIEND_ENTRIES,
+            _CACHE_BYTE_BUDGETS["friends"],
         )
 
 
@@ -138,10 +179,11 @@ def get_online_users() -> Any | None:
 
 def set_online_users(value: Any, ttl_seconds: float = 3.0) -> None:
     global _online_users_cache
+    size = _value_size(value)
     with _lock:
-        _online_users_cache = CacheEntry(
-            expires_at=time.monotonic() + ttl_seconds,
-            value=value,
+        _online_users_cache = (
+            CacheEntry(expires_at=time.monotonic() + ttl_seconds, value=value, size_bytes=size)
+            if size <= _MAX_ENTRY_BYTES else None
         )
 
 
@@ -155,36 +197,37 @@ def set_ccw_creation(oid: str, value: Any, ttl_seconds: float = 1800.0) -> None:
         _store(
             _ccw_creation_cache,
             oid,
-            CacheEntry(expires_at=time.monotonic() + ttl_seconds, value=value),
+            CacheEntry(expires_at=time.monotonic() + ttl_seconds, value=value, size_bytes=_value_size(value)),
             MAX_CCW_CREATION_ENTRIES,
+            _CACHE_BYTE_BUDGETS["creations"],
         )
 
 
 def invalidate_conversation_members(conversation_id: int | None = None) -> None:
     with _lock:
         if conversation_id is None:
-            _conversation_member_cache.clear()
+            _clear(_conversation_member_cache)
         else:
             for key in [key for key in _conversation_member_cache if key[0] == conversation_id]:
-                _conversation_member_cache.pop(key, None)
+                _drop(_conversation_member_cache, key)
 
 
 def invalidate_user_conversations(user_ids: set[int] | list[int] | None = None) -> None:
     with _lock:
         if user_ids is None:
-            _user_conversations_cache.clear()
+            _clear(_user_conversations_cache)
             return
         for user_id in user_ids:
-            _user_conversations_cache.pop(user_id, None)
+            _drop(_user_conversations_cache, user_id)
 
 
 def invalidate_user_friends(user_ids: set[int] | list[int] | None = None) -> None:
     with _lock:
         if user_ids is None:
-            _user_friends_cache.clear()
+            _clear(_user_friends_cache)
             return
         for user_id in user_ids:
-            _user_friends_cache.pop(user_id, None)
+            _drop(_user_friends_cache, user_id)
 
 
 def invalidate_online_users() -> None:

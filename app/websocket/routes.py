@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, status
+from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect, status
 
 from app.core.database import AsyncSessionLocal
 from app.core.dependencies import get_current_user_from_token
@@ -60,8 +60,10 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)) -> N
         while True:
             message = await websocket.receive_text()
             if message.strip().lower() == "ping":
-                await websocket.send_text("pong")
+                await manager.send_text(user.id, websocket, "pong")
     except (WebSocketDisconnect, RuntimeError):
+        pass
+    finally:
         became_offline = await manager.disconnect(user.id, websocket)
         if became_offline:
             response_cache.invalidate_online_users()
@@ -86,8 +88,10 @@ async def admin_websocket_endpoint(websocket: WebSocket, token: str = Query(...)
         while True:
             message = await websocket.receive_text()
             if message.strip().lower() == "ping":
-                await websocket.send_text("pong")
-    except WebSocketDisconnect:
+                await admin_manager.send_text(user.id, websocket, "pong")
+    except (WebSocketDisconnect, RuntimeError):
+        pass
+    finally:
         await admin_manager.disconnect(user.id, websocket)
 
 
@@ -106,8 +110,10 @@ async def bot_websocket_endpoint(websocket: WebSocket, key: str = Query(...)) ->
         while True:
             message = await websocket.receive_text()
             if message.strip().lower() == "ping":
-                await websocket.send_text("pong")
-    except WebSocketDisconnect:
+                await bot_manager.send_text(context.bot.id, websocket, "pong")
+    except (WebSocketDisconnect, RuntimeError):
+        pass
+    finally:
         await bot_manager.disconnect(context.bot.id, websocket)
 
 
@@ -137,7 +143,7 @@ async def game_websocket_endpoint(
         while True:
             # 客户端只收不发，这里仅用于保持连接并感知断开
             await websocket.receive_text()
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, RuntimeError):
         pass
     finally:
         await game_manager.disconnect(conversation_id, websocket)
