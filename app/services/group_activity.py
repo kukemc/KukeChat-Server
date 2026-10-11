@@ -8,6 +8,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
+from app.core.group_levels import exp_required_for_level, level_from_exp, next_level_remaining_exp  # noqa: F401
 from app.models.conversation import ConversationMember
 from app.models.enums import ConversationType, MessageType
 from app.models.group_activity import GroupCheckin, GroupMemberDailyActivity, GroupMemberExpLog
@@ -19,8 +20,11 @@ from app.schemas.user import UserPublic
 from app.services.conversations import require_group_conversation, require_membership
 
 UTC = timezone.utc
-MESSAGE_EXP_DAILY_LIMIT = 25
-CHECKIN_BASE_EXP = 25
+# 活跃成员一天大约能拿 130-160 经验：10 级一周内，20 级约三周，50 级约四个月。
+MESSAGE_EXP_DAILY_LIMIT = 100
+MESSAGE_EXP = 2
+MEDIA_MESSAGE_EXP = 3
+CHECKIN_BASE_EXP = 30
 FIRST_CHECKIN_EXP_BONUS = 15
 
 
@@ -29,34 +33,6 @@ def _clean_text(value: str | None) -> str | None:
         return None
     text = value.strip()
     return text or None
-
-
-def exp_required_for_level(level: int) -> int:
-    return 50 + max(0, level - 1) * max(0, level - 1) * 25
-
-
-def level_from_exp(exp: int) -> int:
-    level = 1
-    remaining = max(0, exp)
-    while level < 100:
-        required = exp_required_for_level(level)
-        if remaining < required:
-            break
-        remaining -= required
-        level += 1
-    return level
-
-
-def next_level_remaining_exp(exp: int) -> int:
-    level = 1
-    remaining = max(0, exp)
-    while level < 100:
-        required = exp_required_for_level(level)
-        if remaining < required:
-            return required - remaining
-        remaining -= required
-        level += 1
-    return 0
 
 
 def calculate_checkin_exp(streak_days: int) -> int:
@@ -226,8 +202,9 @@ async def record_message_activity(db: AsyncSession, conversation_id: int, member
     today = datetime.now(UTC).date()
     daily = await get_or_create_daily_activity(db, conversation_id, member.user_id, today)
     now = datetime.now(UTC)
-    base_score = 2 if message.type in {MessageType.IMAGE, MessageType.VOICE} else 1
-    base_exp = base_score
+    is_media = message.type in {MessageType.IMAGE, MessageType.VOICE}
+    base_score = 2 if is_media else 1
+    base_exp = MEDIA_MESSAGE_EXP if is_media else MESSAGE_EXP
     remaining_exp = max(0, MESSAGE_EXP_DAILY_LIMIT - daily.exp_from_messages)
     exp = min(base_exp, remaining_exp)
 

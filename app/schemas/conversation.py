@@ -46,6 +46,11 @@ class ConversationProfileUpdate(BaseModel):
     category: str | None = Field(default=None, max_length=40)
 
 
+class LevelTitle(BaseModel):
+    min_level: int
+    title: str
+
+
 class GroupSettingsUpdate(BaseModel):
     all_muted: bool | None = None
     slow_mode_seconds: int | None = Field(default=None, ge=0)
@@ -55,6 +60,9 @@ class GroupSettingsUpdate(BaseModel):
     join_question: str | None = Field(default=None, max_length=200)
     tasks_enabled: bool | None = None
     task_creation_permission: Literal["members", "admins"] | None = None
+    level_titles_enabled: bool | None = None
+    # 整体替换；传 [] 恢复默认分档
+    level_titles: list[LevelTitle] | None = None
 
 
 class AnnouncementCreate(BaseModel):
@@ -166,6 +174,9 @@ class ConversationRead(BaseModel):
     join_question: str | None = None
     tasks_enabled: bool = False
     task_creation_permission: Literal["members", "admins"] = "members"
+    # 等级头衔。level_titles 始终是生效的分档（没自定义时是默认分档），按 min_level 升序。
+    level_titles_enabled: bool = False
+    level_titles: list[LevelTitle] = Field(default_factory=list)
     is_temporary: bool = False
     temporary_initiator_id: int | None = None
     temporary_target_id: int | None = None

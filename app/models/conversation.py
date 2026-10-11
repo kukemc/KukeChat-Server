@@ -8,6 +8,7 @@ from sqlalchemy import Boolean, Date, DateTime, Enum as SAEnum, ForeignKey, Inte
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
+from app.core.group_levels import next_level_remaining_exp
 from app.models.enums import ConversationType, GroupJoinRequestStatus, MemberRole
 
 
@@ -36,6 +37,10 @@ class Conversation(Base):
     game_mode_enabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
     game_creation_oid: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     tasks_enabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    # 等级头衔：按等级区间显示的称号（1-10 级「萌新」之类），每个群自己决定开不开、怎么分档。
+    # level_titles 存 JSON 数组 [{"min_level": 1, "title": "萌新"}, ...]，为空表示用默认分档。
+    level_titles_enabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    level_titles: Mapped[str | None] = mapped_column(Text, nullable=True)
     task_creation_permission: Mapped[str] = mapped_column(String(20), default="members", server_default="members")
     direct_key: Mapped[str | None] = mapped_column(String(80), unique=True, nullable=True, index=True)
     is_temporary: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
@@ -94,15 +99,7 @@ class ConversationMember(Base):
 
     @property
     def next_level_exp(self) -> int:
-        level = 1
-        remaining = max(0, self.level_exp)
-        while level < 100:
-            required = 50 + max(0, level - 1) * max(0, level - 1) * 25
-            if remaining < required:
-                return required - remaining
-            remaining -= required
-            level += 1
-        return 0
+        return next_level_remaining_exp(self.level_exp)
 
 
 class TemporaryConversationBlock(Base):

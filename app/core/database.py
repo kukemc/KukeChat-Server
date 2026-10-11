@@ -150,6 +150,8 @@ async def init_db() -> None:
                 ("conversations", "auto_approve", "auto_approve BOOLEAN NOT NULL DEFAULT 0"),
                 ("conversations", "join_question", "join_question VARCHAR(200)"),
                 ("conversations", "tasks_enabled", "tasks_enabled BOOLEAN NOT NULL DEFAULT 0"),
+                ("conversations", "level_titles_enabled", "level_titles_enabled BOOLEAN NOT NULL DEFAULT 0"),
+                ("conversations", "level_titles", "level_titles TEXT"),
                 ("conversations", "task_creation_permission", "task_creation_permission VARCHAR(20) NOT NULL DEFAULT 'members'"),
                 ("conversations", "is_temporary", "is_temporary BOOLEAN NOT NULL DEFAULT 0"),
                 ("conversations", "temporary_initiator_id", "temporary_initiator_id INTEGER"),

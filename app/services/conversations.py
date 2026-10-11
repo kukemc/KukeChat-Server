@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 
 UTC = timezone.utc
@@ -9,6 +10,8 @@ from sqlalchemy import and_, case, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
+from app.core import group_levels
+from app.core.config import settings
 from app.models.conversation import Conversation, ConversationMember, GroupAnnouncement, GroupJoinRequest, TemporaryConversationBlock
 from app.models.enums import ConversationType, GroupJoinRequestStatus, MemberRole
 from app.models.friend import Friendship
@@ -679,6 +682,10 @@ async def update_group_settings(
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Join question is required")
         updates["join_question"] = question
         updates["auto_approve"] = False
+    if "level_titles" in updates:
+        titles = normalize_level_titles(updates["level_titles"] or [])
+        await _ensure_level_titles_allowed(db, actor_id, conversation, titles)
+        updates["level_titles"] = json.dumps(titles, ensure_ascii=False, separators=(",", ":")) if titles else None
     for field, value in updates.items():
         setattr(conversation, field, value)
     if updates:
@@ -686,6 +693,70 @@ async def update_group_settings(
         await db.commit()
         await db.refresh(conversation)
     return conversation
+
+
+def _level_titles_error(message: str) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        detail={"code": "invalid_level_titles", "message": message},
+    )
+
+
+def normalize_level_titles(items: list[dict]) -> list[dict]:
+    """校验并整理等级头衔分档。空列表表示恢复默认。"""
+    if not items:
+        return []
+    if len(items) > group_levels.MAX_LEVEL_TITLE_TIERS:
+        raise _level_titles_error(f"等级头衔最多 {group_levels.MAX_LEVEL_TITLE_TIERS} 档")
+    cleaned: list[dict] = []
+    for item in items:
+        min_level = item.get("min_level")
+        title = (item.get("title") or "").strip() if isinstance(item.get("title"), str) else ""
+        if not isinstance(min_level, int) or isinstance(min_level, bool) or not 1 <= min_level <= group_levels.MAX_LEVEL:
+            raise _level_titles_error(f"起始等级必须在 1 到 {group_levels.MAX_LEVEL} 之间")
+        if not 1 <= len(title) <= group_levels.MAX_LEVEL_TITLE_LENGTH:
+            raise _level_titles_error(f"头衔长度需要在 1 到 {group_levels.MAX_LEVEL_TITLE_LENGTH} 个字之间")
+        cleaned.append({"min_level": min_level, "title": title})
+    cleaned.sort(key=lambda entry: entry["min_level"])
+    levels = [entry["min_level"] for entry in cleaned]
+    if len(set(levels)) != len(levels):
+        raise _level_titles_error("不能有两档从同一个等级开始")
+    if levels[0] != 1:
+        raise _level_titles_error("第一档必须从 1 级开始")
+    return cleaned
+
+
+def effective_level_titles(conversation: Conversation) -> list[dict]:
+    """群里实际生效的头衔分档：自定义的优先，否则是默认分档。"""
+    if conversation.level_titles:
+        try:
+            value = json.loads(conversation.level_titles)
+        except json.JSONDecodeError:
+            value = None
+        if isinstance(value, list) and value:
+            return value
+    return group_levels.default_level_titles()
+
+
+async def _ensure_level_titles_allowed(db: AsyncSession, actor_id: int, conversation: Conversation, titles: list[dict]) -> None:
+    """头衔会显示在每条消息旁边，先过一遍文本审核。审核服务不可用时放行。"""
+    if not titles or not settings.content_moderation_enabled:
+        return
+    actor = await db.get(User, actor_id)
+    if actor is None or actor.content_moderation_whitelisted:
+        return
+    from app.services import moderation as moderation_service
+
+    text = " ".join(entry["title"] for entry in titles)
+    try:
+        result = await moderation_service._call_text_moderation_for_user(text, actor_id, context_id=f"level_titles:{conversation.id}")
+    except Exception:
+        return
+    if result.get("decision") == "block":
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "level_titles_rejected", "message": "头衔里有不合适的内容，请修改后重试"},
+        )
 
 
 async def update_my_member_settings(
@@ -1214,6 +1285,8 @@ async def build_conversation_read(db: AsyncSession, conversation: Conversation, 
         join_question=conversation.join_question,
         tasks_enabled=conversation.tasks_enabled,
         task_creation_permission=conversation.task_creation_permission,
+        level_titles_enabled=conversation.level_titles_enabled,
+        level_titles=effective_level_titles(conversation),
         is_temporary=conversation.is_temporary,
         temporary_initiator_id=conversation.temporary_initiator_id,
         temporary_target_id=conversation.temporary_target_id,
@@ -1404,6 +1477,8 @@ async def build_conversation_reads(db: AsyncSession, conversations: list[Convers
                 join_question=conversation.join_question,
                 tasks_enabled=conversation.tasks_enabled,
                 task_creation_permission=conversation.task_creation_permission,
+                level_titles_enabled=conversation.level_titles_enabled,
+                level_titles=effective_level_titles(conversation),
                 is_temporary=conversation.is_temporary,
                 temporary_initiator_id=conversation.temporary_initiator_id,
                 temporary_target_id=conversation.temporary_target_id,
