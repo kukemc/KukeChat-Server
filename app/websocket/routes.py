@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+import json
+import logging
+
 from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect, status
 
 from app.core.database import AsyncSessionLocal
@@ -8,11 +12,13 @@ from app.models.enums import PlatformRole
 from app.models.user import User
 from app.services.auth import mark_user_seen
 from app.services import response_cache
+from app.services import typing as typing_service
 from app.services.bots import authenticate_bot_key
 from app.websocket.manager import admin_manager, bot_manager, game_manager, manager
 
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 def get_websocket_ip(websocket: WebSocket) -> str:
@@ -40,6 +46,30 @@ async def build_presence_payload(user: User, online: bool) -> dict:
     }
 
 
+def _consume_task_error(task: asyncio.Task) -> None:
+    try:
+        task.result()
+    except Exception:
+        logger.exception("Client websocket event failed")
+
+
+def _handle_client_event(user_id: int, raw: str) -> None:
+    """客户端上行的 JSON 事件。目前只有「正在输入」；格式不对或不认识的一律忽略。"""
+    if len(raw) > 512:
+        return
+    try:
+        event = json.loads(raw)
+    except json.JSONDecodeError:
+        return
+    if not isinstance(event, dict) or event.get("type") != "typing":
+        return
+    conversation_id = event.get("conversation_id")
+    if not isinstance(conversation_id, int) or isinstance(conversation_id, bool) or conversation_id <= 0:
+        return
+    # 不在接收循环里等数据库，避免挡住心跳
+    asyncio.create_task(typing_service.handle_typing(user_id, conversation_id)).add_done_callback(_consume_task_error)
+
+
 @router.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)) -> None:
     async with AsyncSessionLocal() as db:
@@ -61,6 +91,8 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)) -> N
             message = await websocket.receive_text()
             if message.strip().lower() == "ping":
                 await manager.send_text(user.id, websocket, "pong")
+            elif message.startswith("{"):
+                _handle_client_event(user.id, message)
     except (WebSocketDisconnect, RuntimeError):
         pass
     finally:

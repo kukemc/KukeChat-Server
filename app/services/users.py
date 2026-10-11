@@ -46,6 +46,8 @@ async def update_profile(db: AsyncSession, user: User, payload: UserUpdate) -> U
             user.profile_cover_url = None
             user.profile_cover_pending_url = None
             user.profile_cover_moderation_status = ModerationStatus.APPROVED.value
+    if updates.get("share_typing") is None:
+        updates.pop("share_typing", None)
     for key, value in updates.items():
         if isinstance(value, str):
             value = value.strip() or None

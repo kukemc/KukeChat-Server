@@ -351,7 +351,7 @@ def build_new_message_read(message: Message, current_user_id: int) -> MessageRea
         sender_name = _display_name(message.sender)
     sender_title = _clean_text(getattr(message, "_sender_title", None))
     sender_level = getattr(message, "_sender_level", None)
-    return _message_read_from_orm(
+    read = _message_read_from_orm(
         message,
         reactions=[],
         sender_display_name=sender_name,
@@ -360,6 +360,11 @@ def build_new_message_read(message: Message, current_user_id: int) -> MessageRea
         bookmarked_by_me=False,
         featured=False,
     )
+    if message.type == MessageType.POLL:
+        from app.services import polls as poll_service
+
+        poll_service.fill_empty_state(read)
+    return read
 
 
 async def build_message_reads(db: AsyncSession, messages: list[Message], current_user_id: int) -> list[MessageRead]:
@@ -370,7 +375,7 @@ async def build_message_reads(db: AsyncSession, messages: list[Message], current
     sender_display_names = await _message_sender_display_names(db, messages)
     sender_titles = await _message_sender_titles(db, messages)
     sender_levels = await _message_sender_levels(db, messages)
-    return [
+    reads = [
         _message_read_from_orm(
             message,
             summaries.get(message.id, []),
@@ -382,6 +387,11 @@ async def build_message_reads(db: AsyncSession, messages: list[Message], current
         )
         for message in messages
     ]
+    if any(message.type == MessageType.POLL for message in messages):
+        from app.services import polls as poll_service
+
+        await poll_service.attach_states(db, reads, current_user_id)
+    return reads
 
 
 async def _message_sender_levels(
@@ -434,8 +444,13 @@ async def send_message(
     content: str,
     message_type: MessageType = MessageType.TEXT,
     metadata: dict[str, Any] | None = None,
+    *,
+    allow_poll: bool = False,
 ) -> Message:
     ensure_can_post(sender)
+    # 投票消息必须由 polls.create_poll 创建，否则 metadata 里的定义没有对应的投票记录
+    if message_type == MessageType.POLL and not allow_poll:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Polls must be created through the poll endpoint")
     max_content_length = MAX_BOT_MESSAGE_CONTENT_LENGTH if sender.is_bot else MAX_MESSAGE_CONTENT_LENGTH
     if len(content) > max_content_length:
         detail = (

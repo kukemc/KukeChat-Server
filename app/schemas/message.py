@@ -17,7 +17,7 @@ class MessageCreate(BaseModel):
     @field_validator("type")
     @classmethod
     def validate_sendable_type(cls, value: MessageType) -> MessageType:
-        if value in {MessageType.FORWARD_BUNDLE, MessageType.SYSTEM}:
+        if value in {MessageType.FORWARD_BUNDLE, MessageType.SYSTEM, MessageType.POLL}:
             raise ValueError("This message type cannot be sent from the public message endpoint")
         return value
 

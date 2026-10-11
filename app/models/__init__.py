@@ -7,6 +7,7 @@ from app.models.group_activity import GroupCheckin, GroupMemberDailyActivity, Gr
 from app.models.invite import InviteLink
 from app.models.message import FeaturedMessage, MentionAllUsage, Message, MessageBookmark, MessageReaction, MessageVisibility
 from app.models.penalty import UserViolation
+from app.models.poll import GroupEmoji, Poll, PollVote
 from app.models.post import Post, PostComment, PostCommentLike, PostLike, PostMention, PostNotification, PostTopic, PostTopicLink
 from app.models.report import AdminAuditLog, ContentModerationRecord, PasswordResetRequest, UserReport
 from app.models.sticker import FavoriteSticker, StickerAsset
@@ -53,6 +54,9 @@ __all__ = [
     "PasswordResetRequest",
     "UserViolation",
     "ReportCase",
+    "Poll",
+    "PollVote",
+    "GroupEmoji",
     "JuryMember",
     "JuryVote",
     "FavoriteSticker",

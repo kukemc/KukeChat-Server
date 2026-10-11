@@ -65,6 +65,8 @@ class User(Base):
     # 禁言：能登录能看，不能发。到期靠读取时比较时间，不需要后台任务清理。
     muted_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     mute_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 是否让别人看到「对方正在输入」
+    share_typing: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1")
     registration_ip: Mapped[str | None] = mapped_column(String(45), unique=True, index=True, nullable=True)
     last_login_ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

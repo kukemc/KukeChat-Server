@@ -52,6 +52,7 @@ class UserPublic(BaseModel):
 
 class UserRead(UserPublic):
     email: EmailStr | None = None
+    share_typing: bool = True
     profile_cover_pending_url: str | None = None
     profile_cover_moderation_status: str = "approved"
     updated_at: datetime
@@ -70,6 +71,8 @@ class UserUpdate(BaseModel):
     profile_card_style: str | None = Field(default=None, max_length=20)
     profile_accent_color: str | None = Field(default=None, max_length=20)
     profile_cover_url: str | None = Field(default=None, max_length=500)
+    # 关掉后别人看不到「我正在输入」
+    share_typing: bool | None = None
 
 
 class UserPresenceUpdate(BaseModel):

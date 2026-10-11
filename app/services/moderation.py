@@ -656,6 +656,14 @@ async def _moderate_post_topic_content(db: AsyncSession, topic: PostTopic) -> Co
 def _text_to_moderate(message: Message, metadata: dict[str, Any]) -> str | None:
     if message.type == MessageType.TEXT and message.content.strip():
         return _strip_mention_names(message.content, metadata)
+    if message.type == MessageType.POLL:
+        poll = metadata.get("poll")
+        if not isinstance(poll, dict):
+            return None
+        parts = [str(poll.get("title") or "")] + [
+            str(option.get("text") or "") for option in poll.get("options", []) if isinstance(option, dict)
+        ]
+        return "\n".join(part.strip() for part in parts if part.strip()) or None
     if message.type == MessageType.FORWARD_BUNDLE:
         parts: list[str] = []
         note = metadata.get("note")
