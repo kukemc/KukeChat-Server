@@ -315,7 +315,7 @@ async def _moderate_message_task(
         if not records:
             return
 
-        worst = max(records, key=lambda item: (item.severity, _decision_rank(item.decision)))
+        worst = _worst_record(records)
         action = ModerationAction.NONE if source == ModerationSource.REPORT_REVIEW and worst.decision != "block" else await _apply_moderation_action(session, message, worst)
         for record in records:
             record.action_taken = action
@@ -350,7 +350,7 @@ async def _moderate_post_task(post_id: int) -> None:
                 await db.commit()
                 await _broadcast_post_moderation_action(db, post, ModerationAction.NONE)
                 return
-            worst = max(records, key=lambda item: (item.severity, _decision_rank(item.decision)))
+            worst = _worst_record(records)
             action = await _apply_post_moderation_action(db, post, worst)
             for record in records:
                 record.action_taken = action
@@ -385,7 +385,7 @@ async def _moderate_post_comment_task(comment_id: int) -> None:
                 await db.commit()
                 await _broadcast_post_comment_moderation_action(db, comment, ModerationAction.NONE)
                 return
-            worst = max(records, key=lambda item: (item.severity, _decision_rank(item.decision)))
+            worst = _worst_record(records)
             action = await _apply_post_comment_moderation_action(db, comment, worst)
             for record in records:
                 record.action_taken = action
@@ -445,7 +445,7 @@ async def _moderate_profile_cover_task(user_id: int) -> None:
             record = _build_profile_cover_record(user, image_url, result)
             db.add(record)
             normalized = _normalize_result(result, "image")
-            if normalized["decision"] == "allow" and normalized["severity"] <= 0:
+            if normalized["decision"] != "block":
                 user.profile_cover_url = image_url
                 user.profile_cover_pending_url = None
                 user.profile_cover_moderation_status = ModerationStatus.APPROVED.value
@@ -489,7 +489,7 @@ async def _moderate_teamup_profile_task(profile_id: int) -> None:
                 await db.commit()
                 await _broadcast_teamup_profile_moderation_action(db, profile, ModerationAction.NONE)
                 return
-            worst = max(records, key=lambda item: (item.severity, _decision_rank(item.decision)))
+            worst = _worst_record(records)
             action = await _apply_teamup_profile_moderation_action(db, profile, worst)
             for record in records:
                 record.action_taken = action
@@ -524,7 +524,7 @@ async def _moderate_teamup_comment_task(comment_id: int) -> None:
                 await db.commit()
                 await _broadcast_teamup_comment_moderation_action(db, comment, ModerationAction.NONE)
                 return
-            worst = max(records, key=lambda item: (item.severity, _decision_rank(item.decision)))
+            worst = _worst_record(records)
             action = await _apply_teamup_comment_moderation_action(db, comment, worst)
             for record in records:
                 record.action_taken = action
@@ -771,9 +771,11 @@ async def _call_image_moderation(image_url: str, message: Message) -> dict[str, 
 async def _call_image_moderation_for_user(image_url: str, user_id: int, context_id: str | None = None) -> dict[str, Any]:
     key = storage_key_from_url(image_url)
     if key is None:
+        # 外链图片没法送审。review 不再触发撤回，所以这里必须明确判 block，
+        # 否则任意外链就成了绕过图片审核的口子。severity 1 只撤回、不处罚。
         return {
             "type": "image",
-            "decision": "review",
+            "decision": "block",
             "severity": 1,
             "confidence": None,
             "reason": "Image URL is not a local moderated upload",
@@ -1055,7 +1057,7 @@ def _normalize_result(result: dict[str, Any], fallback_type: str) -> dict[str, A
 
 
 async def _apply_moderation_action(db: AsyncSession, message: Message, record: ContentModerationRecord) -> ModerationAction:
-    if record.decision == "allow" and record.severity <= 0:
+    if not _needs_action(record):
         return ModerationAction.NONE
 
     now = datetime.now(UTC)
@@ -1101,7 +1103,7 @@ async def _apply_moderation_action(db: AsyncSession, message: Message, record: C
 
 
 async def _apply_post_moderation_action(db: AsyncSession, post: Post, record: ContentModerationRecord) -> ModerationAction:
-    if record.decision == "allow" and record.severity <= 0:
+    if not _needs_action(record):
         post.moderation_status = ModerationStatus.APPROVED.value
         return ModerationAction.NONE
     now = datetime.now(UTC)
@@ -1122,7 +1124,7 @@ async def _apply_post_moderation_action(db: AsyncSession, post: Post, record: Co
 
 
 async def _apply_post_comment_moderation_action(db: AsyncSession, comment: PostComment, record: ContentModerationRecord) -> ModerationAction:
-    if record.decision == "allow" and record.severity <= 0:
+    if not _needs_action(record):
         comment.moderation_status = ModerationStatus.APPROVED.value
         return ModerationAction.NONE
     now = datetime.now(UTC)
@@ -1143,7 +1145,7 @@ async def _apply_post_comment_moderation_action(db: AsyncSession, comment: PostC
 
 
 async def _apply_teamup_profile_moderation_action(db: AsyncSession, profile: TeamupProfile, record: ContentModerationRecord) -> ModerationAction:
-    if record.decision == "allow" and record.severity <= 0:
+    if not _needs_action(record):
         profile.moderation_status = ModerationStatus.APPROVED.value
         return ModerationAction.NONE
     now = datetime.now(UTC)
@@ -1164,7 +1166,7 @@ async def _apply_teamup_profile_moderation_action(db: AsyncSession, profile: Tea
 
 
 async def _apply_teamup_comment_moderation_action(db: AsyncSession, comment: TeamupComment, record: ContentModerationRecord) -> ModerationAction:
-    if record.decision == "allow" and record.severity <= 0:
+    if not _needs_action(record):
         comment.moderation_status = ModerationStatus.APPROVED.value
         return ModerationAction.NONE
     now = datetime.now(UTC)
@@ -1185,7 +1187,7 @@ async def _apply_teamup_comment_moderation_action(db: AsyncSession, comment: Tea
 
 
 async def _apply_post_topic_moderation_action(db: AsyncSession, topic: PostTopic, record: ContentModerationRecord) -> ModerationAction:
-    if record.decision == "allow" and record.severity <= 0:
+    if not _needs_action(record):
         topic.moderation_status = ModerationStatus.APPROVED.value
         return ModerationAction.NONE
     topic.moderation_status = ModerationStatus.REJECTED.value
@@ -1231,10 +1233,25 @@ def _action_details(action: ModerationAction, user_id: int, record: ContentModer
     }
 
 
+def _needs_action(record: ContentModerationRecord) -> bool:
+    if record.decision == "allow" and record.severity <= 0:
+        return False
+    # 图片的 review 是模型「拿不准」，不是违规结论。线上被撤回的图片里绝大多数
+    # 都落在这一档，所以只留记录等人工看，不撤回也不处罚。
+    if record.content_type == "image" and record.decision != "block":
+        return False
+    return True
+
+
+def _worst_record(records: list[ContentModerationRecord]) -> ContentModerationRecord:
+    return max(records, key=lambda item: (_needs_action(item), item.severity, _decision_rank(item.decision)))
+
+
 def _punishment_for_record(record: ContentModerationRecord) -> ModerationAction:
     categories = set(_json_list(record.categories))
+    # 图片模型误判率高，机器不单独对图片下永封：先封 7 天，是否升级由管理员复核决定。
     if record.content_type == "image" and record.decision == "block" and record.severity >= 2:
-        return ModerationAction.PERMANENT_BAN
+        return ModerationAction.USER_BANNED
     if categories & PERMANENT_TEXT_CATEGORIES:
         return ModerationAction.PERMANENT_BAN
     if record.decision == "block" and (record.severity >= 2 or categories & SEVERE_TEXT_CATEGORIES):
