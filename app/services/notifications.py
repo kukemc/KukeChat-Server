@@ -9,7 +9,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
 from app.models.conversation import Conversation, ConversationMember, GroupJoinRequest
-from app.models.enums import FriendRequestStatus, GroupJoinRequestStatus, MemberRole, MessageType, PostNotificationType
+from app.models.enums import FriendRequestStatus, GroupJoinRequestStatus, MemberRole, MessageType, PostNotificationType, ReportStatus
+from app.models.report import UserReport
 from app.models.friend import FriendRequest
 from app.models.bot import Bot, BotReview
 from app.models.message import Message
@@ -18,6 +19,7 @@ from app.models.post import PostNotification
 from app.models.teamup import TeamupComment, TeamupProfile
 from app.schemas.notification import UnifiedNotificationListRead, UnifiedNotificationRead
 from app.schemas.user import UserPublic
+from app.services import cases as case_service
 from app.services import penalties as penalty_service
 
 UTC = timezone.utc
@@ -313,6 +315,40 @@ async def _moderation_notifications(db: AsyncSession, user_id: int) -> list[Unif
     return items
 
 
+async def _report_result_notifications(db: AsyncSession, user_id: int) -> list[UnifiedNotificationRead]:
+    """举报处理结果。举报人此前收不到任何反馈。"""
+    cutoff = datetime.now(UTC) - timedelta(days=30)
+    result = await db.execute(
+        select(UserReport)
+        .where(
+            UserReport.reporter_id == user_id,
+            UserReport.status != ReportStatus.PENDING,
+            UserReport.reviewed_at.is_not(None),
+            UserReport.reviewed_at >= cutoff,
+        )
+        .order_by(UserReport.reviewed_at.desc())
+        .limit(30)
+    )
+    items: list[UnifiedNotificationRead] = []
+    for report in result.scalars().all():
+        title, body = case_service.report_result_text(report)
+        items.append(
+            UnifiedNotificationRead(
+                id=f"report_result:{report.id}",
+                category="system",
+                type="report_result",
+                title=title,
+                body=body,
+                time=report.reviewed_at,
+                unread=False,
+                pending=False,
+                action="none",
+                payload={"report_id": report.id, "case_id": report.case_id, "status": report.status.value},
+            )
+        )
+    return items
+
+
 async def list_unified_notifications(db: AsyncSession, user_id: int, limit: int = 100) -> UnifiedNotificationListRead:
     groups = await _group_join_notifications(db, user_id)
     friends = await _friend_request_notifications(db, user_id)
@@ -320,7 +356,8 @@ async def list_unified_notifications(db: AsyncSession, user_id: int, limit: int 
     interactions = await _interaction_notifications(db, user_id)
     systems = await _managed_group_system_notifications(db, user_id)
     penalties = await _moderation_notifications(db, user_id)
-    items = [*friends, *groups, *posts, *interactions, *systems, *penalties]
+    report_results = await _report_result_notifications(db, user_id)
+    items = [*friends, *groups, *posts, *interactions, *systems, *penalties, *report_results]
     items.sort(key=lambda item: item.time, reverse=True)
     items = items[:limit]
     counts = {"all": len(items), "friend": 0, "group": 0, "post": 0, "interact": 0, "system": 0}

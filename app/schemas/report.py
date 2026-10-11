@@ -101,6 +101,8 @@ class ReportCreate(BaseModel):
     message_id: int | None = Field(default=None, gt=0)
     reported_user_id: int | None = Field(default=None, gt=0)
     attachments: list[str] = Field(default_factory=list, max_length=6)
+    # 举报用户时选中的证据消息：必须是被举报人在 conversation_id 这个会话里发的
+    evidence_message_ids: list[int] = Field(default_factory=list, max_length=10)
 
     @model_validator(mode="after")
     def normalize_details_and_attachments(self) -> ReportCreate:
@@ -152,6 +154,10 @@ class ReportRead(BaseModel):
     action: str | None = None
     created_at: datetime
     reviewed_at: datetime | None = None
+    case_id: int | None = None
+    # 给举报人看的处理结果，未结案时为空
+    result_title: str | None = None
+    result_text: str | None = None
     reporter: UserPublic | None = None
     reviewer: UserPublic | None = None
     reported_user: UserPublic | None = None
@@ -287,6 +293,9 @@ class AdminStats(BaseModel):
     audit_actions_today: int
     appeals_pending: int = 0
     penalty_reviews_pending: int = 0
+    cases_admin_pending: int = 0
+    cases_jury_pending: int = 0
+    jury_applications_pending: int = 0
 
 
 class AdminAuditLogRead(BaseModel):
@@ -328,6 +337,14 @@ class ContentModerationRecordRead(BaseModel):
     action_taken: ModerationAction
     created_at: datetime
     acted_at: datetime | None = None
+    teamup_profile_id: int | None = None
+    teamup_comment_id: int | None = None
+    profile_user_id: int | None = None
+    human_verdict: str | None = None
+    human_category: str | None = None
+    human_level: int | None = None
+    human_by_id: int | None = None
+    human_at: datetime | None = None
 
     @computed_field
     @property
@@ -339,6 +356,20 @@ class ContentModerationRecordRead(BaseModel):
         if self.message_id is not None:
             return "message"
         return "unknown"
+
+
+class ModerationRecordVerdict(BaseModel):
+    verdict: Literal["violation", "clean"]
+    category: str | None = Field(default=None, max_length=40)
+    level: int | None = Field(default=None, ge=0, le=4)
+
+    @model_validator(mode="after")
+    def validate_verdict(self) -> ModerationRecordVerdict:
+        if self.verdict == "clean" and (self.category or self.level is not None):
+            raise ValueError("判为不违规时不能带类别和等级")
+        if self.verdict == "violation" and not self.category:
+            raise ValueError("判为违规时必须选择类别")
+        return self
 
 
 class DownloadSettingsRead(BaseModel):

@@ -1,4 +1,5 @@
 from app.models.announcement import Announcement
+from app.models.case import JuryMember, JuryVote, ReportCase
 from app.models.bot import Bot, BotInstallation, BotReview, BotReviewLike, BotReviewReply
 from app.models.conversation import Conversation, ConversationMember, GroupAnnouncement, GroupJoinRequest, TemporaryConversationBlock
 from app.models.friend import FriendRequest, Friendship
@@ -51,6 +52,9 @@ __all__ = [
     "ContentModerationRecord",
     "PasswordResetRequest",
     "UserViolation",
+    "ReportCase",
+    "JuryMember",
+    "JuryVote",
     "FavoriteSticker",
     "StickerAsset",
     "SystemSetting",

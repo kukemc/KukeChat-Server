@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 
 UTC = timezone.utc
 
-from sqlalchemy import DateTime, Enum as SAEnum, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Enum as SAEnum, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -38,6 +38,10 @@ class UserReport(Base):
     action: Mapped[str | None] = mapped_column(String(40), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 同一目标的举报并成一个案件（report_cases），结论按案件统一回写。
+    case_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    # 被认定为恶意 / 无效举报，会拉低举报人的信誉和每日额度。
+    malicious: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
 
     reporter: Mapped["User"] = relationship(back_populates="submitted_reports", foreign_keys=[reporter_id])
     reviewer: Mapped["User | None"] = relationship(back_populates="reviewed_reports", foreign_keys=[reviewer_id])
@@ -91,6 +95,12 @@ class ContentModerationRecord(Base):
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
     acted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 人工复核结论：violation / clean。既是模型拿不准时的最终裁决，也是评测模型用的标注。
+    human_verdict: Mapped[str | None] = mapped_column(String(12), nullable=True, index=True)
+    human_category: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    human_level: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    human_by_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    human_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     message: Mapped["Message | None"] = relationship(foreign_keys=[message_id])
     post: Mapped["Post | None"] = relationship(foreign_keys=[post_id])

@@ -64,7 +64,7 @@ class ReportFlowTests(unittest.IsolatedAsyncioTestCase):
                 await report_service.create_report(
                     db,
                     reporter_id,
-                    ReportCreate(target_type=ReportTargetType.POST, target_id=post.id, reason="其他"),
+                    ReportCreate(target_type=ReportTargetType.POST, target_id=post.id, reason="垃圾广告"),
                 )
 
     async def test_review_can_delete_post_and_disable_author_together(self) -> None:
@@ -113,7 +113,7 @@ class ReportFlowTests(unittest.IsolatedAsyncioTestCase):
             report = await report_service.create_report(
                 db,
                 reporter_id,
-                ReportCreate(target_type=ReportTargetType.POST, target_id=post.id, reason="其他"),
+                ReportCreate(target_type=ReportTargetType.POST, target_id=post.id, reason="其他", details="动态内容与社区主题完全无关，属于刷屏"),
             )
             with self.assertRaisesRegex(Exception, "Cannot disable an admin"):
                 await report_service.review_report(

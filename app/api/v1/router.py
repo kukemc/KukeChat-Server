@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from app.api.v1 import admin, announcements, auth, bot_api, bots, ccw, conversations, friends, game, home, invites, moderation, notifications, posts, reports, stickers, task, teamup, uploads, users
+from app.api.v1 import admin, announcements, auth, bot_api, bots, ccw, conversations, friends, game, home, invites, jury, moderation, notifications, posts, reports, stickers, task, teamup, uploads, users
 
 
 api_router = APIRouter(prefix="/api/v1")
@@ -18,6 +18,7 @@ api_router.include_router(posts.router, prefix="/posts", tags=["posts"])
 api_router.include_router(uploads.router, prefix="/uploads", tags=["uploads"])
 api_router.include_router(reports.router, prefix="/reports", tags=["reports"])
 api_router.include_router(moderation.router, prefix="/moderation", tags=["moderation"])
+api_router.include_router(jury.router, prefix="/jury", tags=["jury"])
 api_router.include_router(admin.router, prefix="/admin", tags=["admin"])
 api_router.include_router(ccw.router, prefix="/ccw", tags=["ccw"])
 api_router.include_router(teamup.router, prefix="/teamup", tags=["teamup"])

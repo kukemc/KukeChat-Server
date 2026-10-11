@@ -15,6 +15,7 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from fastapi import HTTPException, status
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
@@ -25,6 +26,7 @@ from app.models.conversation import Conversation, ConversationMember
 from app.models.enums import MessageType, ModerationAction, ModerationSource, ModerationStatus, UserStatus
 from app.models.message import Message
 from app.models.post import Post, PostComment, PostTopic
+from app.models.penalty import UserViolation
 from app.models.report import AdminAuditLog, ContentModerationRecord
 from app.models.teamup import TeamupComment, TeamupProfile
 from app.models.user import User
@@ -1425,6 +1427,122 @@ async def _disconnect_suspended_user(db: AsyncSession, user_id: int) -> None:
     })
 
 
+_RECORD_TARGETS: tuple[tuple[str, str], ...] = (
+    ("post_comment_id", "post_comment"),
+    ("teamup_comment_id", "teamup_comment"),
+    ("teamup_profile_id", "teamup_profile"),
+    ("post_id", "post"),
+    ("message_id", "message"),
+    ("profile_user_id", "profile_cover"),
+)
+
+
+def _record_target(record: ContentModerationRecord) -> tuple[str | None, int | None]:
+    for column, target_type in _RECORD_TARGETS:
+        value = getattr(record, column)
+        if value is not None:
+            return target_type, value
+    return None, None
+
+
+async def _remove_record_content(db: AsyncSession, record: ContentModerationRecord) -> Message | None:
+    """人工判定违规后处理掉内容。返回被撤回的消息，供调用方广播。"""
+    now = datetime.now(UTC)
+    target_type, target_id = _record_target(record)
+    if target_type == "message":
+        message = await db.get(Message, target_id)
+        if message is not None and message.recalled_at is None:
+            message.recalled_at = now
+            message.recalled_by_id = None
+            return message
+        return None
+    model = {"post": Post, "post_comment": PostComment, "teamup_profile": TeamupProfile, "teamup_comment": TeamupComment}.get(target_type or "")
+    if model is not None:
+        item = await db.get(model, target_id)
+        if item is not None and item.deleted_at is None:
+            item.deleted_at = now
+            item.moderation_status = ModerationStatus.REJECTED.value
+    elif target_type == "profile_cover":
+        user = await db.get(User, target_id)
+        if user is not None and record.content_url and user.profile_cover_url == record.content_url:
+            user.profile_cover_url = None
+    return None
+
+
+async def set_human_verdict(
+    db: AsyncSession,
+    record_id: int,
+    *,
+    actor_id: int,
+    verdict: str,
+    category: str | None = None,
+    level: int | None = None,
+) -> ContentModerationRecord:
+    """管理员对一条机器审核记录给出最终结论。
+
+    violation：处理内容并按统一阶梯记违规（机器已经罚过的不重复罚，等级更高时改判）。
+    clean：撤销机器因这条记录给出的处罚。已经撤回 / 删除的内容不会自动恢复。
+    """
+    record = await get_moderation_record(db, record_id)
+    if record is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Moderation record not found")
+    if record.human_verdict is not None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="这条记录已经复核过了")
+    if verdict == "violation" and category not in penalty_service.CATEGORIES:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Unknown violation category")
+    now = datetime.now(UTC)
+    record.human_verdict = verdict
+    record.human_by_id = actor_id
+    record.human_at = now
+    target_type, target_id = _record_target(record)
+    recalled: Message | None = None
+    revoked: list[UserViolation] = []
+    if verdict == "violation":
+        record.human_category = category
+        record.human_level = penalty_service.default_level(category) if level is None else level
+        recalled = await _remove_record_content(db, record)
+        if record.user_id is not None:
+            summary = (record.content_text or "").strip()[:120] or ("[图片]" if record.content_type == "image" else None)
+            await penalty_service.record_violation(
+                db,
+                user_id=record.user_id,
+                category=category,
+                level=record.human_level,
+                source="admin",
+                target_type=target_type,
+                target_id=target_id,
+                conversation_id=record.conversation_id,
+                moderation_record_id=record.id,
+                actor_id=actor_id,
+                confidence=record.confidence,
+                summary=summary,
+                reason=record.reason,
+            )
+    else:
+        result = await db.execute(
+            select(UserViolation).where(UserViolation.moderation_record_id == record.id, UserViolation.status == "active")
+        )
+        for violation in result.scalars().all():
+            revoked.append(await penalty_service.revoke_violation(db, violation.id, actor_id=actor_id, reason="人工复核：机器误判"))
+    db.add(
+        AdminAuditLog(
+            actor_id=actor_id,
+            action=f"moderation.record.{verdict}",
+            target_type="moderation_record",
+            target_id=record.id,
+            details=_canonical_json({"category": record.human_category, "level": record.human_level, "machine_decision": record.decision}),
+        )
+    )
+    await db.commit()
+    await penalty_service.flush_notifications(db)
+    for violation in revoked:
+        await penalty_service.notify_violation_updated(db, violation, "revoked")
+    if recalled is not None:
+        await _broadcast_moderation_action(db, recalled, ModerationAction.RECALLED)
+    await admin_manager.broadcast("admin.moderation.changed", {"record_id": record.id, "action": f"human_{verdict}"})
+    return record
+
+
 async def list_moderation_records(
     db: AsyncSession,
     decision: str | None = None,
@@ -1434,6 +1552,7 @@ async def list_moderation_records(
     include_allow: bool = True,
     limit: int = 100,
     offset: int = 0,
+    human: str | None = None,
 ) -> list[ContentModerationRecord]:
     stmt = (
         select(ContentModerationRecord)
@@ -1452,6 +1571,10 @@ async def list_moderation_records(
         stmt = stmt.where(ContentModerationRecord.source == source)
     if content_type is not None:
         stmt = stmt.where(ContentModerationRecord.content_type == content_type)
+    if human == "pending":
+        stmt = stmt.where(ContentModerationRecord.human_verdict.is_(None))
+    elif human == "done":
+        stmt = stmt.where(ContentModerationRecord.human_verdict.is_not(None))
     result = await db.execute(stmt)
     records = list(result.scalars().all())
     changed = False

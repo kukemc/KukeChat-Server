@@ -24,9 +24,11 @@ from app.schemas.report import AdminBanPage, AdminBanRead, AdminConversationRead
 from app.schemas.user import UserPublic
 from app.services.messages import admin_recall_message, get_visible_message_for_user
 from app.services.upload_paths import require_message_image_upload_url
+from app.services import cases as case_service
 from app.services import messages as message_service
 from app.services import penalties as penalty_service
 from app.services import posts as post_service
+from app.models.case import JuryMember, ReportCase
 from app.models.penalty import UserViolation
 
 
@@ -72,12 +74,23 @@ async def _can_view_user(db: AsyncSession, target_id: int, reporter_id: int) -> 
 
 
 async def create_report(db: AsyncSession, reporter_id: int, payload: ReportCreate) -> UserReport:
+    case_service.validate_report_payload(
+        payload.target_type, payload.reason.strip(), payload.details, payload.attachments, payload.evidence_message_ids
+    )
+    credit = await case_service.ensure_quota(db, reporter_id)
     target_snapshot: dict | None = None
     conversation_id: int | None = None
     message_id: int | None = None
     reported_user_id: int | None = None
     if payload.target_type == ReportTargetType.MESSAGE:
         message = await get_visible_message_for_user(db, payload.target_id, reporter_id)
+        if message.recalled_at is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "already_handled", "message": "这条消息已经被处理过了"},
+            )
+        if message.sender_id == reporter_id:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot report your own message")
         conversation = await db.get(Conversation, message.conversation_id)
         conversation_id = message.conversation_id
         message_id = message.id
@@ -106,7 +119,13 @@ async def create_report(db: AsyncSession, reporter_id: int, payload: ReportCreat
             if not await _conversation_has_user(db, payload.conversation_id, reported_user_id):
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Reported user is not in the conversation")
             conversation_id = payload.conversation_id
+        if reported_user_id == reporter_id:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot report yourself")
         target_snapshot = await _user_report_snapshot(db, reported_user, reporter_id, conversation_id)
+        if payload.evidence_message_ids:
+            target_snapshot["evidence_messages"] = await _evidence_message_snapshots(
+                db, payload.evidence_message_ids, reporter_id, reported_user_id, conversation_id
+            )
 
     attachments = _normalize_report_attachments(payload.attachments)
     snapshot_json = _canonical_json(target_snapshot) if target_snapshot else None
@@ -114,17 +133,19 @@ async def create_report(db: AsyncSession, reporter_id: int, payload: ReportCreat
 
     reason = payload.reason.strip()
     details = payload.details.strip() if payload.details else None
-    existing = await _find_recent_duplicate_report(
-        db,
-        reporter_id=reporter_id,
-        target_type=payload.target_type,
-        target_id=payload.target_id,
-        conversation_id=conversation_id,
-        message_id=message_id,
-        reported_user_id=reported_user_id,
+    open_case = await case_service.find_open_case(
+        db, case_service.target_key(payload.target_type, payload.target_id, conversation_id, message_id, reported_user_id)
     )
-    if existing is not None:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="A pending report already exists for this target")
+    if open_case is not None and await case_service.already_reported(db, reporter_id, open_case.id):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "already_reported",
+                "message": "你已经举报过了，处理结果会通知你",
+                "case_id": open_case.id,
+                "detail": "A pending report already exists for this target",
+            },
+        )
 
     report = UserReport(
         reporter_id=reporter_id,
@@ -140,8 +161,33 @@ async def create_report(db: AsyncSession, reporter_id: int, payload: ReportCreat
         evidence_hash=_evidence_hash(target_snapshot, attachments, reason=reason, details=details),
     )
     db.add(report)
+    await db.flush()
+    case, created = await case_service.attach_report(db, report, weight=float(credit["weight"]))
     await db.commit()
-    return await get_report(db, report.id)
+    result = await get_report(db, report.id)
+    # 新案件要先过一遍机器预审，由 API 层在事务提交后调度。
+    setattr(result, "_new_case_id", case.id if created else None)
+    return result
+
+
+async def _evidence_message_snapshots(
+    db: AsyncSession,
+    message_ids: list[int],
+    reporter_id: int,
+    reported_user_id: int,
+    conversation_id: int | None,
+) -> list[dict]:
+    """举报用户时附带的证据消息。只收举报人看得到、且确实是被举报人发的消息，提交时固化。"""
+    if conversation_id is None:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="选择证据消息时必须指明所在会话")
+    items: list[dict] = []
+    for message_id in list(dict.fromkeys(message_ids)):
+        message = await get_visible_message_for_user(db, message_id, reporter_id)
+        if message.conversation_id != conversation_id or message.sender_id != reported_user_id:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="证据消息必须是被举报人在该会话中发送的")
+        await db.refresh(message, attribute_names=["sender"])
+        items.append(_message_snapshot_item(message, is_target=True))
+    return items
 
 
 async def list_my_reports(db: AsyncSession, reporter_id: int, limit: int = 100) -> list[UserReport]:
@@ -226,35 +272,6 @@ async def _restore_auto_rejected_reports(db: AsyncSession) -> None:
     )
     if result.rowcount:
         await db.commit()
-
-
-async def _find_recent_duplicate_report(
-    db: AsyncSession,
-    *,
-    reporter_id: int,
-    target_type: ReportTargetType,
-    target_id: int,
-    conversation_id: int | None,
-    message_id: int | None,
-    reported_user_id: int | None,
-) -> UserReport | None:
-    stmt = select(UserReport).where(
-        UserReport.reporter_id == reporter_id,
-        UserReport.target_type == target_type,
-        UserReport.status == ReportStatus.PENDING,
-    )
-    if target_type == ReportTargetType.MESSAGE:
-        stmt = stmt.where(UserReport.message_id == (message_id or target_id))
-    elif target_type == ReportTargetType.POST:
-        stmt = stmt.where(UserReport.target_id == target_id)
-    elif target_type == ReportTargetType.CONVERSATION:
-        stmt = stmt.where(UserReport.conversation_id == (conversation_id or target_id))
-    else:
-        stmt = stmt.where(UserReport.reported_user_id == (reported_user_id or target_id))
-        if conversation_id is not None:
-            stmt = stmt.where(UserReport.conversation_id == conversation_id)
-    result = await db.execute(stmt.order_by(UserReport.created_at.desc()).limit(1))
-    return result.scalar_one_or_none()
 
 
 async def _backfill_report_context(db: AsyncSession) -> None:
@@ -653,6 +670,9 @@ async def build_report_read(db: AsyncSession, report: UserReport, viewer_id: int
             extra={"snapshot": target_snapshot} if include_snapshot and target_snapshot else {},
         )
 
+    result_title = result_text = None
+    if report.status != ReportStatus.PENDING:
+        result_title, result_text = case_service.report_result_text(report)
     return ReportRead(
         id=report.id,
         reporter_id=report.reporter_id,
@@ -672,6 +692,9 @@ async def build_report_read(db: AsyncSession, report: UserReport, viewer_id: int
         action=report.action,
         created_at=report.created_at,
         reviewed_at=report.reviewed_at,
+        case_id=report.case_id,
+        result_title=result_title,
+        result_text=result_text,
         reporter=report.reporter,
         reviewer=report.reviewer,
         reported_user=reported_user,
@@ -887,6 +910,7 @@ async def review_report(db: AsyncSession, report_id: int, reviewer_id: int, payl
     action = "+".join(actions) if actions else "none"
     report.action = action
     report.reviewed_at = now
+    closed_case = await case_service.sync_from_report_review(db, report, actor_id=reviewer_id)
     db.add(
         AdminAuditLog(
             actor_id=reviewer_id,
@@ -898,6 +922,8 @@ async def review_report(db: AsyncSession, report_id: int, reviewer_id: int, payl
     )
     await db.commit()
     await penalty_service.flush_notifications(db)
+    if closed_case is not None:
+        await case_service.notify_case_closed(db, closed_case)
     if deleted_post is not None:
         try:
             await post_service.cleanup_deleted_post_uploads(db, deleted_post)
@@ -1778,6 +1804,13 @@ async def admin_stats(db: AsyncSession) -> dict[str, int]:
         "reports_pending": await _count(db, select(func.count()).select_from(UserReport).where(UserReport.status == ReportStatus.PENDING)),
         "audit_actions_today": await _count(db, select(func.count()).select_from(AdminAuditLog).where(AdminAuditLog.created_at >= today)),
         "appeals_pending": await _count(db, select(func.count()).select_from(UserViolation).where(UserViolation.appeal_status == "pending")),
+        "cases_admin_pending": await _count(
+            db, select(func.count()).select_from(ReportCase).where(ReportCase.status == "open", ReportCase.queue != "jury")
+        ),
+        "cases_jury_pending": await _count(
+            db, select(func.count()).select_from(ReportCase).where(ReportCase.status == "open", ReportCase.queue == "jury")
+        ),
+        "jury_applications_pending": await _count(db, select(func.count()).select_from(JuryMember).where(JuryMember.status == "applied")),
         "penalty_reviews_pending": await _count(
             db,
             select(func.count()).select_from(UserViolation).where(UserViolation.review_status == "pending", UserViolation.status == "active"),

@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
@@ -30,6 +31,7 @@ from app.schemas.report import (
     AdminUserRead,
     AdminUserStatusUpdate,
     ContentModerationRecordRead,
+    ModerationRecordVerdict,
     DownloadSettingsRead,
     DownloadSettingsUpdate,
     ReportRead,
@@ -46,6 +48,20 @@ from app.schemas.penalty import (
     AdminViolationRevoke,
     PenaltyInput,
 )
+from app.models.case import JuryVote, ReportCase
+from app.schemas.case import (
+    CaseDetail,
+    CaseMove,
+    CasePage,
+    CaseRead,
+    CaseResolve,
+    JuryMemberPage,
+    JuryMemberRead,
+    JuryMemberReview,
+    JuryVoteSummary,
+)
+from app.services import cases as case_service
+from app.services import jury as jury_service
 from app.services import messages as message_service
 from app.services import penalties as penalty_service
 from app.services import moderation as moderation_service
@@ -463,6 +479,11 @@ async def admin_review_report(
             if post is not None and post.deleted_at is None:
                 post_recipients = await post_service.post_recipient_ids(db, post)
     report = await report_service.review_report(db, report_id, admin.id, payload)
+    if report.case_id is not None:
+        closed_case = await db.get(ReportCase, report.case_id)
+        if closed_case is not None and closed_case.status != "open":
+            await jury_service.settle_after_admin(db, closed_case)
+            await db.commit()
     await admin_manager.broadcast("admin.report.changed", {"report_id": report.id, "action": "reviewed"})
     if "recall_message" in (report.action or "") and report.message_id is not None:
         message = await message_service.get_message(db, report.message_id)
@@ -503,9 +524,23 @@ async def admin_moderation_records(
     include_allow: bool = False,
     limit: Annotated[int, Query(ge=1, le=500)] = 100,
     offset: Annotated[int, Query(ge=0)] = 0,
+    human: Annotated[str | None, Query(pattern="^(pending|done)$")] = None,
 ) -> list[ContentModerationRecordRead]:
-    items = await moderation_service.list_moderation_records(db, decision, action, source, content_type, include_allow, limit, offset)
+    items = await moderation_service.list_moderation_records(db, decision, action, source, content_type, include_allow, limit, offset, human)
     return [ContentModerationRecordRead.model_validate(item) for item in items]
+
+
+@router.post("/moderation-records/{record_id}/verdict", response_model=ContentModerationRecordRead)
+async def admin_moderation_record_verdict(
+    record_id: int,
+    payload: ModerationRecordVerdict,
+    admin: Annotated[User, Depends(get_current_admin)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> ContentModerationRecordRead:
+    record = await moderation_service.set_human_verdict(
+        db, record_id, actor_id=admin.id, verdict=payload.verdict, category=payload.category, level=payload.level
+    )
+    return ContentModerationRecordRead.model_validate(record)
 
 
 @router.get("/download-settings", response_model=DownloadSettingsRead)
@@ -716,3 +751,122 @@ async def admin_unmute_user(
     )
     await admin_manager.broadcast("admin.user.changed", {"user_id": user.id, "action": "unmuted"})
     return await report_service.get_admin_user(db, user.id)
+
+
+# ---------------------------------------------------------------- 举报案件
+
+
+async def _case_detail(db: AsyncSession, case: ReportCase, admin_id: int) -> CaseDetail:
+    base = (await case_service.build_case_reads(db, [case]))[0]
+    reports = await case_service.case_reports(db, case.id)
+    full_reports = [await report_service.get_report(db, report.id) for report in reports]
+    votes = (
+        await db.execute(
+            select(JuryVote, User).join(User, User.id == JuryVote.juror_id).where(JuryVote.case_id == case.id, JuryVote.voted_at.is_not(None))
+        )
+    ).all()
+    return CaseDetail(
+        **base,
+        snapshot=await case_service.case_snapshot(db, case) or None,
+        reports=await report_service.build_report_reads(db, full_reports, admin_id),
+        votes=[JuryVoteSummary(vote=vote.vote, note=vote.note, voted_at=penalty_service.aware(vote.voted_at), juror=juror) for vote, juror in votes],
+    )
+
+
+@router.get("/cases", response_model=CasePage)
+async def admin_list_cases(
+    _admin: Annotated[User, Depends(get_current_admin)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    status_filter: Literal["open", "resolved", "dismissed"] | None = Query(default="open", alias="status"),
+    queue: Literal["triage", "jury", "admin"] | None = None,
+    q: str | None = Query(default=None, max_length=80),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> CasePage:
+    await case_service.escalate_stale_jury_cases(db)
+    items, total, counts = await case_service.list_cases(db, status_filter=status_filter, queue=queue, query=q, limit=limit, offset=offset)
+    return CasePage(items=[CaseRead(**item) for item in await case_service.build_case_reads(db, items)], total=total, open_counts=counts)
+
+
+@router.get("/cases/{case_id}", response_model=CaseDetail)
+async def admin_case_detail(
+    case_id: int,
+    admin: Annotated[User, Depends(get_current_admin)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> CaseDetail:
+    case = await db.get(ReportCase, case_id)
+    if case is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Case not found")
+    detail = await _case_detail(db, case, admin.id)
+    await report_service.log_sensitive_read(db, admin.id, "case.snapshot.read", "report_case", case.id, {"target": case.target_key})
+    return detail
+
+
+@router.post("/cases/{case_id}/resolve", response_model=CaseDetail)
+async def admin_resolve_case(
+    case_id: int,
+    payload: CaseResolve,
+    admin: Annotated[User, Depends(get_current_admin)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> CaseDetail:
+    case = await case_service.resolve_case(
+        db,
+        case_id,
+        source="admin",
+        actor_id=admin.id,
+        upheld=payload.outcome == "violation",
+        category=payload.category,
+        level=payload.level,
+        delete_content=payload.delete_content,
+        override=_penalty_from_input(payload.penalty) if payload.penalty is not None else None,
+        note=payload.note,
+        malicious_reporter_ids=set(payload.malicious_reporter_ids),
+    )
+    # 管理员的结论是委员一致率的基准，也让这个案件进入质控题库。
+    await jury_service.settle_after_admin(db, case)
+    if case.jury_eligible:
+        case.is_golden = True
+    await db.commit()
+    await admin_manager.broadcast("admin.report.changed", {"case_id": case.id, "action": "reviewed"})
+    return await _case_detail(db, case, admin.id)
+
+
+@router.post("/cases/{case_id}/queue", response_model=CaseRead)
+async def admin_move_case(
+    case_id: int,
+    payload: CaseMove,
+    admin: Annotated[User, Depends(get_current_admin)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> CaseRead:
+    case = await case_service.move_case(db, case_id, payload.queue, actor_id=admin.id)
+    return CaseRead(**(await case_service.build_case_reads(db, [case]))[0])
+
+
+# ---------------------------------------------------------------- 风纪委员
+
+
+@router.get("/jury/members", response_model=JuryMemberPage)
+async def admin_list_jury_members(
+    _admin: Annotated[User, Depends(get_current_admin)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    status_filter: Literal["applied", "active", "rejected", "suspended", "retired"] | None = Query(default=None, alias="status"),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> JuryMemberPage:
+    items, total = await jury_service.list_members(db, status_filter, limit, offset)
+    return JuryMemberPage(items=[JuryMemberRead(**item) for item in items], total=total)
+
+
+@router.post("/jury/members/{user_id}/review", response_model=JuryMemberRead)
+async def admin_review_jury_member(
+    user_id: int,
+    payload: JuryMemberReview,
+    admin: Annotated[User, Depends(get_current_admin)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> JuryMemberRead:
+    await jury_service.review_member(db, user_id, action=payload.action, actor_id=admin.id, note=payload.note)
+    items, _total = await jury_service.list_members(db, None, 200, 0)
+    item = next((entry for entry in items if entry["user_id"] == user_id), None)
+    if item is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Jury member not found")
+    return JuryMemberRead(**item)

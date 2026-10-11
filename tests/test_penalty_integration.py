@@ -167,6 +167,57 @@ class PenaltyIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(message.recalled_at)
             self.assertEqual(await self._violations(db), [])
 
+    async def test_human_verdict_settles_what_the_machine_could_not(self) -> None:
+        async with self.sessions() as db:
+            message = (await db.execute(select(Message))).scalar_one()
+            uncertain = ContentModerationRecord(
+                source=ModerationSource.MESSAGE_AUTO,
+                message_id=message.id,
+                conversation_id=message.conversation_id,
+                user_id=message.sender_id,
+                content_type="image",
+                content_url="/uploads/messages/a.png",
+                decision="review",
+                severity=1,
+            )
+            db.add(uncertain)
+            await db.commit()
+            record = await moderation_service.set_human_verdict(
+                db, uncertain.id, actor_id=self.admin_id, verdict="violation", category="sexual"
+            )
+            self.assertEqual((record.human_verdict, record.human_category, record.human_level), ("violation", "sexual", 3))
+            self.assertIsNotNone(message.recalled_at)
+            rows = await self._violations(db)
+            self.assertEqual((rows[0].source, rows[0].level, rows[0].moderation_record_id, rows[0].summary), ("admin", 3, uncertain.id, "[图片]"))
+            with self.assertRaises(HTTPException):
+                await moderation_service.set_human_verdict(db, uncertain.id, actor_id=self.admin_id, verdict="clean")
+
+    async def test_human_clean_verdict_revokes_machine_penalty(self) -> None:
+        async with self.sessions() as db:
+            message = (await db.execute(select(Message))).scalar_one()
+            record = ContentModerationRecord(
+                source=ModerationSource.MESSAGE_AUTO,
+                message_id=message.id,
+                conversation_id=message.conversation_id,
+                user_id=message.sender_id,
+                content_type="image",
+                decision="block",
+                severity=2,
+            )
+            db.add(record)
+            action = await moderation_service._apply_moderation_action(db, message, record)
+            await db.commit()
+            penalty_service.discard_notifications(db)
+            self.assertEqual(action, ModerationAction.MUTED)
+            author = await db.get(User, self.author_id)
+            self.assertIsNotNone(penalty_service.mute_state(author))
+
+            await moderation_service.set_human_verdict(db, record.id, actor_id=self.admin_id, verdict="clean")
+            rows = await self._violations(db)
+            self.assertEqual(rows[0].status, "revoked")
+            self.assertIsNone(author.muted_until)
+            self.assertEqual(await penalty_service.active_points(db, self.author_id), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
