@@ -540,8 +540,12 @@ async def history(db: AsyncSession, juror_id: int, limit: int = 50) -> list[dict
     return items
 
 
-async def list_members(db: AsyncSession, status_filter: str | None, limit: int, offset: int) -> tuple[list[dict[str, Any]], int]:
+async def list_members(
+    db: AsyncSession, status_filter: str | None, limit: int, offset: int, user_id: int | None = None
+) -> tuple[list[dict[str, Any]], int]:
     clauses = [JuryMember.status == status_filter] if status_filter else []
+    if user_id is not None:
+        clauses.append(JuryMember.user_id == user_id)
     total = int((await db.execute(select(func.count(JuryMember.id)).where(*clauses))).scalar_one() or 0)
     rows = await db.execute(
         select(JuryMember, User)

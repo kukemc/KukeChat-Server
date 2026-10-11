@@ -873,8 +873,7 @@ async def admin_review_jury_member(
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> JuryMemberRead:
     await jury_service.review_member(db, user_id, action=payload.action, actor_id=admin.id, note=payload.note)
-    items, _total = await jury_service.list_members(db, None, 200, 0)
-    item = next((entry for entry in items if entry["user_id"] == user_id), None)
-    if item is None:
+    items, _total = await jury_service.list_members(db, None, 1, 0, user_id=user_id)
+    if not items:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Jury member not found")
-    return JuryMemberRead(**item)
+    return JuryMemberRead(**items[0])
