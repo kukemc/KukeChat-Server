@@ -12,6 +12,7 @@ from app.models.enums import FriendRequestStatus, ModerationStatus, PresenceStat
 from app.models.friend import FriendRequest, Friendship
 from app.models.user import User
 from app.schemas.user import UserPresenceUpdate, UserUpdate
+from app.services import pokes as poke_service
 from app.services.upload_paths import require_avatar_upload_url, require_profile_cover_upload_url
 
 
@@ -48,6 +49,14 @@ async def update_profile(db: AsyncSession, user: User, payload: UserUpdate) -> U
             user.profile_cover_moderation_status = ModerationStatus.APPROVED.value
     if updates.get("share_typing") is None:
         updates.pop("share_typing", None)
+    # 这两个字段不可为空，传 null 或空串表示恢复默认
+    if "poke_action" in updates:
+        user.poke_action = poke_service.normalize_action(updates.pop("poke_action"))
+    if "poke_suffix" in updates:
+        suffix = poke_service.normalize_suffix(updates.pop("poke_suffix"))
+        if suffix != (user.poke_suffix or ""):
+            await poke_service.ensure_suffix_allowed(user, suffix)
+        user.poke_suffix = suffix
     for key, value in updates.items():
         if isinstance(value, str):
             value = value.strip() or None

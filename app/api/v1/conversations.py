@@ -59,6 +59,7 @@ from app.schemas.message import (
     MessageRead,
     MessageSearchResponse,
     MessageSearchResult,
+    PokeRequest,
     ReadConversationRequest,
     ReadReceipt,
 )
@@ -67,6 +68,7 @@ from app.services import conversations as conversation_service
 from app.services import group_activity as group_activity_service
 from app.services import messages as message_service
 from app.services import moderation as moderation_service
+from app.services import pokes as poke_service
 from app.services import response_cache
 from app.websocket.manager import admin_manager, bot_manager, game_manager, manager
 
@@ -1433,55 +1435,41 @@ async def read_conversation(
 # ---------------------------------------------------------------------------
 # 戳一戳
 #
-# 完全不落库：它只是一条转瞬即逝的互动提示，存下来只会把消息表撑大，
-# 也没人会想翻历史「谁戳过我」。所以只走 WebSocket 广播。
+# 落成一条系统消息留在聊天记录里（规则见 services/pokes.py）。同时仍然推一次
+# conversation.member.poked：客户端用它做头像抖动，老客户端靠它显示提示。
 # ---------------------------------------------------------------------------
 
-POKE_COOLDOWN_SECONDS = 2.0
-# key 是 (发起者, 被戳者)，value 是上次成功的时间戳。进程内缓存即可 ——
-# 多 worker 下最坏情况是冷却被放宽几倍，而这只是防手抖连点，不是安全边界。
-_poke_cooldowns: dict[tuple[int, int], float] = {}
 
-
-def _poke_allowed(actor_id: int, target_id: int) -> bool:
-    now = asyncio.get_running_loop().time()
-    key = (actor_id, target_id)
-    last = _poke_cooldowns.get(key)
-    if last is not None and now - last < POKE_COOLDOWN_SECONDS:
-        return False
-    _poke_cooldowns[key] = now
-    if len(_poke_cooldowns) > 5000:
-        # 简单封顶，别让长期运行的进程无限攒 key
-        stale = [k for k, v in _poke_cooldowns.items() if now - v > 60]
-        for k in stale:
-            _poke_cooldowns.pop(k, None)
-    return True
-
-
-@router.post("/{conversation_id}/members/{user_id}/poke", response_model=MessageResponse)
+@router.post("/{conversation_id}/members/{user_id}/poke", response_model=MessageRead)
 async def poke_member(
     conversation_id: int,
     user_id: int,
     current_user: Annotated[User, Depends(get_current_user)],
     db: Annotated[AsyncSession, Depends(get_db)],
-) -> MessageResponse:
-    if user_id == current_user.id:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot poke yourself")
-    await conversation_service.require_membership(db, conversation_id, current_user.id)
-    target = await conversation_service.get_member(db, conversation_id, user_id)
-    if not _poke_allowed(current_user.id, user_id):
-        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Poking too fast")
-
-    member_ids = await online_conversation_member_ids(db, conversation_id)
-    await manager.send_to_users(
-        member_ids,
-        "conversation.member.poked",
-        {
-            "conversation_id": conversation_id,
-            "actor_id": current_user.id,
-            "actor_name": display_name(current_user, f"用户 {current_user.id}"),
-            "user_id": user_id,
-            "user_name": display_name(target.user, f"用户 {user_id}"),
-        },
+    payload: PokeRequest | None = None,
+) -> MessageRead:
+    message, poke = await poke_service.create_poke(
+        db, conversation_id, current_user, user_id, payload.action if payload is not None else None
     )
-    return MessageResponse(detail="Poked")
+    message_data = await message_service.build_message_read(db, message, current_user.id)
+    member_ids = await online_conversation_member_ids(db, conversation_id)
+    response_cache.invalidate_user_conversations(set(member_ids) | {current_user.id})
+    try:
+        await send_message_updates(db, "message.created", message, member_ids)
+        await manager.send_to_users(
+            member_ids,
+            "conversation.member.poked",
+            {
+                "conversation_id": conversation_id,
+                "message_id": message.id,
+                "actor_id": poke["actor_id"],
+                "actor_name": poke["actor_name"],
+                "user_id": poke["user_id"],
+                "user_name": poke["user_name"],
+                "action": poke["action"],
+                "suffix": poke["suffix"],
+            },
+        )
+    except Exception:
+        logger.exception("Committed poke message %s realtime delivery failed", message.id)
+    return message_data

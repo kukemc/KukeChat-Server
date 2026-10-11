@@ -11,7 +11,8 @@ from app.core.database import get_db
 from app.core.dependencies import get_current_user
 from app.models.bot import Bot
 from app.models.user import User
-from app.schemas.user import CcwCreatorPage, OnlineCountRead, OnlineUsersRead, UserOnlineStatusRead, UserPresenceUpdate, UserPublic, UserRead, UserUpdate
+from app.schemas.user import CcwCreatorPage, OnlineCountRead, OnlineUsersRead, PokeOptionsRead, UserOnlineStatusRead, UserPresenceUpdate, UserPublic, UserRead, UserUpdate
+from app.services import pokes as poke_service
 from app.services import response_cache
 from app.services.users import list_ccw_creators, recommended_users, resolve_stale_profile_cover_moderation, search_users, update_presence, update_profile
 from app.websocket.manager import bot_manager, manager
@@ -57,6 +58,11 @@ async def update_my_presence(
         },
     )
     return user
+
+
+@router.get("/poke-options", response_model=PokeOptionsRead)
+async def poke_options(current_user: Annotated[User, Depends(get_current_user)]) -> PokeOptionsRead:
+    return PokeOptionsRead(**poke_service.options())
 
 
 @router.get("/online-count", response_model=OnlineCountRead)

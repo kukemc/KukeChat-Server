@@ -15,7 +15,7 @@ from sqlalchemy.orm import joinedload
 
 from app.core.security import hash_password
 from app.models.conversation import Conversation, ConversationMember, GroupJoinRequest
-from app.models.enums import ConversationType, GroupJoinRequestStatus, MemberRole, ModerationAction, PasswordResetStatus, PlatformRole, ReportStatus, ReportTargetType, UserStatus
+from app.models.enums import ConversationType, GroupJoinRequestStatus, MemberRole, MessageType, ModerationAction, PasswordResetStatus, PlatformRole, ReportStatus, ReportTargetType, UserStatus
 from app.models.message import Message, MessageVisibility
 from app.models.post import Post
 from app.models.report import AdminAuditLog, ContentModerationRecord, PasswordResetRequest, UserReport
@@ -73,6 +73,15 @@ async def _can_view_user(db: AsyncSession, target_id: int, reporter_id: int) -> 
     return result.scalar_one_or_none() is not None
 
 
+def _system_message_not_reportable() -> HTTPException:
+    # 系统提示的文字不是「发送者」写的：戳一戳的后缀来自被戳的人，拿它举报或当证据都会算到发起人头上，
+    # 被戳的人甚至可以先改好后缀再去举报对方。
+    return HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        detail={"code": "not_reportable", "message": "系统提示不能被举报，也不能作为证据；请举报对应的用户并写明情况或附上截图"},
+    )
+
+
 async def create_report(db: AsyncSession, reporter_id: int, payload: ReportCreate) -> UserReport:
     case_service.validate_report_payload(
         payload.target_type, payload.reason.strip(), payload.details, payload.attachments, payload.evidence_message_ids
@@ -91,6 +100,8 @@ async def create_report(db: AsyncSession, reporter_id: int, payload: ReportCreat
             )
         if message.sender_id == reporter_id:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot report your own message")
+        if message.type == MessageType.SYSTEM:
+            raise _system_message_not_reportable()
         conversation = await db.get(Conversation, message.conversation_id)
         conversation_id = message.conversation_id
         message_id = message.id
@@ -185,6 +196,8 @@ async def _evidence_message_snapshots(
         message = await get_visible_message_for_user(db, message_id, reporter_id)
         if message.conversation_id != conversation_id or message.sender_id != reported_user_id:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="证据消息必须是被举报人在该会话中发送的")
+        if message.type == MessageType.SYSTEM:
+            raise _system_message_not_reportable()
         await db.refresh(message, attribute_names=["sender"])
         items.append(_message_snapshot_item(message, is_target=True))
     return items

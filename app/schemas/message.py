@@ -117,6 +117,11 @@ class MessageReactionSummary(BaseModel):
     users: list[UserPublic] = Field(default_factory=list)
 
 
+class PokeRequest(BaseModel):
+    # 发起人临时换一个动作；不传就用对方资料里设置的
+    action: str | None = Field(default=None, max_length=16)
+
+
 class MessageRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

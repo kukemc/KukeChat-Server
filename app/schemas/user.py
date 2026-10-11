@@ -47,6 +47,9 @@ class UserPublic(BaseModel):
     ban_reason: str | None = None
     is_bot: bool = False
     bot_owner_id: int | None = None
+    # 别人戳这个用户时的动作和后缀文案，见 docs/chat-features.md
+    poke_action: str = "戳"
+    poke_suffix: str = ""
     created_at: datetime
 
 
@@ -73,6 +76,15 @@ class UserUpdate(BaseModel):
     profile_cover_url: str | None = Field(default=None, max_length=500)
     # 关掉后别人看不到「我正在输入」
     share_typing: bool | None = None
+    # 长度和取值在服务层校验，这样能返回带 code 的错误
+    poke_action: str | None = Field(default=None, max_length=16)
+    poke_suffix: str | None = Field(default=None, max_length=200)
+
+
+class PokeOptionsRead(BaseModel):
+    actions: list[str]
+    default_action: str
+    suffix_max_length: int
 
 
 class UserPresenceUpdate(BaseModel):
