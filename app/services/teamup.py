@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import PurePosixPath
 
 from fastapi import HTTPException, status
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import case, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
@@ -24,6 +24,7 @@ from app.schemas.teamup import (
     TeamupProfileSave,
     TeamupSkillItem,
     TeamupSkillStat,
+    TeamupStatsRead,
 )
 from app.schemas.user import UserPublic
 from app.services.penalties import ensure_can_post
@@ -214,6 +215,39 @@ async def _all_profile_counts(db: AsyncSession) -> tuple[int, int]:
     total_result = await db.execute(base)
     recruiting_result = await db.execute(base.where(TeamupProfile.status == TeamupProfileStatus.RECRUITING.value))
     return int(total_result.scalar_one() or 0), int(recruiting_result.scalar_one() or 0)
+
+
+async def overall_stats(db: AsyncSession, event_id: int | None) -> TeamupStatsRead:
+    """组队中心概览。total_* 和 _all_profile_counts 同一个口径（全部赛季，未删除、已通过审核），
+    评论只数已通过且未删除的；profile_count / recruiting_count 是广场当前在展示的那一批。"""
+    profile_count, recruiting_count = await _event_counts(db, event_id)
+    visible_profile = (TeamupProfile.deleted_at.is_(None), _profile_is_approved())
+    row = (
+        await db.execute(
+            select(
+                func.count(TeamupProfile.id),
+                func.coalesce(
+                    func.sum(case((TeamupProfile.status == TeamupProfileStatus.RECRUITING.value, 1), else_=0)), 0
+                ),
+                func.coalesce(func.sum(TeamupProfile.view_count), 0),
+            ).where(*visible_profile)
+        )
+    ).one()
+    comment_count = (
+        await db.execute(
+            select(func.count(TeamupComment.id))
+            .join(TeamupProfile, TeamupProfile.id == TeamupComment.profile_id)
+            .where(TeamupComment.deleted_at.is_(None), _comment_is_approved(), *visible_profile)
+        )
+    ).scalar_one()
+    return TeamupStatsRead(
+        profile_count=profile_count,
+        recruiting_count=recruiting_count,
+        total_profile_count=int(row[0] or 0),
+        total_recruiting_count=int(row[1] or 0),
+        total_view_count=int(row[2] or 0),
+        total_comment_count=int(comment_count or 0),
+    )
 
 
 def _seconds_remaining(event: TeamupEvent) -> int | None:

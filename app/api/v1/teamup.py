@@ -19,6 +19,7 @@ from app.schemas.teamup import (
     TeamupProfileRead,
     TeamupProfileSave,
     TeamupSkillStat,
+    TeamupStatsRead,
 )
 from app.services import moderation as moderation_service
 from app.services import teamup as teamup_service
@@ -39,6 +40,15 @@ async def current_event(
     del current_user
     event = await teamup_service.get_active_event(db)
     return await teamup_service.build_event_read(db, event) if event is not None else None
+
+
+@router.get("/stats", response_model=TeamupStatsRead)
+async def stats(
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> TeamupStatsRead:
+    del current_user
+    return await teamup_service.overall_stats(db, await teamup_service.get_active_event_id(db))
 
 
 @router.get("/skills", response_model=list[TeamupSkillStat])

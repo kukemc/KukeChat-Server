@@ -160,6 +160,19 @@ class TeamupEventRead(BaseModel):
     total_recruiting_count: int = 0
 
 
+class TeamupStatsRead(BaseModel):
+    """组队中心概览，不依赖是否有进行中的赛季。"""
+
+    # 广场当前展示的范围：有进行中的赛季就是这个赛季的名片，没有就是不属于任何赛季的名片
+    profile_count: int = 0
+    recruiting_count: int = 0
+    # 全部赛季加起来
+    total_profile_count: int = 0
+    total_recruiting_count: int = 0
+    total_view_count: int = 0
+    total_comment_count: int = 0
+
+
 class TeamupEventUpsert(BaseModel):
     title: str = Field(min_length=1, max_length=120)
     theme: str = Field(default="", max_length=2000)
