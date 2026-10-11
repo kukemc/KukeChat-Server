@@ -137,11 +137,24 @@
 | `POST /admin/violations/{id}/appeal` | 处理申诉：`{ accept, note? }` |
 | `POST /admin/users/{id}/unmute` | 直接解除禁言（记分保留） |
 
+后台读规则用 `GET /admin/moderation/rules`（与 `/moderation/rules` 内容相同；后者在客户端证明头校验之后，后台调不通）。
+
 `penalty` 结构：`{ kind, hours?, permanent? }`。`AdminViolationRead` 在 `ViolationRead` 基础上多出：`user_id`、`user`、`raw_source`、`confidence`、`reason`、`moderation_record_id`、`report_id`、`case_id`、`actor`、`review_status`、`recommended_penalty`、`reviewed_at`、`appeal_text`、`appealed_at`、`appeal_note`、`appeal_reviewed_at`、`revoked_at`、`revoke_reason`。
 
 `GET /admin/stats` 新增 `appeals_pending`、`penalty_reviews_pending`。`POST /admin/reports/{id}/review` 新增可选的 `violation_category`、`violation_level`：给了就按阶梯处罚；同时带 `disable_user` 时以管理员指定的封禁时长为准。原有的手动封禁 / 解封接口不变，但现在都会落到台账里。
 
 后台通道 `/admin/ws` 新增事件 `admin.violation.changed`：`{ violation_id, user_id, action }`。
+
+### 1.9 人工复核机器审核记录（后台）
+
+机器「拿不准」（`decision=review`）的内容不再自动处理，需要管理员给最终结论；对机器已经处罚的记录也可以复核纠错。
+
+- `GET /admin/moderation-records` 新增查询参数 `human=pending|done`；每条记录新增 `human_verdict`（`violation` / `clean` / null）、`human_category`、`human_level`、`human_by_id`、`human_at`，以及 `teamup_profile_id`、`teamup_comment_id`、`profile_user_id`。
+- `POST /admin/moderation-records/{id}/verdict`，body `{ verdict: "violation" | "clean", category?, level? }` → 更新后的记录。每条记录只能复核一次（重复 409）。
+  - `violation`：`category` 必填，`level` 缺省取类别默认值。内容会被撤回 / 删除，并按阶梯记违规；机器已经罚过同一内容时不重复罚，等级更高则改判。
+  - `clean`：撤销机器因这条记录给出的处罚（记分、禁言、封禁一并回滚）。**已经撤回 / 删除的内容不会自动恢复。**
+
+复核结论同时是评测审核模型用的标注数据，所以即使不需要处罚，也请把误判的记录判成 `clean`。
 
 ## 2. 举报案件（已实现）
 

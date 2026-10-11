@@ -39,7 +39,9 @@ from app.schemas.report import (
 )
 from app.models.penalty import UserViolation
 from app.models.report import AdminAuditLog
+from app.api.v1.moderation import moderation_rules
 from app.schemas.penalty import (
+    ModerationRules,
     AdminAppealReview,
     AdminViolationCreate,
     AdminViolationPage,
@@ -629,6 +631,12 @@ def _penalty_from_input(value: PenaltyInput) -> penalty_service.Penalty:
 
 async def _admin_violation_read(db: AsyncSession, violation: UserViolation) -> AdminViolationRead:
     return AdminViolationRead(**(await penalty_service.build_admin_reads(db, [violation]))[0])
+
+
+@router.get("/moderation/rules", response_model=ModerationRules)
+async def admin_moderation_rules(_admin: Annotated[User, Depends(get_current_admin)]) -> ModerationRules:
+    # 后台不带客户端证明头，过不了 /api/v1/moderation/rules 前面的 request_guard，这里给一个等价入口。
+    return await moderation_rules()
 
 
 @router.get("/violations", response_model=AdminViolationPage)
