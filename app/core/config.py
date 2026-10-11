@@ -43,6 +43,8 @@ class Settings(BaseSettings):
     # 默认关闭；启用时必须同时提供 CONTENT_MODERATION_URL。
     content_moderation_enabled: bool = False
     content_moderation_url: str | None = None
+    # 审核服务的共享密钥，随请求放在 X-Moderation-Token 头里。留空则不带。
+    content_moderation_token: str | None = None
     content_moderation_timeout_seconds: int = Field(default=30, ge=1, le=120)
     content_moderation_retry_interval_seconds: int = Field(default=300, ge=10, le=86400)
     content_moderation_retry_min_age_seconds: int = Field(default=120, ge=0, le=86400)

@@ -96,7 +96,7 @@ class ContentModerationRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
     acted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # 人工复核结论：violation / clean。既是模型拿不准时的最终裁决，也是评测模型用的标注。
-    human_verdict: Mapped[str | None] = mapped_column(String(12), nullable=True, index=True)
+    human_verdict: Mapped[str | None] = mapped_column(String(12), nullable=True)
     human_category: Mapped[str | None] = mapped_column(String(40), nullable=True)
     human_level: Mapped[int | None] = mapped_column(Integer, nullable=True)
     human_by_id: Mapped[int | None] = mapped_column(Integer, nullable=True)

@@ -804,12 +804,10 @@ def _post_json(path: str, payload: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError("CONTENT_MODERATION_URL 未配置，无法调用内容审核服务")
     base_url = settings.content_moderation_url.rstrip("/")
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    request = Request(
-        f"{base_url}{path}",
-        data=data,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
+    headers = {"Content-Type": "application/json"}
+    if settings.content_moderation_token:
+        headers["X-Moderation-Token"] = settings.content_moderation_token
+    request = Request(f"{base_url}{path}", data=data, headers=headers, method="POST")
     try:
         with urlopen(request, timeout=settings.content_moderation_timeout_seconds) as response:
             body = response.read().decode("utf-8")
@@ -1295,11 +1293,22 @@ _LEGACY_TEXT_CATEGORIES: tuple[tuple[str, str, int], ...] = (
 _RULE_MODELS = {"rules-first", "kukechat-local-safety", "fast-safe-rules"}
 
 
+def _raw_result(record: ContentModerationRecord) -> dict[str, Any]:
+    """审核服务对这条内容的原始结论。统一入口 /moderate 把各类型的结论包在 results 里。"""
+    raw = _json_object(record.raw_response)
+    results = raw.get("results")
+    if isinstance(results, list):
+        for item in results:
+            if isinstance(item, dict) and item.get("type") == record.content_type:
+                return item
+    return raw
+
+
 def _verdict_for_record(record: ContentModerationRecord) -> tuple[str, int] | None:
     """返回这条审核记录对应的 (违规类别, 等级)；None 表示不构成违规认定。"""
     if record.decision != "block":
         return None
-    raw = _json_object(record.raw_response)
+    raw = _raw_result(record)
     category, level = raw.get("category"), raw.get("level")
     if isinstance(category, str) and category in penalty_service.CATEGORIES and isinstance(level, int) and not isinstance(level, bool):
         return category, max(0, min(4, level))
@@ -1324,7 +1333,7 @@ def _verdict_for_record(record: ContentModerationRecord) -> tuple[str, int] | No
 def _violation_source(record: ContentModerationRecord) -> str:
     if record.content_type == "image":
         return "auto_image"
-    model = _json_object(record.raw_response).get("model")
+    model = _raw_result(record).get("model")
     return "auto_rule" if model in _RULE_MODELS else "auto_ai"
 
 

@@ -313,6 +313,11 @@ async def init_db() -> None:
 
             for table_name, index_name, index_sql in (
                 (
+                    "user_reports",
+                    "ix_user_reports_case_id",
+                    "CREATE INDEX ix_user_reports_case_id ON user_reports (case_id)",
+                ),
+                (
                     "messages",
                     "ix_messages_conversation_id_id",
                     "CREATE INDEX ix_messages_conversation_id_id ON messages (conversation_id, id)",

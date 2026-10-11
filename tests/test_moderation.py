@@ -98,6 +98,11 @@ class VerdictMappingTests(unittest.TestCase):
         record.raw_response = '{"category": "not-a-category", "level": 4}'
         self.assertEqual(_verdict_for_record(record), ("sexual", 3))
 
+    def test_verdict_is_read_from_unified_endpoint_envelope(self) -> None:
+        record = _record("image", "block", 2)
+        record.raw_response = '{"decision": "block", "results": [{"type": "image", "category": "suggestive", "level": 1}]}'
+        self.assertEqual(_verdict_for_record(record), ("suggestive", 1))
+
     def test_source_reflects_who_judged(self) -> None:
         rule = _record("text", "block", 2)
         rule.raw_response = '{"model": "rules-first"}'
