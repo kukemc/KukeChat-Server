@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -63,10 +63,20 @@ class ReportCase(Base):
     violation_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # 作为风纪委员的质控题：结论已由管理员给出，混在正常案件里发给委员
     is_golden: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    # 题库（is_golden 表示在题库里）。已核对的题才用于入门考试和评审中的质控计分，未核对的只用于练习
+    golden_verified: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    # 在题库里：admin（管理员标注）/ consensus（委员一致通过后自动入库）/ legacy（上线前回填，为空也按它算）。
+    # 不在题库里：removed（管理员移出，不再自动入库）/ excluded（自动入库检查过，不符合条件）/ 空
+    golden_source: Mapped[str | None] = mapped_column(String(12), nullable=True)
+    golden_explanation: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 管理员改过的标准答案：violation / clean、等级、类别。为空取案件自身的结论
+    golden_outcome: Mapped[str | None] = mapped_column(String(12), nullable=True)
+    golden_level: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    golden_category: Mapped[str | None] = mapped_column(String(40), nullable=True)
 
     # 进入委员队列的时间：超时从这里算起，不被后续举报重置。为空表示从没进过委员队列
     queued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    # 离开委员队列的方式：consensus（委员定案）/ no_consensus / timeout / manual（管理员接手）
+    # 离开委员队列的方式：consensus（委员定案）/ no_consensus / need_context（上下文不足）/ timeout / manual（管理员接手）
     jury_outcome: Mapped[str | None] = mapped_column(String(16), nullable=True)
     escalated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # 不能交给委员的原因，目前只有 sensitive（色情低俗 / 涉未成年类）
@@ -108,9 +118,24 @@ class JuryMember(Base):
     golden_total: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     golden_correct: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
 
+    # 风纪值总分，明细在 jury_point_logs
+    points: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # 本人是否选择公开展示委员身份；对外展示的结果冗余在 users.jury_badge
+    badge_visible: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    # 本次任职的开始时间（任命 / 复职时写入），晋升条件里的「在任天数」从这里算
+    serving_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 连续参与天数（UTC+8 自然日）和最近一次参与是哪天
+    streak_days: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    streak_last_day: Mapped[date | None] = mapped_column(Date, nullable=True)
+    # 弃权过多被暂停发案到什么时候
+    cooldown_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 距上一道质控题投了几张票；在质控题上回避后下一件强制补一道
+    votes_since_quality: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    force_quality: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+
 
 class JuryVote(Base):
-    """一行 = 一次分配。vote 为空表示已分配但还没投。"""
+    """一行 = 一次分配。vote 为空表示已分配但还没投；主动回避的 vote 是 recuse、voted_at 仍为空。"""
 
     __tablename__ = "jury_votes"
     __table_args__ = (
@@ -121,8 +146,10 @@ class JuryVote(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     case_id: Mapped[int] = mapped_column(ForeignKey("report_cases.id", ondelete="CASCADE"), index=True)
     juror_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
-    # none（不违规）/ l1 / l2 / l3 / abstain（看不懂）
+    # none（不违规）/ l1 / l2 / l3 / abstain（看不懂）/ need_context（上下文不足）/ recuse（主动回避）
     vote: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    # 违规票可以带的类别；没带为空
+    category: Mapped[str | None] = mapped_column(String(40), nullable=True)
     note: Mapped[str | None] = mapped_column(Text, nullable=True)
     assigned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     voted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -132,6 +159,8 @@ class JuryVote(Base):
     alias: Mapped[str | None] = mapped_column(String(12), nullable=True)
     # 这次分配是不是质控题。不能用「案件 is_golden 且已结」去猜：真实案件被管理员结案后也会变成 is_golden
     is_quality_check: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    # 主动回避的时间。回避不算投票（voted_at 保持为空），这一行留着是为了不再把同一个案件分给他
+    recused_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class JuryOpinion(Base):
@@ -182,3 +211,94 @@ class JuryOpinionReport(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     handled_by_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     handled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class JuryPointLog(Base):
+    """风纪值流水。总分汇总在 jury_members.points，加减分一律走 jury_points.award。"""
+
+    __tablename__ = "jury_point_logs"
+    __table_args__ = (
+        Index("ix_jury_point_logs_user_created", "user_id", "created_at"),
+        Index("ix_jury_point_logs_user_kind_case", "user_id", "kind", "case_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    # vote_agreed / vote_disagreed / quality_correct / quality_wrong / daily_first / streak_7 /
+    # opinion_liked / exam_passed / overturn_adjust / admin_adjust
+    kind: Mapped[str] = mapped_column(String(24))
+    # 实际变动的分值：总分不会低于 0，扣到 0 为止
+    points: Mapped[int] = mapped_column(Integer)
+    case_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # 同一个案件里还要再区分时用：daily_first / streak_7 是日期序数，opinion_liked 是观点 id
+    ref_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # 管理员调整时写的说明
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class JuryAchievement(Base):
+    """已获得的成就。定义在 jury_points.ACHIEVEMENTS，进度实时算，这里只存获得时间。"""
+
+    __tablename__ = "jury_achievements"
+    __table_args__ = (UniqueConstraint("user_id", "key", name="uq_jury_achievements_user_key"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    key: Mapped[str] = mapped_column(String(24))
+    earned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class JuryExamAttempt(Base):
+    """入门考试的一场。服务端不保存作答草稿，交卷时一次写入。"""
+
+    __tablename__ = "jury_exam_attempts"
+    __table_args__ = (Index("ix_jury_exam_attempts_user_started", "user_id", "started_at"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    # 交卷时间；超时未交的在结算时记成截止时间。为空表示还在进行中
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 题目的案件 id 列表（JSON），下标 + 1 就是给考生看的题号
+    question_ids: Mapped[str] = mapped_column(Text)
+    # 作答（JSON：题号 -> vote）
+    answers: Mapped[str | None] = mapped_column(Text, nullable=True)
+    score: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    total: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    passed: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    # 超时未交，按 0 分记了一次
+    timed_out: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+
+
+class JuryPracticeAnswer(Base):
+    """练习场的一次作答。不计入一致率，不给风纪值。"""
+
+    __tablename__ = "jury_practice_answers"
+    __table_args__ = (
+        Index("ix_jury_practice_answers_user_created", "user_id", "created_at"),
+        Index("ix_jury_practice_answers_user_case", "user_id", "case_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    case_id: Mapped[int] = mapped_column(ForeignKey("report_cases.id", ondelete="CASCADE"))
+    vote: Mapped[str] = mapped_column(String(10))
+    correct: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class JuryNotification(Base):
+    """给委员本人的系统通知：晋升、降级、被系统暂停、任期届满未能续任。通知中心从这里读。"""
+
+    __tablename__ = "jury_notifications"
+    __table_args__ = (Index("ix_jury_notifications_user_created", "user_id", "created_at"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    # promoted / demoted / suspended / term_expired
+    kind: Mapped[str] = mapped_column(String(24))
+    title: Mapped[str] = mapped_column(String(120))
+    body: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)

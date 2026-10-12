@@ -17,8 +17,9 @@ from app.core.config import settings
 from app.models.report import AdminAuditLog
 from app.models.system import SystemSetting
 
-# 前三个会改变「谁能处罚用户」，一期只存取、不产生行为；后两个一期就生效。
-SWITCHES: tuple[str, ...] = ("auto_appoint", "appeals", "machine_review", "public_group_content", "opinions_open_to_jurors")
+# 前三个会改变「谁能处罚用户」：auto_appoint 二期起生效（通过考试直接任命），另两个三期才产生行为。
+# exam_required：申请是否必须先通过入门考试。默认关 —— 已发布的旧客户端没有考试入口。
+SWITCHES: tuple[str, ...] = ("auto_appoint", "appeals", "machine_review", "public_group_content", "opinions_open_to_jurors", "exam_required")
 PUBLIC_SWITCHES: tuple[str, ...] = ("auto_appoint", "appeals", "machine_review")
 _KEY_PREFIX = "jury.switch."
 # 服务跑两个 worker 进程，另一个进程改了开关后最多这么久才能看到。
@@ -103,4 +104,52 @@ def thresholds() -> dict[str, int | float]:
         "opinions_per_minute": settings.jury_opinions_per_minute,
         "opinions_per_day": settings.jury_opinions_per_day,
         "opinion_auto_hide_reports": settings.jury_opinion_auto_hide_reports,
+        # 二期
+        "severe_min_votes": settings.jury_severe_min_votes,
+        "need_context_votes": settings.jury_need_context_votes,
+        "quality_min_gap": settings.jury_quality_min_gap,
+        "quality_max_gap": settings.jury_quality_max_gap,
+        "recuse_daily_limit": settings.jury_recuse_daily_limit,
+        "abstain_window": settings.jury_abstain_window,
+        "abstain_min_votes": settings.jury_abstain_min_votes,
+        "abstain_warn_rate": settings.jury_abstain_warn_rate,
+        "abstain_cooldown_rate": settings.jury_abstain_cooldown_rate,
+        "abstain_cooldown_hours": settings.jury_abstain_cooldown_hours,
+        "warning_margin": settings.jury_warning_margin,
+        "warning_sample_ratio": settings.jury_warning_sample_ratio,
+        "points_vote_agreed": settings.jury_points_vote_agreed,
+        "points_vote_disagreed": settings.jury_points_vote_disagreed,
+        "points_quality_correct": settings.jury_points_quality_correct,
+        "points_quality_wrong": settings.jury_points_quality_wrong,
+        "points_daily_first": settings.jury_points_daily_first,
+        "points_streak_7": settings.jury_points_streak_7,
+        "points_opinion_liked": settings.jury_points_opinion_liked,
+        "points_exam_passed": settings.jury_points_exam_passed,
+        "points_overturn_adjust": settings.jury_points_overturn_adjust,
+        "opinion_like_reward_threshold": settings.jury_opinion_like_reward_threshold,
+        "regular_votes_settled": settings.jury_regular_votes_settled,
+        "regular_agreement_rate": settings.jury_regular_agreement_rate,
+        "regular_quality_rate": settings.jury_regular_quality_rate,
+        "regular_quality_min": settings.jury_regular_quality_min,
+        "regular_days_served": settings.jury_regular_days_served,
+        "regular_demote_rate": settings.jury_regular_demote_rate,
+        "senior_votes_settled": settings.jury_senior_votes_settled,
+        "senior_agreement_rate": settings.jury_senior_agreement_rate,
+        "senior_quality_rate": settings.jury_senior_quality_rate,
+        "senior_quality_min": settings.jury_senior_quality_min,
+        "senior_days_served": settings.jury_senior_days_served,
+        "senior_demote_rate": settings.jury_senior_demote_rate,
+        "demote_window": settings.jury_demote_window,
+        "demote_min_votes": settings.jury_demote_min_votes,
+        "exam_total": settings.jury_exam_total,
+        "exam_pass_score": settings.jury_exam_pass_score,
+        "exam_time_limit_minutes": settings.jury_exam_time_limit_minutes,
+        "exam_grace_seconds": settings.jury_exam_grace_seconds,
+        "exam_attempts_max": settings.jury_exam_attempts_max,
+        "exam_window_days": settings.jury_exam_window_days,
+        "exam_retry_hours": settings.jury_exam_retry_hours,
+        "exam_valid_days": settings.jury_exam_valid_days,
+        "practice_daily_limit": settings.jury_practice_daily_limit,
+        "golden_consensus_votes": settings.jury_golden_consensus_votes,
+        "golden_delay_hours": settings.jury_golden_delay_hours,
     }

@@ -21,6 +21,7 @@ from app.models.case import JuryMember, JuryOpinion, JuryOpinionLike, JuryOpinio
 from app.models.report import AdminAuditLog
 from app.models.user import User
 from app.services import jury as jury_service
+from app.services import jury_points as points_service
 from app.services import jury_settings
 from app.services import penalties as penalty_service
 
@@ -54,10 +55,11 @@ async def _reader(db: AsyncSession, user: User, case_id: int) -> tuple[ReportCas
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"code": "case_not_found", "message": "案件不存在"})
     vote = await jury_service.my_vote(db, user.id, case_id)
     if vote is None:
-        # 开关打开后，已定案案件的观点区对所有在任委员只读；和这个案件有回避关系的仍然不行。
+        # 开关打开后，已定案案件的观点区对所有在任委员只读；和这个案件有回避关系的（包括自己主动回避过的）仍然不行。
         if (
             case.status != "open"
             and case.jury_eligible
+            and not await jury_service.has_recused(db, user.id, case_id)
             and await jury_settings.is_enabled(db, "opinions_open_to_jurors")
             and jury_service._is_serving(await jury_service.get_member(db, user.id))
             and not await jury_service._has_conflict(db, user.id, case)
@@ -276,6 +278,12 @@ async def set_like(db: AsyncSession, user: User, opinion_id: int, liked: bool) -
         # 同一个人的两次点赞同时到达：另一次已经记上了。
         await db.rollback()
     await db.refresh(opinion)
+    if liked:
+        # 赞数第一次达到阈值时给作者加一次风纪值，顺带看看「获赞」的成就；之后取消赞不扣。
+        await points_service.reward_opinion_like(db, opinion)
+        await points_service.check_achievements(db, opinion.author_id)
+        await db.commit()
+        await points_service.flush_events(db)
     return {"id": opinion.id, "like_count": opinion.like_count, "liked": liked}
 
 

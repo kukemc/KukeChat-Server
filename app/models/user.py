@@ -70,6 +70,9 @@ class User(Base):
     # 别人戳我时用的动作（预设里的一个字）和接在我名字后面的文案
     poke_action: Mapped[str] = mapped_column(String(4), default="戳", server_default="戳")
     poke_suffix: Mapped[str] = mapped_column(String(32), default="", server_default="")
+    # 对外展示的风纪委员层级（trainee / regular / senior）。冗余自 jury_members：只有在任且本人选择公开时有值，
+    # 由 jury_points.sync_badge 维护。用户对象出现在消息发送等热路径上，序列化时不能再去查 jury_members
+    jury_badge: Mapped[str | None] = mapped_column(String(12), nullable=True)
     registration_ip: Mapped[str | None] = mapped_column(String(45), unique=True, index=True, nullable=True)
     last_login_ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

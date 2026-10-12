@@ -25,7 +25,7 @@
 7. **「定案前只显示已有 N 票」里的 N 不含弃权**，避免从数字变化反推别人投了什么。
 8. **72 小时超时改成后台定时执行**，从进入委员队列算起，不被新举报重置（原来只在管理员打开后台案件页时才触发，且每来一条举报就重新计时）。案件记录转出原因和时间。
 9. **入门考试默认不是申请的硬条件**（`exam_required` 默认关）。已发布的客户端没有考试入口，硬性要求会让它们的「申请」按钮直接失效。没考试的申请照旧进审批队列，后台标「未考试」；通过考试的在 `auto_appoint` 打开时直接任命。
-10. **自动入库的题视为已核对。** 全票一致（有效票 ≥ 4）的案件自动进题库并可用于考试和质控；否则题库只能靠管理员一道道核对。上线前回填的 35 道历史题仍是未核对。
+10. **自动入库的题视为已核对。** 全票一致（有效票 ≥ 3）的案件自动进题库并可用于考试和质控；否则题库只能靠管理员一道道核对。上线前回填的 35 道历史题仍是未核对。
 11. **考试题不带案件编号，且不出公示栏里能看到内容的案件**，否则可以去公示栏查答案。
 12. **层级只因一致率低而降，不因数量不够而降**，这样管理员直接任命的创始委员不会被立刻打回见习。
 13. **进合议要先确认凑得齐人。** 无共识、上下文不足、超时的案件都先尝试资深合议，但只有此刻确实有 3 位可参加的资深委员时才进，否则直接转管理员；合议 48 小时没结果也转管理员。这样超时案件不会因为「本来就没人能审」而白等一轮。
@@ -196,6 +196,8 @@
 - 定案前 `tally`、`verdict` 都是 null，只有 `votes_cast`。
 - **质控题**：`is_quality_check: true`，投完立刻 `stage: "closed"`、`verdict` 是标准结论、`tally` 为 null、`votes_cast` 为 0、`opinions_enabled: false`。客户端应当明确告诉委员「这是一道质控题」并展示标准结论和 `my_vote.agreed`。
 - `my_vote.agreed` 在改判后会跟着变。
+- 质控题不分配代号，`my_vote.alias` 为 null。
+- 内容保留期从「定案时间」和「我投票的时间」里较晚的那个算起（质控题是早就定案的案件）。
 
 ### 1.6 观点区
 
@@ -203,7 +205,7 @@
 
 **列表** `GET /jury/cases/{case_id}/opinions` → `{ "items": Opinion[], "total": 7 }`
 
-一次返回全部（一个案件最多 7 个参与者，量很小），按时间正序；回复挂在所属的那条观点下面，只有一层。
+一次返回全部（一个案件最多 7 个参与者，量很小），按时间正序；回复挂在所属的那条观点下面，只有一层。`total` 是未删除的观点数（含回复、含被折叠的）。已删除的回复不出现；已删除的根观点只在下面还有回复时留一个占位（`state: "deleted"`、`content: null`，`mine` 等字段照常给）。
 
 ```jsonc
 {
@@ -287,6 +289,10 @@
 ```
 
 从没当过委员的人调这两个接口：`/jury/votes` 返回空列表，`/jury/me/stats` 返回全 0。
+
+- 三个比率在分母为 0 时给 0，不是 null（`/jury/me.stats.agreement_rate` 仍是 null，没动）；要判断「还没有数据」请看对应的 `*_total` / `votes_settled`。
+- `trend` 的 `votes` 含质控题，`settled` / `agreed` 不含（与一致率同口径）。
+- 查询参数留空（`state=&agreed=`）等同于不筛选。
 
 ### 1.8 公示栏
 
@@ -398,7 +404,7 @@
 题库里的一道题 = 一个已经有结论的案件（内容是匿名的案件快照）。来源有两个：
 
 - 管理员在后台标注（可以写说明、改标准答案）。
-- 自动入库：委员一致通过（有效票 ≥ 4 且全票一致）、定案满 72 小时、没有被改判、没有待处理申诉的案件。
+- 自动入库：委员全票一致通过（有效票 ≥ 3）、定案满 72 小时、没有被改判、没有待处理申诉的案件。有分歧的（比如 4 比 1）不入库。
 
 不入库的：涉及私聊的、色情 / 涉未成年 / 隐私类别的、公示栏里会展示内容的（公开动态且认定违规——否则考试可以去公示栏查答案）。
 
@@ -417,7 +423,7 @@
 | `points` | 风纪值；没当过委员为 0 |
 | `tier_progress` | 见 2.6；不是在任委员为 null |
 | `badge_visible` | 是否公开展示委员身份 |
-| `warnings` | `[{ code, message }]`，如 `high_abstain` |
+| `warnings` | `[{ code, message, current, threshold, sample }]`，后三个可能为 null。`code` ∈ `high_abstain`（弃权偏多）/ `demote_risk`（最近的一致率接近或低于降级线）/ `suspend_risk`（一致率或质控正确率接近或低于暂停线）。`current` 是服务端实际用来判断的那个数（比如最近 30 张已结票的一致率），`sample` 是它的样本数。客户端直接展示，不要自己估算 |
 | `cooldown_until` | 弃权过多被暂停发案到什么时候；没有则为 null |
 | `recuse_left_today` | 今天还能主动回避几次 |
 
@@ -480,9 +486,11 @@
 
 满足四项资格的用户、以及当过委员的人都可以练习。不计入一致率，不给风纪值。
 
-`GET /jury/practice/next` → `{ "question": PracticeQuestion | null, "left_today": 17, "daily_limit": 20, "stats": { "answered": 34, "correct": 29 } }`
+`GET /jury/practice/next` → `{ "question": PracticeQuestion | null, "left_today": 17, "daily_limit": 20, "stats": { "answered": 34, "correct": 29 }, "round": { "total": 42, "done": 30 } }`
 
-`PracticeQuestion` = `JuryCaseView` 的内容字段 + `question_id` + `verified`（是否已核对）。没做过的题优先；都做过后按「最久没做」的顺序重出。题库为空时 `question: null`。
+`round.total` 是题库里我能练的题数，`round.done` 是其中我做过的（不重复计）；`done == total` 说明这一轮做完了，之后出的都是重做的题。
+
+`PracticeQuestion` = `JuryCaseView` 的内容字段 + `question_id` + `verified`（是否已核对）+ `answered_before`（我以前做过这道题）。受处罚期间（`restriction` 有值）也可以练习，服务端不拦。没做过的题优先；都做过后按「最久没做」的顺序重出。题库为空时 `question: null`。
 
 `POST /jury/practice/{question_id}/answer`，body `{ "vote": "none" | "l1" | "l2" | "l3" }` →
 
@@ -542,7 +550,7 @@
                       { "kind": "daily_first", "points": 2, "label": "今日首票" }] }
 ```
 
-案件定案时的加分通过实时事件 `jury.points.changed` 通知：`{ delta, total, kind, case_id }`。案件详情的 `my_vote` 新增 `points`（这个案件累计给了我多少分）。
+案件定案时的加分通过实时事件 `jury.points.changed` 通知：`{ delta, total, kind, label, case_id }`。`label` 是可以直接显示的文字，以后新增 kind 时客户端不用跟着改。案件详情的 `my_vote` 新增 `points`（这个案件累计给了我多少分）。
 
 `GET /jury/me/points?limit=20&offset=0` → `{ "total": 142, "items": [{ "kind", "label", "points", "case_id", "created_at" }], "count": 57 }`，明细按时间倒序。
 
@@ -588,7 +596,8 @@
     { "rank": 2, "points": 71, "tier": "regular", "votes": 11, "me": true,
       "user": null }                             // 没公开的显示为「匿名委员」；me 为 true 时客户端可显示「我」
   ],
-  "me": { "rank": 2, "points": 71 },             // 不是委员或本期没有得分时为 null
+  "me": { "rank": 2, "points": 71, "tier": "regular", "votes": 11, "me": true, "user": null },
+                                                 // 和榜单行同形；不是委员或本期没有得分时为 null
   "generated_at": "…"
 }
 ```
@@ -605,7 +614,7 @@
 
 | 事件 | data | 发给谁 |
 | --- | --- | --- |
-| `jury.points.changed` | `{ delta, total, kind, case_id }` | 本人 |
+| `jury.points.changed` | `{ delta, total, kind, label, case_id }` | 本人 |
 | `jury.achievement.earned` | `{ key, label }` | 本人 |
 | `jury.status.changed` | `{}` | 本人。晋升、降级、暂停、续任、任期届满也会发 |
 
@@ -636,7 +645,9 @@
   "hall": {
     "title_max": 60, "content_max": 5000, "comment_max": 1000,
     "posts_per_day": 3, "comments_per_day": 50,
-    "vote_days": 7, "quorum_ratio": 0.3, "quorum_min": 3, "pass_ratio": 0.667,
+    "vote_days": 7, "quorum_ratio": 0.3, "quorum_min": 3,
+    // 通过线：服务端按整数比较 yes × pass_den >= (yes + no) × pass_num，恰好 2/3 算通过；pass_ratio 只是给展示用的近似值
+    "pass_num": 2, "pass_den": 3, "pass_ratio": 0.6667,
     "guidelines": "……",                                          // 要展示的守则，纯文本，含换行
     "report_reasons": ["人身攻击", "讨论未结案件", "泄露身份或隐私", "与风纪无关", "其他"]
   }
@@ -741,7 +752,7 @@
 - 限量：每天进队列的上限 = 在任委员数 × 2（至少 5），到上限后当天不再收。
 - 排在所有真实举报的案件后面。
 - 这类案件超时或无共识时不转管理员：有资深委员就进合议，否则直接以「未作处理」结案，不记任何处罚。
-- 委员看到的 `JuryCaseView`（以及 `PanelCaseView`、`JuryCaseDetail`）新增 `case_origin`：`report` / `machine`。机器来源的案件 `report_count` 为 0，`reasons` 是一项 `{ "reason": "机器筛查 · 辱骂骚扰", "count": 1 }`。
+- 委员看到的 `JuryCaseView`（以及 `PanelCaseView`、`JuryCaseDetail`、公示栏的条目和详情）新增 `case_origin`：`report` / `machine`。机器来源的案件 `report_count` 为 0，`reasons` 是一项 `{ "reason": "机器筛查 · 辱骂骚扰", "count": 1 }`。
 - 认定违规后和举报案件一样：撤回内容、按阶梯处罚、进公示栏（群聊消息不带内容）。
 
 ### 3.4 判例
@@ -804,11 +815,12 @@
   "status": "open",                           // open / passed / rejected / adopted / declined / closed
   "pinned": false,
   "vote": { "yes": 6, "no": 2, "ends_at": "…", "my_vote": "yes", "can_vote": true,
-            "quorum": 4, "pass_ratio": 0.667 },   // 非提案为 null
+            "quorum": 4, "pass_num": 2, "pass_den": 3 },   // 非提案为 null；quorum 是这个提案需要的最少表决人数
   "admin_note": null,
   "comment_count": 12,
   "can_comment": true, "mine": false,
   "can_edit": false, "can_delete": false,      // 作者本人才可能为 true；提案有人表决后 can_edit 为 false
+  "reported": false,                           // 我是否举报过
   "created_at": "…", "updated_at": "…"
 }
 ```
@@ -820,7 +832,7 @@
 | `PUT /jury/hall/posts/{id}` | 作者本人；提案有人表决后不能再改 |
 | `DELETE /jury/hall/posts/{id}` | 作者本人 |
 | `POST /jury/hall/posts/{id}/vote` | `{ vote: "yes" \| "no" }` → `HallPost` |
-| `GET /jury/hall/posts/{id}/comments?limit&offset` | `{ items: HallComment[], total }`。**平铺**、时间正序（所以根评论一定排在它的回复前面），用 `parent_id` 归组；`HallComment`：`{ id, parent_id, author, author_tier, content, state, mine, created_at, reply_to: UserPublic \| null }`，回复只有一层；`state` 取值同观点区（visible / deleted / hidden），非 visible 时 `content` 为 null |
+| `GET /jury/hall/posts/{id}/comments?limit&offset` | `{ items: HallComment[], total }`。**平铺**、时间正序（所以根评论一定排在它的回复前面），用 `parent_id` 归组；`HallComment`：`{ id, parent_id, author, author_tier, content, state, mine, reported, created_at, reply_to: UserPublic \| null }`，回复只有一层；`state` 取值同观点区（visible / deleted / hidden），非 visible 时 `content` 为 null |
 | `POST /jury/hall/posts/{id}/comments` | `{ content: "≤1000 字", parent_id? }` |
 | `DELETE /jury/hall/comments/{id}` | 作者本人 |
 | `POST /jury/hall/reports` | `{ target_type: "post" \| "comment", target_id, reason, details? }`；理由列表在 `config.hall.report_reasons`。任何登录用户都可以举报；重复举报 409 `already_reported`；举报自己的 400 `cannot_report_own` |

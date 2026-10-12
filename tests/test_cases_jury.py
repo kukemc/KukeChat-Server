@@ -35,7 +35,11 @@ class TallyTests(unittest.TestCase):
         self.assertIsNone(tally(["l2", "l2"]))
 
     def test_level_is_lower_median_of_violation_votes(self) -> None:
-        self.assertEqual(tally(["l1", "l3", "l3"]), ("violation", 3))
+        # 二期：按现有票会定成严重违规（l3）但有效票不足 5 张时先不定案，到 5 张再按原规则表决
+        self.assertIsNone(tally(["l1", "l3", "l3"]))
+        self.assertIsNone(tally(["l1", "l3", "l3", "l3"]))
+        self.assertEqual(tally(["l1", "l3", "l3", "l3", "l3"]), ("violation", 3))
+        self.assertEqual(tally(["l1", "l3", "l3", "l3", "none"]), ("violation", 3))
         self.assertEqual(tally(["l1", "l1", "l3"]), ("violation", 1))
         self.assertEqual(tally(["l1", "l2", "l2", "l3", "none"]), ("violation", 2))
 
@@ -279,9 +283,10 @@ class CaseAndJuryTests(unittest.IsolatedAsyncioTestCase):
         async with self.sessions() as db:
             report = await self._report(db, "alice", self.group_message_id)
             case = await case_service.resolve_case(db, report.case_id, source="admin", actor_id=self.ids["admin"], upheld=True, category="harassment")
-            case.is_golden = True
+            # 二期：评审中的质控题只出已核对的；位置随机，隔了太多张没出才强制出
+            case.is_golden, case.golden_verified = True, True
             member = await jury_service.get_member(db, self.ids["juror1"])
-            member.votes_total = jury_service.GOLDEN_EVERY - 1
+            member.votes_since_quality = jury_service.QUALITY_MAX_GAP + 1
             member.golden_total, member.golden_correct = 4, 2
             await db.commit()
 

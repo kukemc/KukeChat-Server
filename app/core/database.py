@@ -218,6 +218,24 @@ async def init_db() -> None:
                 ("report_cases", "overturned_at", "overturned_at DATETIME"),
                 ("report_cases", "overturned_by_id", "overturned_by_id INTEGER"),
                 ("report_cases", "overturn_note", "overturn_note TEXT"),
+                # 风纪 v2 二期
+                ("users", "jury_badge", "jury_badge VARCHAR(12)"),
+                ("report_cases", "golden_verified", "golden_verified BOOLEAN NOT NULL DEFAULT 0"),
+                ("report_cases", "golden_source", "golden_source VARCHAR(12)"),
+                ("report_cases", "golden_explanation", "golden_explanation TEXT"),
+                ("report_cases", "golden_outcome", "golden_outcome VARCHAR(12)"),
+                ("report_cases", "golden_level", "golden_level INTEGER"),
+                ("report_cases", "golden_category", "golden_category VARCHAR(40)"),
+                ("jury_members", "points", "points INTEGER NOT NULL DEFAULT 0"),
+                ("jury_members", "badge_visible", "badge_visible BOOLEAN NOT NULL DEFAULT 0"),
+                ("jury_members", "serving_since", "serving_since DATETIME"),
+                ("jury_members", "streak_days", "streak_days INTEGER NOT NULL DEFAULT 0"),
+                ("jury_members", "streak_last_day", "streak_last_day DATE"),
+                ("jury_members", "cooldown_until", "cooldown_until DATETIME"),
+                ("jury_members", "votes_since_quality", "votes_since_quality INTEGER NOT NULL DEFAULT 0"),
+                ("jury_members", "force_quality", "force_quality BOOLEAN NOT NULL DEFAULT 0"),
+                ("jury_votes", "category", "category VARCHAR(40)"),
+                ("jury_votes", "recused_at", "recused_at DATETIME"),
             ):
                 if table_name not in table_names:
                     continue
@@ -225,6 +243,15 @@ async def init_db() -> None:
                 existing_columns = {row[1] for row in columns}
                 if column_name not in existing_columns:
                     await conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_sql}"))
+
+            # 风纪二期的存量回填，可重复执行：上线前就在题库里的题算 legacy（未核对）；
+            # 在任委员的「本次任职开始时间」用审批时间补上。
+            if "report_cases" in table_names:
+                await conn.execute(text("UPDATE report_cases SET golden_source = 'legacy' WHERE is_golden = 1 AND golden_source IS NULL"))
+            if "jury_members" in table_names:
+                await conn.execute(
+                    text("UPDATE jury_members SET serving_since = COALESCE(reviewed_at, applied_at) WHERE serving_since IS NULL AND status = 'active'")
+                )
 
             await conn.execute(text("UPDATE users SET presence_status = lower(presence_status) WHERE presence_status IN ('ONLINE', 'AWAY', 'BUSY', 'DND', 'CREATING', 'GAMING', 'CUSTOM')"))
             await conn.execute(text("UPDATE posts SET visibility = lower(visibility) WHERE visibility IN ('PUBLIC', 'FRIENDS', 'PRIVATE')"))

@@ -69,7 +69,7 @@ class CaseRead(BaseModel):
     first_report_id: int | None = None
     created_at: datetime
     closed_at: datetime | None = None
-    # 离开委员队列的方式：consensus / no_consensus / timeout / manual；没进过或还在队列里为 null
+    # 离开委员队列的方式：consensus / no_consensus / need_context / timeout / manual；没进过或还在队列里为 null
     jury_outcome: str | None = None
     # 不能交给委员的原因，目前只有 sensitive
     jury_block_reason: str | None = None
@@ -216,6 +216,47 @@ class JuryRestriction(BaseModel):
     message: str
 
 
+class JuryExamSummary(BaseModel):
+    # false 表示题库里已核对的题不够，暂时不能考
+    available: bool = False
+    passed: bool = False
+    passed_at: datetime | None = None
+    attempts_used: int = 0
+    attempts_max: int
+    # 现在就能考时为 null
+    next_attempt_at: datetime | None = None
+    last_score: int | None = None
+    pass_score: int
+    total: int
+
+
+class JuryTierRequirement(BaseModel):
+    # votes_settled / agreement_rate / quality_rate / days_served
+    key: str
+    label: str
+    # 还没有数据（比如质控题没答够）时为 null
+    current: int | float | None = None
+    target: int | float
+    ok: bool
+    note: str | None = None
+
+
+class JuryTierProgress(BaseModel):
+    # 已是资深时为 null
+    next_tier: str | None = None
+    requirements: list[JuryTierRequirement] = Field(default_factory=list)
+
+
+class JuryWarning(BaseModel):
+    # high_abstain 弃权偏多 / demote_risk 最近的一致率接近或低于降级线 / suspend_risk 一致率或质控正确率接近或低于暂停线
+    code: str
+    message: str
+    # 服务端实际用来判断的那个数、它要比较的线、它的样本数；客户端直接展示，不要自己估算
+    current: float | None = None
+    threshold: float | None = None
+    sample: int | None = None
+
+
 class JuryStatus(BaseModel):
     # none / applied / active / expired / rejected / suspended / retired
     status: str
@@ -232,6 +273,25 @@ class JuryStatus(BaseModel):
     available_cases: int | None = None
     # 在任委员正在受处罚时有值：评审、发观点、点赞都会被拒绝（juror_restricted）
     restriction: JuryRestriction | None = None
+    # —— 二期 ——
+    exam: JuryExamSummary | None = None
+    # 申请是否必须先通过入门考试
+    exam_required: bool = False
+    # 风纪值；没当过委员为 0
+    points: int = 0
+    # 离下一层还差什么；不是在任委员为 null
+    tier_progress: JuryTierProgress | None = None
+    # 是否公开展示委员身份
+    badge_visible: bool = False
+    warnings: list[JuryWarning] = Field(default_factory=list)
+    # 弃权过多被暂停发案到什么时候
+    cooldown_until: datetime | None = None
+    # 今天还能主动回避几次；不是在任委员为 null
+    recuse_left_today: int | None = None
+
+
+class JuryMeSettings(BaseModel):
+    badge_visible: bool | None = None
 
 
 class JuryApply(BaseModel):
@@ -274,6 +334,8 @@ class JuryCaseView(JuryCaseContent):
     # 分到手的时间和让出的时间
     assigned_at: datetime | None = None
     expires_at: datetime | None = None
+    # 投违规票时默认选中的类别：按举报理由映射；映射不到可选类别时为 null
+    suggested_category: str | None = None
 
 
 class JuryNextCase(BaseModel):
@@ -282,8 +344,11 @@ class JuryNextCase(BaseModel):
 
 
 class JuryVoteCreate(BaseModel):
-    vote: Literal["none", "l1", "l2", "l3", "abstain"]
+    # recuse 主动回避 / need_context 上下文不足是二期加的；旧客户端只会发前五种
+    vote: Literal["none", "l1", "l2", "l3", "abstain", "recuse", "need_context"]
     note: str | None = Field(default=None, max_length=500)
+    # 投违规票时可以带类别（config.categories 里的 key）；合法性在服务层校验
+    category: str | None = Field(default=None, max_length=40)
 
 
 class JuryMyVote(BaseModel):
@@ -294,6 +359,10 @@ class JuryMyVote(BaseModel):
     alias: str | None = None
     # 是否与结论一致；未定案或我弃权时为 null
     agreed: bool | None = None
+    # 我投违规票时选的类别
+    category: str | None = None
+    # 这个案件累计给了我多少风纪值
+    points: int = 0
 
 
 class JuryVerdict(BaseModel):
@@ -308,7 +377,7 @@ class JuryVerdict(BaseModel):
     hours: float | None = None
     overturned: bool = False
     overturn_note: str | None = None
-    # 题库里这道题的讲解；只有质控题且管理员写了才有（二期起），一期恒为 null
+    # 题库里这道题的讲解；只有质控题且管理员写了才有
     explanation: str | None = None
 
 
@@ -322,7 +391,7 @@ class JuryCaseDetail(JuryCaseContent):
     stage: Literal["jury", "panel", "admin", "closed"]
     # 已有几张有效票（不含弃权）
     votes_cast: int = 0
-    # 定案后才给：{ none, l1, l2, l3, abstain }
+    # 定案后才给：{ none, l1, l2, l3, abstain, need_context }
     tally: dict[str, int] | None = None
     verdict: JuryVerdict | None = None
     is_quality_check: bool = False
@@ -330,10 +399,26 @@ class JuryCaseDetail(JuryCaseContent):
     opinion_count: int = 0
 
 
+class JuryRewardItem(BaseModel):
+    kind: str
+    points: int
+    label: str
+
+
+class JuryReward(BaseModel):
+    """投票当场结算的风纪值。案件定案时的加分走 jury.points.changed 事件。"""
+
+    points: int = 0
+    total: int = 0
+    items: list[JuryRewardItem] = Field(default_factory=list)
+
+
 class JuryVoteResult(BaseModel):
     case_id: int
     settled: bool
+    # 回避之后看不了这个案件，为 null
     case: JuryCaseDetail | None = None
+    reward: JuryReward | None = None
 
 
 class JuryHistoryItem(BaseModel):
@@ -355,6 +440,17 @@ class JuryMemberRead(JuryStats):
     review_note: str | None = None
     term_ends_at: datetime | None = None
     tier: str = "trainee"
+    # —— 二期 ——
+    points: int = 0
+    # 最近一场考试的分数；没考过为 null（显示「未考试」）
+    exam_score: int | None = None
+    exam_passed_at: datetime | None = None
+    # 「拿不准 + 上下文不足」占全部票的比例 / 回避占全部分配的比例
+    abstain_rate: float = 0
+    recuse_rate: float = 0
+    badge_visible: bool = False
+    # 本次任职到现在多少天；不是在任状态为 0
+    days_served: int = 0
 
 
 class JuryMemberPage(BaseModel):
@@ -363,10 +459,12 @@ class JuryMemberPage(BaseModel):
 
 
 class JuryMemberReview(BaseModel):
-    action: Literal["approve", "reject", "suspend", "retire", "reinstate", "set_tier"]
+    action: Literal["approve", "reject", "suspend", "retire", "reinstate", "set_tier", "adjust_points"]
     note: str | None = Field(default=None, max_length=500)
     # approve / reinstate 时可选（创始任命：直接任命为任意层级）；set_tier 时必填
     tier: Literal["trainee", "regular", "senior"] | None = None
+    # adjust_points 时必填：要增减的风纪值，可以为负（总分扣到 0 为止）
+    points: int | None = Field(default=None, ge=-100000, le=100000)
 
     @model_validator(mode="after")
     def validate_tier(self) -> JuryMemberReview:
@@ -374,4 +472,8 @@ class JuryMemberReview(BaseModel):
             raise ValueError("set_tier 需要指定 tier")
         if self.tier is not None and self.action not in {"approve", "reinstate", "set_tier"}:
             raise ValueError("只有任命、复职和调整层级时可以指定 tier")
+        if self.action == "adjust_points" and not self.points:
+            raise ValueError("adjust_points 需要指定非零的 points")
+        if self.points is not None and self.action != "adjust_points":
+            raise ValueError("只有调整风纪值时可以指定 points")
         return self

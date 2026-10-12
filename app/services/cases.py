@@ -51,6 +51,8 @@ PUBLISH_DELAY_HOURS = settings.jury_publish_delay_hours
 # 委员池里未成年人占多数：这些举报理由 / 机器类别的案件整类只走管理员。
 SENSITIVE_REASONS = {"色情低俗"}
 SENSITIVE_MACHINE_CATEGORIES = {"sexual", "minor_sexual"}
+# 这些类别的案件即使认定违规也不公示内容、也不进题库：隐私类会二次扩散，色情 / 擦边类不适合给未成年人看。
+HIDDEN_CONTENT_CATEGORIES = {"privacy", "sexual", "minor_sexual", "vulgar", "suggestive"}
 # 结论来自这些来源、且有委员真实投过票的案件才可能进公示栏（机器自动结案的不进）。
 PUBLISHABLE_SOURCES = {"jury", "panel", "admin"}
 QUEUE_EVENT_INTERVAL_SECONDS = 30.0
@@ -213,11 +215,19 @@ def _enter_jury_queue(case: ReportCase, now: datetime) -> None:
 
 
 def _leave_jury_queue(case: ReportCase, now: datetime, outcome: str | None) -> None:
-    """outcome 取 no_consensus / timeout / manual；因敏感类别被撤出来的不算委员评审的结果，传 None。"""
+    """outcome 取 no_consensus / need_context / timeout / manual；因敏感类别被撤出来的不算委员评审的结果，传 None。"""
     case.queue = "admin"
     case.jury_outcome = outcome
     case.escalated_at = now
     case.updated_at = now
+
+
+async def escalate_from_jury(db: AsyncSession, case: ReportCase, now: datetime, outcome: str) -> None:
+    """委员没能定案（no_consensus / need_context / timeout）时把案件转出去。调用方负责 commit 和通知。
+
+    「转到哪里」只在这一处决定：现在一律转管理员；三期会改成先尝试资深合议，凑不齐人再转管理员。
+    """
+    _leave_jury_queue(case, now, outcome)
 
 
 async def route_case(db: AsyncSession, case: ReportCase, now: datetime) -> None:
@@ -668,7 +678,7 @@ async def escalate_stale_jury_cases(db: AsyncSession) -> int:
     )
     cases = list(result.scalars().all())
     for case in cases:
-        _leave_jury_queue(case, now, "timeout")
+        await escalate_from_jury(db, case, now, "timeout")
     if cases:
         await db.commit()
         for case in cases:
@@ -702,15 +712,24 @@ async def sweep_jury_queue(db: AsyncSession) -> dict[str, int]:
     return stats
 
 
+async def sweep_jury_housekeeping(db: AsyncSession) -> dict[str, int]:
+    """定时循环里和队列无关的两件事：任期届满的委员续任 / 标记到期，一致通过的案件自动进题库。"""
+    from app.services import jury as jury_service
+    from app.services import jury_bank
+
+    return {"terms": await jury_service.renew_expired_terms(db), "questions": await jury_bank.auto_include(db)}
+
+
 async def _jury_sweep_worker() -> None:
     while True:
-        try:
-            async with AsyncSessionLocal() as db:
-                await sweep_jury_queue(db)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("Jury queue sweep failed")
+        for name, job in (("queue sweep", sweep_jury_queue), ("housekeeping", sweep_jury_housekeeping)):
+            try:
+                async with AsyncSessionLocal() as db:
+                    await job(db)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Jury %s failed", name)
         await asyncio.sleep(settings.jury_sweep_interval_seconds)
 
 
@@ -908,6 +927,14 @@ async def _notify_overturned(db: AsyncSession, case: ReportCase) -> None:
     await _notify_reporters(db, case)
     await _broadcast_admin(case, "overturned")
     await notify_jurors_settled(db, case)
+    await _flush_jury_events(db)
+
+
+async def _flush_jury_events(db: AsyncSession) -> None:
+    """结算票时攒下的风纪值 / 层级 / 成就事件，事务提交之后在这里发出去。"""
+    from app.services import jury_points
+
+    await jury_points.flush_events(db)
 
 
 # ---------------------------------------------------------------- 通知
@@ -976,6 +1003,7 @@ async def notify_case_closed(db: AsyncSession, case: ReportCase) -> None:
     await _notify_reporters(db, case)
     await _broadcast_admin(case, "closed")
     await notify_jurors_settled(db, case)
+    await _flush_jury_events(db)
     if case.queue == "jury":
         await notify_jury_queue_changed(db)
 
@@ -1182,7 +1210,9 @@ async def backfill_cases(db: AsyncSession) -> dict[str, int]:
             case.closed_at = first.reviewed_at or now
             # 管理员明确处置过（或明确驳回）的历史案件，直接作为风纪委员的质控题库。
             decisive = (upheld and (first.action or "none") != "none") or (not upheld and first.reviewer_id is not None)
+            # 这样回填进题库的题来源记 legacy，默认未核对：只用于练习，核对之后才用于考试和质控。
             case.is_golden = bool(case.jury_eligible and decisive)
+            case.golden_source = "legacy" if case.is_golden else None
             stats["cases_closed"] += 1
             continue
         handled = False

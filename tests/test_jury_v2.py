@@ -36,6 +36,7 @@ from app.services import cases as case_service
 from app.services import jury as jury_service
 from app.services import jury_opinions as opinion_service
 from app.services import jury_overview as overview_service
+from app.services import jury_points as points_service
 from app.services import jury_settings
 from app.services import moderation as moderation_service
 from app.services import penalties as penalty_service
@@ -51,6 +52,7 @@ class JuryV2TestCase(unittest.IsolatedAsyncioTestCase):
         asyncio.get_running_loop().set_debug(False)
         jury_settings.reset_cache()
         overview_service.reset_overview_cache()
+        points_service.reset_leaderboard_cache()
         case_service._last_queue_event_at = None
         self.engine = create_async_engine("sqlite+aiosqlite:///:memory:")
         self.sessions = async_sessionmaker(self.engine, expire_on_commit=False)
@@ -415,7 +417,7 @@ class VotingTests(JuryV2TestCase):
             self.assertEqual(settled, [({self.ids[name] for name in ("juror1", "juror2", "juror3", "juror4")}, {"case_id": case_id, "outcome": "violation"})])
             detail = JuryCaseDetail(**await jury_service.case_detail(db, self.ids["juror2"], case_id))
             self.assertEqual((detail.stage, detail.votes_cast), ("closed", 3))
-            self.assertEqual(detail.tally, {"none": 0, "l1": 1, "l2": 2, "l3": 0, "abstain": 1})
+            self.assertEqual(detail.tally, {"none": 0, "l1": 1, "l2": 2, "l3": 0, "abstain": 1, "need_context": 0})
             self.assertEqual((detail.verdict.outcome, detail.verdict.source, detail.verdict.category, detail.verdict.category_label, detail.verdict.level), ("violation", "jury", "harassment", "辱骂骚扰", 2))
             self.assertFalse(detail.verdict.overturned)
             self.assertIsNotNone(detail.verdict.hours)
@@ -442,9 +444,10 @@ class VotingTests(JuryV2TestCase):
         async with self.sessions() as db:
             report = await self._report(db, "alice", "insult")
             golden = await case_service.resolve_case(db, report.case_id, source="admin", actor_id=self.ids["admin"], upheld=True, category="harassment")
-            golden.is_golden = True
+            # 二期：评审中的质控题只出已核对的；位置随机，隔了太多张没出才强制出
+            golden.is_golden, golden.golden_verified = True, True
             member = await jury_service.get_member(db, self.ids["juror1"])
-            member.votes_total = jury_service.GOLDEN_EVERY - 1
+            member.votes_since_quality = jury_service.QUALITY_MAX_GAP + 1
             await db.commit()
             juror = await self._user(db, "juror1")
             view = await jury_service.next_case(db, juror)
@@ -780,7 +783,7 @@ class PublicBoardTests(JuryV2TestCase):
             self.assertEqual(await self._public_ids(db), [post_case])
             item = PublicCase(**(await overview_service.public_cases(db))[0][0])
             self.assertEqual((item.kind, item.outcome, item.category, item.category_label, item.level, item.source), ("post", "violation", "advertising", "垃圾广告", 2, "jury"))
-            self.assertEqual((item.tally, item.votes, item.report_count, item.overturned, item.has_content), ({"none": 0, "l1": 0, "l2": 3, "l3": 0, "abstain": 0}, 3, 1, False, True))
+            self.assertEqual((item.tally, item.votes, item.report_count, item.overturned, item.has_content), ({"none": 0, "l1": 0, "l2": 3, "l3": 0, "abstain": 0, "need_context": 0}, 3, 1, False, True))
             self.assertEqual([(reason.reason, reason.count) for reason in item.reasons], [("垃圾广告", 1)])
             detail = PublicCaseDetail(**await overview_service.public_case(db, post_case))
             # 只给文字，图片只给数量
@@ -802,9 +805,9 @@ class PublicBoardTests(JuryV2TestCase):
             # 质控题、没有委员投过票的、机器自动结案的都不进公示栏
             report = await self._report(db, "alice", "insult")
             golden = await case_service.resolve_case(db, report.case_id, source="admin", actor_id=self.ids["admin"], upheld=True, category="harassment")
-            golden.is_golden = True
+            golden.is_golden, golden.golden_verified = True, True
             member = await jury_service.get_member(db, self.ids["juror4"])
-            member.votes_total = jury_service.GOLDEN_EVERY - 1
+            member.votes_since_quality = jury_service.QUALITY_MAX_GAP + 1
             auto_report = await self._report(db, "alice", "insult2")
             auto = await db.get(ReportCase, auto_report.case_id)
             await case_service._close(
@@ -1041,25 +1044,30 @@ class OverviewAndSettingsTests(JuryV2TestCase):
             self.assertEqual(await jury_settings.get_switches(db), {name: False for name in jury_settings.SWITCHES})
             config = JuryConfig(**await overview_service.config(db))
             self.assertEqual((config.version, config.switches), (2, {"auto_appoint": False, "appeals": False, "machine_review": False}))
-            self.assertEqual(config.capabilities, ["overview", "case_detail", "opinions", "votes", "public_cases"])
+            # 一期的能力和投票选项原样在前面，二期的追加在后面
+            self.assertEqual(config.capabilities[:5], ["overview", "case_detail", "opinions", "votes", "public_cases"])
             self.assertEqual([tier.key for tier in config.tiers], ["trainee", "regular", "senior"])
-            self.assertEqual([(vote.value, vote.kind, vote.level) for vote in config.votes], [("none", "clean", None), ("l1", "violation", 1), ("l2", "violation", 2), ("l3", "violation", 3), ("abstain", "abstain", None)])
+            self.assertEqual([(vote.value, vote.kind, vote.level) for vote in config.votes][:5], [("none", "clean", None), ("l1", "violation", 1), ("l2", "violation", 2), ("l3", "violation", 3), ("abstain", "abstain", None)])
             self.assertEqual(config.rules.model_dump(), {
                 "seats_per_case": 5, "quick_consensus_votes": 3, "full_consensus_votes": 4, "timeout_hours": 72, "assignment_ttl_hours": 24,
                 "daily_votes": 30, "term_days": 30, "context_near": 3, "content_retention_days": 30, "publish_delay_hours": 72, "min_sample": 5,
                 "max_ban_hours": penalty_service.CAPPED_BAN_HOURS,
+                # 二期新增
+                "severe_min_votes": 5, "need_context_votes": 2,
             })
             self.assertEqual(config.rules.max_ban_hours, 168)
             self.assertEqual(config.opinions.model_dump(), {
                 "max_length": 500, "per_case": 20, "per_minute": 5, "per_day": 100, "auto_hide_reports": 2,
                 "report_reasons": ["人身攻击", "泄露身份或隐私", "照抄违规原文", "与案件无关", "其他"],
+                # 二期新增
+                "like_reward_threshold": 3,
             })
             self.assertEqual(config.eligibility.model_dump(), {"min_account_age_days": 30, "min_recent_messages": 30, "recent_activity_days": 30})
             self.assertEqual(settings.jury_large_group_members, 200)
 
             # 改开关：立即生效，写审计日志，没变化的不记
             changed = await jury_settings.update_switches(db, self.ids["admin"], {"appeals": True, "auto_appoint": False, "public_group_content": True})
-            self.assertEqual(changed, {"auto_appoint": False, "appeals": True, "machine_review": False, "public_group_content": True, "opinions_open_to_jurors": False})
+            self.assertEqual(changed, {"auto_appoint": False, "appeals": True, "machine_review": False, "public_group_content": True, "opinions_open_to_jurors": False, "exam_required": False})
             self.assertTrue(await jury_settings.is_enabled(db, "public_group_content"))
             self.assertEqual((await overview_service.config(db))["switches"], {"auto_appoint": False, "appeals": True, "machine_review": False})
             log = (await db.execute(select(AdminAuditLog).where(AdminAuditLog.action == "jury.settings.update"))).scalar_one()

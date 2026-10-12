@@ -1,5 +1,17 @@
 from app.models.announcement import Announcement
-from app.models.case import JuryMember, JuryOpinion, JuryOpinionLike, JuryOpinionReport, JuryVote, ReportCase
+from app.models.case import (
+    JuryAchievement,
+    JuryExamAttempt,
+    JuryMember,
+    JuryNotification,
+    JuryOpinion,
+    JuryOpinionLike,
+    JuryOpinionReport,
+    JuryPointLog,
+    JuryPracticeAnswer,
+    JuryVote,
+    ReportCase,
+)
 from app.models.bot import Bot, BotInstallation, BotReview, BotReviewLike, BotReviewReply
 from app.models.conversation import Conversation, ConversationMember, GroupAnnouncement, GroupJoinRequest, TemporaryConversationBlock
 from app.models.friend import FriendRequest, Friendship
@@ -62,6 +74,11 @@ __all__ = [
     "JuryOpinion",
     "JuryOpinionLike",
     "JuryOpinionReport",
+    "JuryPointLog",
+    "JuryAchievement",
+    "JuryExamAttempt",
+    "JuryPracticeAnswer",
+    "JuryNotification",
     "FavoriteSticker",
     "StickerAsset",
     "SystemSetting",

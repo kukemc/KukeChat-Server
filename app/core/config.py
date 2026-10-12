@@ -99,6 +99,65 @@ class Settings(BaseSettings):
     jury_opinions_per_minute: int = Field(default=5, ge=1, le=1000)
     jury_opinions_per_day: int = Field(default=100, ge=1, le=100000)
     jury_opinion_auto_hide_reports: int = Field(default=2, ge=1, le=100)
+    # —— 二期（docs/jury-v2.md 第 2 节）——
+    # 定为严重违规（l3）至少要几张有效票；同一案件累计几张「上下文不足」后转出
+    jury_severe_min_votes: int = Field(default=5, ge=3, le=15)
+    jury_need_context_votes: int = Field(default=2, ge=1, le=15)
+    # 质控题的位置：距上一道至少隔几张票才可能再出（之后每次取件按 1 / jury_golden_every 的概率出），隔了多少张之后强制出
+    jury_quality_min_gap: int = Field(default=2, ge=0, le=1000)
+    jury_quality_max_gap: int = Field(default=9, ge=1, le=10000)
+    jury_recuse_daily_limit: int = Field(default=5, ge=0, le=1000)
+    # 弃权过多：近 window 张票里「拿不准 + 上下文不足」的比例，不足 min_votes 张不判断
+    jury_abstain_window: int = Field(default=50, ge=1, le=10000)
+    jury_abstain_min_votes: int = Field(default=20, ge=1, le=10000)
+    jury_abstain_warn_rate: float = Field(default=0.3, ge=0, le=1)
+    jury_abstain_cooldown_rate: float = Field(default=0.5, ge=0, le=1)
+    jury_abstain_cooldown_hours: int = Field(default=24, ge=1, le=24 * 30)
+    # /jury/me.warnings 里「快要被降级 / 暂停」的提醒：比率离那条线不到 margin 时开始提醒；
+    # 暂停线的样本数达到要求的 sample_ratio 倍（默认一半）就开始看
+    jury_warning_margin: float = Field(default=0.1, ge=0, le=1)
+    jury_warning_sample_ratio: float = Field(default=0.5, ge=0, le=1)
+    # 风纪值：事件 -> 分值
+    jury_points_vote_agreed: int = Field(default=10, ge=-1000, le=1000)
+    jury_points_vote_disagreed: int = Field(default=3, ge=-1000, le=1000)
+    jury_points_quality_correct: int = Field(default=5, ge=-1000, le=1000)
+    jury_points_quality_wrong: int = Field(default=-5, ge=-1000, le=1000)
+    jury_points_daily_first: int = Field(default=2, ge=-1000, le=1000)
+    jury_points_streak_7: int = Field(default=10, ge=-1000, le=1000)
+    jury_points_opinion_liked: int = Field(default=5, ge=-1000, le=1000)
+    jury_points_exam_passed: int = Field(default=20, ge=-1000, le=1000)
+    jury_points_overturn_adjust: int = Field(default=7, ge=0, le=1000)
+    # 一条观点的赞数第一次达到多少时给作者加分
+    jury_opinion_like_reward_threshold: int = Field(default=3, ge=1, le=1000)
+    # 层级：晋升到正式 / 资深的条件，以及各自的降级线
+    jury_regular_votes_settled: int = Field(default=15, ge=0, le=100000)
+    jury_regular_agreement_rate: float = Field(default=0.7, ge=0, le=1)
+    jury_regular_quality_rate: float = Field(default=0.7, ge=0, le=1)
+    jury_regular_quality_min: int = Field(default=3, ge=0, le=100000)
+    jury_regular_days_served: int = Field(default=14, ge=0, le=3650)
+    jury_regular_demote_rate: float = Field(default=0.6, ge=0, le=1)
+    jury_senior_votes_settled: int = Field(default=50, ge=0, le=100000)
+    jury_senior_agreement_rate: float = Field(default=0.8, ge=0, le=1)
+    jury_senior_quality_rate: float = Field(default=0.8, ge=0, le=1)
+    jury_senior_quality_min: int = Field(default=8, ge=0, le=100000)
+    jury_senior_days_served: int = Field(default=60, ge=0, le=3650)
+    jury_senior_demote_rate: float = Field(default=0.7, ge=0, le=1)
+    # 降级看最近多少张已结的票，不足 min_votes 张不判断
+    jury_demote_window: int = Field(default=30, ge=1, le=10000)
+    jury_demote_min_votes: int = Field(default=15, ge=1, le=10000)
+    # 入门考试
+    jury_exam_total: int = Field(default=10, ge=1, le=100)
+    jury_exam_pass_score: int = Field(default=8, ge=1, le=100)
+    jury_exam_time_limit_minutes: int = Field(default=60, ge=1, le=24 * 60)
+    jury_exam_grace_seconds: int = Field(default=30, ge=0, le=3600)
+    jury_exam_attempts_max: int = Field(default=3, ge=1, le=100)
+    jury_exam_window_days: int = Field(default=30, ge=1, le=3650)
+    jury_exam_retry_hours: int = Field(default=24, ge=0, le=24 * 365)
+    jury_exam_valid_days: int = Field(default=90, ge=1, le=3650)
+    jury_practice_daily_limit: int = Field(default=20, ge=1, le=10000)
+    # 自动入库：委员全票一致且有效票不少于这么多、定案满这么久
+    jury_golden_consensus_votes: int = Field(default=3, ge=3, le=15)
+    jury_golden_delay_hours: int = Field(default=72, ge=0, le=24 * 365)
     task_reminder_check_interval_seconds: int = Field(default=60, ge=10, le=3600)
     task_reminder_advance_hours: int = Field(default=24, ge=1, le=168)
     smtp_enabled: bool = False

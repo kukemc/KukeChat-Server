@@ -1,0 +1,431 @@
+"""题库（docs/jury-v2.md 2.1）。
+
+一道题 = 一个已经有结论的案件，report_cases.is_golden 表示「在题库里」。题有「已核对」标记：
+已核对的用于入门考试和评审中的质控计分，未核对的只用于练习。
+这个模块不依赖 jury.py（评审分案时要用这里的规则），需要委员视图的地方在函数里再导入。
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+from fastapi import HTTPException, status
+from sqlalchemy import func, or_, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.config import settings
+from app.models.case import JuryExamAttempt, JuryPracticeAnswer, JuryVote, ReportCase
+from app.models.penalty import UserViolation
+from app.models.report import AdminAuditLog
+from app.models.user import User
+from app.services import cases as case_service
+from app.services import jury_settings
+from app.services import penalties as penalty_service
+
+logger = logging.getLogger(__name__)
+UTC = timezone.utc
+
+SOURCES = ("admin", "consensus", "legacy")
+# 自动入库：委员全票一致、有效票不少于这么多，定案满这么久
+CONSENSUS_VOTES = settings.jury_golden_consensus_votes
+AUTO_INCLUDE_DELAY_HOURS = settings.jury_golden_delay_hours
+AUTO_INCLUDE_BATCH = 200
+DECIDED_VOTES = ("none", "l1", "l2", "l3")
+BLOCK_MESSAGES = {
+    "open": "案件还没有结论，不能进题库",
+    "private": "涉及私聊或账号本身的案件不能进题库",
+    "sensitive": "色情低俗 / 涉未成年 / 隐私类的案件不能进题库",
+    "public_content": "这个案件的内容会出现在公示栏里，不能进题库（否则可以去公示栏查答案）",
+}
+
+
+# ---------------------------------------------------------------- 标准答案
+
+
+def question_source(case: ReportCase) -> str:
+    """题目的来源；上线前回填的旧题没有记来源，按 legacy 算。"""
+    return case.golden_source if case.golden_source in SOURCES else "legacy"
+
+
+def question_upheld(case: ReportCase) -> bool:
+    """标准答案是不是「违规」：管理员改过的以改过的为准，否则取案件自身的结论。"""
+    if case.golden_outcome in {"violation", "clean"}:
+        return case.golden_outcome == "violation"
+    return case.status == "resolved"
+
+
+def question_answer(case: ReportCase) -> dict[str, Any]:
+    upheld = question_upheld(case)
+    category = (case.golden_category or case.verdict_category) if upheld else None
+    level = (case.golden_level if case.golden_level is not None else case.verdict_level) if upheld else None
+    return {
+        "outcome": "violation" if upheld else "clean",
+        "level": level,
+        "category": category,
+        "category_label": penalty_service.category_label(category) if category else None,
+        "explanation": case.golden_explanation,
+    }
+
+
+def is_correct(case: ReportCase, vote: str | None) -> bool:
+    """只判「违规 / 不违规」对不对，等级不计分。没答（None）算错。"""
+    if vote not in DECIDED_VOTES:
+        return False
+    return (vote != "none") == question_upheld(case)
+
+
+# ---------------------------------------------------------------- 入库规则
+
+
+def shows_public_content(case: ReportCase, group_content: bool) -> bool:
+    """公示栏里会不会展示这个案件的内容：公开动态且认定违规；群聊内容公示的开关打开时，委员审过的群聊违规案件也会。"""
+    if case.status != "resolved":
+        return False
+    if case.content_publishable:
+        return True
+    return bool(group_content and case.publishable and case.target_type == "message")
+
+
+async def block_reason(db: AsyncSession, case: ReportCase, *, group_content: bool | None = None) -> str | None:
+    """这个案件为什么不能当题目；None 表示可以。入库和出题时都按这一套判断。"""
+    if case.status == "open":
+        return "open"
+    if not case.jury_eligible:
+        return "private"
+    # 和公示栏用同一套敏感类别判断，再加上分案时那套（举报理由 / 机器类别）
+    categories = {case.verdict_category, case.golden_category}
+    if case.jury_block_reason == "sensitive" or categories & case_service.HIDDEN_CONTENT_CATEGORIES or await case_service.is_sensitive(db, case):
+        return "sensitive"
+    if group_content is None:
+        group_content = await jury_settings.is_enabled(db, "public_group_content")
+    if shows_public_content(case, group_content):
+        return "public_content"
+    return None
+
+
+async def _has_pending_appeal(db: AsyncSession, case: ReportCase) -> bool:
+    clauses = [UserViolation.case_id == case.id]
+    if case.violation_id is not None:
+        clauses.append(UserViolation.id == case.violation_id)
+    result = await db.execute(select(UserViolation.id).where(or_(*clauses), UserViolation.appeal_status == "pending").limit(1))
+    return result.scalar_one_or_none() is not None
+
+
+async def include_after_admin(db: AsyncSession, case: ReportCase) -> bool:
+    """管理员结案的案件进题库，但只是「未核对」：随手结一个案不等于核对过题目。调用方负责 commit。"""
+    if case.is_golden or case.golden_source == "removed" or await block_reason(db, case) is not None:
+        return False
+    case.is_golden = True
+    case.golden_verified = False
+    case.golden_source = "admin"
+    return True
+
+
+async def auto_include(db: AsyncSession) -> int:
+    """委员一致通过的案件自动入库并视为已核对。由定时循环调用，自己提交事务。
+
+    条件：委员定案、有效票不少于 CONSENSUS_VOTES 且全票一致、定案满 AUTO_INCLUDE_DELAY_HOURS、没有被改判、
+    相关处罚没有待处理的申诉。永远不会满足条件的案件记成 excluded，下次不再看。
+    """
+    now = datetime.now(UTC)
+    rows = await db.execute(
+        select(ReportCase)
+        .where(
+            ReportCase.status != "open",
+            ReportCase.jury_outcome == "consensus",
+            ReportCase.verdict_source == "jury",
+            ReportCase.is_golden.is_(False),
+            ReportCase.golden_source.is_(None),
+            ReportCase.closed_at <= now - timedelta(hours=AUTO_INCLUDE_DELAY_HOURS),
+        )
+        .order_by(ReportCase.id.asc())
+        .limit(AUTO_INCLUDE_BATCH)
+    )
+    cases = list(rows.scalars().all())
+    if not cases:
+        return 0
+    group_content = await jury_settings.is_enabled(db, "public_group_content")
+    included = 0
+    for case in cases:
+        if await _has_pending_appeal(db, case):
+            # 申诉有了结果再看：驳回就入库，通过的话案件会被改判。
+            continue
+        votes = (
+            await db.execute(
+                select(JuryVote.vote).where(
+                    JuryVote.case_id == case.id, JuryVote.voted_at.is_not(None), JuryVote.is_quality_check.is_(False), JuryVote.vote.in_(DECIDED_VOTES)
+                )
+            )
+        ).scalars().all()
+        violation = sum(1 for vote in votes if vote != "none")
+        unanimous = len(votes) >= CONSENSUS_VOTES and violation in {0, len(votes)}
+        if case.overturned_at is not None or not unanimous or await block_reason(db, case, group_content=group_content) is not None:
+            case.golden_source = "excluded"
+            continue
+        case.is_golden = True
+        case.golden_verified = True
+        case.golden_source = "consensus"
+        included += 1
+    await db.commit()
+    return included
+
+
+# ---------------------------------------------------------------- 出题
+
+
+def bank_clauses(*, verified_only: bool) -> list[Any]:
+    """题库里能出的题在 SQL 里能判断的那部分条件；类别和公示栏的检查见 block_reason。"""
+    clauses: list[Any] = [
+        ReportCase.is_golden.is_(True),
+        ReportCase.status != "open",
+        ReportCase.jury_eligible.is_(True),
+        ReportCase.jury_block_reason.is_(None),
+    ]
+    if verified_only:
+        clauses.append(ReportCase.golden_verified.is_(True))
+    return clauses
+
+
+async def verified_count(db: AsyncSession) -> int:
+    """已核对的题有多少道。只是个便宜的估计，用来告诉客户端「现在能不能考」；真正抽题时还会逐题检查。"""
+    result = await db.execute(select(func.count(ReportCase.id)).where(*bank_clauses(verified_only=True)))
+    return int(result.scalar_one() or 0)
+
+
+# ---------------------------------------------------------------- 后台
+
+
+async def _answer_stats(db: AsyncSession, case_ids: list[int]) -> dict[int, tuple[int, int]]:
+    """每道题被答了多少次、答对多少次：评审中的质控作答 + 练习场作答。考试的作答存在场次里，不计入。"""
+    stats: dict[int, list[int]] = {case_id: [0, 0] for case_id in case_ids}
+    if not case_ids:
+        return {}
+    quality = await db.execute(
+        select(JuryVote.case_id, JuryVote.agreed, func.count())
+        .where(JuryVote.case_id.in_(case_ids), JuryVote.is_quality_check.is_(True), JuryVote.agreed.is_not(None))
+        .group_by(JuryVote.case_id, JuryVote.agreed)
+    )
+    practice = await db.execute(
+        select(JuryPracticeAnswer.case_id, JuryPracticeAnswer.correct, func.count())
+        .where(JuryPracticeAnswer.case_id.in_(case_ids))
+        .group_by(JuryPracticeAnswer.case_id, JuryPracticeAnswer.correct)
+    )
+    for rows in (quality, practice):
+        for case_id, correct, count in rows.all():
+            stats[case_id][0] += int(count)
+            stats[case_id][1] += int(count) if correct else 0
+    return {case_id: (answered, correct) for case_id, (answered, correct) in stats.items()}
+
+
+async def question_reads(db: AsyncSession, cases: list[ReportCase]) -> list[dict[str, Any]]:
+    stats = await _answer_stats(db, [case.id for case in cases])
+    items: list[dict[str, Any]] = []
+    for case in cases:
+        answer = question_answer(case)
+        answered, correct = stats.get(case.id, (0, 0))
+        items.append(
+            {
+                "case_id": case.id,
+                "kind": case.target_type,
+                "primary_reason": case.primary_reason,
+                "summary": case_service._case_summary(await case_service.case_snapshot(db, case)),
+                "closed_at": penalty_service.aware(case.closed_at),
+                "verdict_source": case.verdict_source,
+                "in_bank": bool(case.is_golden),
+                "verified": bool(case.is_golden and case.golden_verified),
+                "source": question_source(case) if case.is_golden else None,
+                "outcome": answer["outcome"],
+                "level": answer["level"],
+                "category": answer["category"],
+                "category_label": answer["category_label"],
+                "explanation": answer["explanation"],
+                # 标准答案是不是管理员改过的
+                "answer_overridden": case.golden_outcome is not None or case.golden_level is not None or case.golden_category is not None,
+                "answered": answered,
+                "correct_rate": round(correct / answered, 3) if answered else None,
+            }
+        )
+    return items
+
+
+async def list_questions(
+    db: AsyncSession,
+    *,
+    verified: bool | None = None,
+    source: str | None = None,
+    query: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> tuple[list[dict[str, Any]], int]:
+    clauses: list[Any] = [ReportCase.is_golden.is_(True)]
+    if verified is not None:
+        clauses.append(ReportCase.golden_verified.is_(verified))
+    if source == "legacy":
+        clauses.append(or_(ReportCase.golden_source.is_(None), ReportCase.golden_source.not_in(("admin", "consensus"))))
+    elif source:
+        clauses.append(ReportCase.golden_source == source)
+    if query and query.strip():
+        text = query.strip()
+        conditions = [ReportCase.primary_reason.ilike(f"%{text}%"), ReportCase.golden_explanation.ilike(f"%{text}%")]
+        if text.isdigit():
+            conditions.append(ReportCase.id == int(text))
+        clauses.append(or_(*conditions))
+    total = int((await db.execute(select(func.count(ReportCase.id)).where(*clauses))).scalar_one() or 0)
+    rows = await db.execute(select(ReportCase).where(*clauses).order_by(ReportCase.id.desc()).offset(offset).limit(limit))
+    return await question_reads(db, list(rows.scalars().all())), total
+
+
+async def _case(db: AsyncSession, case_id: int) -> ReportCase:
+    case = await db.get(ReportCase, case_id)
+    if case is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"code": "case_not_found", "message": "案件不存在"})
+    return case
+
+
+async def question_detail(db: AsyncSession, case_id: int) -> dict[str, Any]:
+    """题目内容（匿名视图）+ 列表里的字段。还没入库的已结案件也能看，方便入库前预览。"""
+    from app.services import jury as jury_service
+
+    case = await _case(db, case_id)
+    view = await jury_service.juror_case_view(db, case)
+    reason = await block_reason(db, case)
+    return {
+        **(await question_reads(db, [case]))[0],
+        "reasons": view["reasons"],
+        "report_count": view["report_count"],
+        "messages": view["messages"],
+        "post": view["post"],
+        # 不能当题目的原因；可以时为 null
+        "block_reason": reason,
+        "block_message": BLOCK_MESSAGES.get(reason) if reason else None,
+    }
+
+
+async def _rescore_quality_votes(db: AsyncSession, case: ReportCase) -> int:
+    """标准答案改了之后，把评审中答过这道质控题的人重新对一遍答案（只改正确数，不追溯风纪值）。"""
+    from app.models.case import JuryMember
+
+    upheld = question_upheld(case)
+    votes = (
+        await db.execute(select(JuryVote).where(JuryVote.case_id == case.id, JuryVote.is_quality_check.is_(True), JuryVote.agreed.is_not(None)))
+    ).scalars().all()
+    changed = 0
+    for vote in votes:
+        if vote.vote not in DECIDED_VOTES:
+            continue
+        agreed = (vote.vote != "none") == upheld
+        if vote.agreed == agreed:
+            continue
+        vote.agreed = agreed
+        member = (await db.execute(select(JuryMember).where(JuryMember.user_id == vote.juror_id))).scalar_one_or_none()
+        if member is not None:
+            member.golden_correct = max(0, min(member.golden_total, member.golden_correct + (1 if agreed else -1)))
+        changed += 1
+    return changed
+
+
+async def update_question(db: AsyncSession, case_id: int, *, actor_id: int, changes: dict[str, Any]) -> dict[str, Any]:
+    """加入 / 移出题库、核对、改标准答案和说明。changes 里只放请求里出现过的字段，值为 None 表示清空。"""
+    case = await _case(db, case_id)
+    before = {
+        "in_bank": bool(case.is_golden),
+        "verified": bool(case.golden_verified),
+        "source": case.golden_source,
+        "outcome": case.golden_outcome,
+        "level": case.golden_level,
+        "category": case.golden_category,
+        "explanation": case.golden_explanation,
+    }
+    requested = changes.get("in_bank")
+    if requested is False:
+        # 移出题库：记成 removed，自动入库和管理员结案都不会再把它放回来。
+        case.is_golden = False
+        case.golden_verified = False
+        case.golden_source = "removed"
+    elif not case.is_golden and requested is not True:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail={"code": "not_in_bank", "message": "这个案件不在题库里，先把它加入题库"})
+    else:
+        category = changes.get("category")
+        if category is not None and (category not in penalty_service.CATEGORIES or category in case_service.HIDDEN_CONTENT_CATEGORIES):
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail={"code": "invalid_category", "message": "未知或不能用于题库的违规类别"})
+        # 新加入、或者要标成已核对时，都按入库规则查一遍（先查再改，不合规就什么都不动）。
+        if not case.is_golden or changes.get("verified"):
+            reason = await block_reason(db, case)
+            if reason is not None:
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail={"code": "case_not_eligible", "message": BLOCK_MESSAGES[reason]})
+        if not case.is_golden:
+            case.is_golden = True
+            case.golden_verified = False
+            case.golden_source = "admin"
+        if changes.get("verified") is not None:
+            case.golden_verified = bool(changes["verified"])
+        if "outcome" in changes:
+            case.golden_outcome = changes["outcome"]
+        if "level" in changes:
+            case.golden_level = changes["level"]
+        if "category" in changes:
+            case.golden_category = category
+        if "explanation" in changes:
+            text = (changes["explanation"] or "").strip()
+            case.golden_explanation = text[:2000] or None
+        if not question_upheld(case):
+            # 标准答案是「不违规」时不留等级和类别
+            case.golden_level = None
+            case.golden_category = None
+        if "outcome" in changes:
+            await _rescore_quality_votes(db, case)
+    after = {
+        "in_bank": bool(case.is_golden),
+        "verified": bool(case.golden_verified),
+        "source": case.golden_source,
+        "outcome": case.golden_outcome,
+        "level": case.golden_level,
+        "category": case.golden_category,
+        "explanation": case.golden_explanation,
+    }
+    if after != before:
+        db.add(
+            AdminAuditLog(
+                actor_id=actor_id,
+                action="jury.question.update",
+                target_type="report_case",
+                target_id=case.id,
+                details=json.dumps({"from": before, "to": after}, ensure_ascii=False),
+            )
+        )
+    await db.commit()
+    return await question_detail(db, case.id)
+
+
+async def list_exams(db: AsyncSession, *, passed: bool | None = None, limit: int = 50, offset: int = 0) -> tuple[list[dict[str, Any]], int]:
+    """考试记录：已经有结果的场次，按时间倒序。"""
+    clauses: list[Any] = [JuryExamAttempt.submitted_at.is_not(None)]
+    if passed is not None:
+        clauses.append(JuryExamAttempt.passed.is_(passed))
+    total = int((await db.execute(select(func.count(JuryExamAttempt.id)).where(*clauses))).scalar_one() or 0)
+    rows = await db.execute(
+        select(JuryExamAttempt, User)
+        .join(User, User.id == JuryExamAttempt.user_id)
+        .where(*clauses)
+        .order_by(JuryExamAttempt.submitted_at.desc(), JuryExamAttempt.id.desc())
+        .offset(offset)
+        .limit(limit)
+    )
+    items = [
+        {
+            "id": attempt.id,
+            "user_id": attempt.user_id,
+            "user": user,
+            "score": attempt.score or 0,
+            "total": attempt.total,
+            "passed": bool(attempt.passed),
+            "timed_out": bool(attempt.timed_out),
+            "started_at": penalty_service.aware(attempt.started_at),
+            "submitted_at": penalty_service.aware(attempt.submitted_at),
+        }
+        for attempt, user in rows.all()
+    ]
+    return items, total

@@ -20,7 +20,9 @@ from app.models.report import UserReport
 from app.models.user import User
 from app.services import cases as case_service
 from app.services import jury as jury_service
+from app.services import jury_exam as exam_service
 from app.services import jury_opinions as opinion_service
+from app.services import jury_points as points_service
 from app.services import jury_settings
 from app.services import penalties as penalty_service
 
@@ -30,15 +32,21 @@ WINDOW_DAYS = settings.jury_overview_window_days
 # 总览里的比率至少要这么多样本才给
 MIN_SAMPLE = settings.jury_overview_min_sample
 OVERVIEW_CACHE_SECONDS = 60.0
-CAPABILITIES = ["overview", "case_detail", "opinions", "votes", "public_cases"]
-# 这些类别的案件即使认定违规也不公示内容：隐私类会二次扩散，色情 / 擦边类不适合给未成年人看。
-HIDDEN_CONTENT_CATEGORIES = {"privacy", "sexual", "minor_sexual", "vulgar", "suggestive"}
+# 后端已经实现的能力，客户端据此决定显示哪些板块。第二行是二期追加的。
+CAPABILITIES = [
+    "overview", "case_detail", "opinions", "votes", "public_cases",
+    "exam", "practice", "votes_v2", "points", "tiers", "achievements", "leaderboard", "badge",
+]  # fmt: skip
+# 这些类别的案件即使认定违规也不公示内容（题库也用同一份）。
+HIDDEN_CONTENT_CATEGORIES = case_service.HIDDEN_CONTENT_CATEGORIES
 VOTE_OPTIONS: list[dict[str, Any]] = [
     {"value": "none", "kind": "clean", "label": "不违规", "hint": "没有违反社区规则"},
     {"value": "l1", "kind": "violation", "label": "违规 · 轻微", "hint": "不太合适，但影响很小，比如随口的脏话、轻度刷屏", "level": 1},
     {"value": "l2", "kind": "violation", "label": "违规 · 一般", "hint": "明确违规，比如针对他人的辱骂、广告、引战", "level": 2},
     {"value": "l3", "kind": "violation", "label": "违规 · 严重", "hint": "性质恶劣，比如人身威胁、诈骗、泄露他人隐私", "level": 3},
     {"value": "abstain", "kind": "abstain", "label": "拿不准", "hint": "看不懂或无法判断，不计入表决"},
+    {"value": "recuse", "kind": "recuse", "label": "回避", "hint": "我可能认识当事人或有利害关系，改派给别人"},
+    {"value": "need_context", "kind": "abstain", "label": "上下文不足", "hint": "看完全部上下文仍然无法判断，不计入表决"},
 ]
 
 _overview_cache: dict[str, Any] = {"at": None, "data": None}
@@ -59,7 +67,16 @@ async def config(db: AsyncSession) -> dict[str, Any]:
         "version": 2,
         "capabilities": list(CAPABILITIES),
         "switches": {name: switches[name] for name in jury_settings.PUBLIC_SWITCHES},
-        "tiers": [{"key": key, "label": label} for key, label in jury_service.TIERS],
+        "tiers": [
+            {
+                "key": key,
+                "label": label,
+                # 晋升到这一层的条件和这一层的降级线；见习没有
+                "requirements": dict(points_service.TIER_RULES[key]["requirements"]) if key in points_service.TIER_RULES else None,
+                "demote_below": dict(points_service.TIER_RULES[key]["demote_below"]) if key in points_service.TIER_RULES else None,
+            }
+            for key, label in jury_service.TIERS
+        ],
         "votes": [dict(option) for option in VOTE_OPTIONS],
         "rules": {
             "seats_per_case": jury_service.SEATS_PER_CASE,
@@ -75,6 +92,8 @@ async def config(db: AsyncSession) -> dict[str, Any]:
             "publish_delay_hours": case_service.PUBLISH_DELAY_HOURS,
             "min_sample": MIN_SAMPLE,
             "max_ban_hours": penalty_service.CAPPED_BAN_HOURS,
+            "severe_min_votes": jury_service.SEVERE_MIN_VOTES,
+            "need_context_votes": jury_service.NEED_CONTEXT_VOTES,
         },
         "opinions": {
             "max_length": opinion_service.MAX_LENGTH,
@@ -83,11 +102,43 @@ async def config(db: AsyncSession) -> dict[str, Any]:
             "per_day": opinion_service.PER_DAY,
             "auto_hide_reports": opinion_service.AUTO_HIDE_REPORTS,
             "report_reasons": list(opinion_service.REPORT_REASONS),
+            "like_reward_threshold": points_service.LIKE_REWARD_THRESHOLD,
         },
         "eligibility": {
             "min_account_age_days": jury_service.MIN_ACCOUNT_AGE_DAYS,
             "min_recent_messages": jury_service.MIN_RECENT_MESSAGES,
             "recent_activity_days": jury_service.RECENT_ACTIVITY_DAYS,
+        },
+        # —— 二期 ——
+        "categories": [
+            {"key": key, "label": penalty_service.category_label(key), "default_level": penalty_service.default_level(key)}
+            for key in jury_service.VOTE_CATEGORIES
+        ],
+        "points": dict(points_service.POINTS),
+        "suspend": {
+            "min_settled": jury_service.MIN_SETTLED_FOR_REVIEW,
+            "agreement_rate": jury_service.MIN_ACCURACY,
+            "quality_min": jury_service.MIN_GOLDEN_FOR_REVIEW,
+            "quality_rate": jury_service.MIN_ACCURACY,
+        },
+        "exam": {
+            "total": exam_service.EXAM_TOTAL,
+            "pass_score": exam_service.EXAM_PASS_SCORE,
+            "time_limit_minutes": exam_service.EXAM_TIME_LIMIT_MINUTES,
+            "grace_seconds": exam_service.EXAM_GRACE_SECONDS,
+            "attempts_max": exam_service.EXAM_ATTEMPTS_MAX,
+            "window_days": exam_service.EXAM_WINDOW_DAYS,
+            "retry_hours": exam_service.EXAM_RETRY_HOURS,
+            "valid_days": exam_service.EXAM_VALID_DAYS,
+        },
+        "practice": {"daily_limit": exam_service.PRACTICE_DAILY_LIMIT},
+        "recuse": {"daily_limit": jury_service.RECUSE_DAILY_LIMIT},
+        "abstain": {
+            "window": jury_service.ABSTAIN_WINDOW,
+            "min_votes": jury_service.ABSTAIN_MIN_VOTES,
+            "warn_rate": jury_service.ABSTAIN_WARN_RATE,
+            "cooldown_rate": jury_service.ABSTAIN_COOLDOWN_RATE,
+            "cooldown_hours": jury_service.ABSTAIN_COOLDOWN_HOURS,
         },
     }
 

@@ -66,9 +66,20 @@ from app.schemas.case import (
     JuryMemberReview,
     JuryVoteSummary,
 )
-from app.schemas.jury import JurySettingsRead, JurySettingsUpdate
+from app.schemas.jury import (
+    AdminExamPage,
+    AdminExamRead,
+    AdminQuestionDetail,
+    AdminQuestionPage,
+    AdminQuestionRead,
+    AdminQuestionUpdate,
+    JurySettingsRead,
+    JurySettingsUpdate,
+)
 from app.services import cases as case_service
 from app.services import jury as jury_service
+from app.services import jury_bank as bank_service
+from app.services import jury_points as points_service
 from app.services import jury_opinions as opinion_service
 from app.services import jury_settings
 from app.services import messages as message_service
@@ -846,11 +857,12 @@ async def admin_resolve_case(
         note=payload.note,
         malicious_reporter_ids=set(payload.malicious_reporter_ids),
     )
-    # 管理员的结论是委员一致率的基准，也让这个案件进入质控题库（敏感类别的不能再发给委员）。
+    # 管理员的结论是委员一致率的基准。案件同时进题库，但只是「未核对」的练习题：
+    # 随手结一个案不等于核对过题目，要用于考试和质控得在题库里单独核对。
     await jury_service.settle_after_admin(db, case)
-    if case.jury_eligible and case.jury_block_reason is None:
-        case.is_golden = True
+    await bank_service.include_after_admin(db, case)
     await db.commit()
+    await points_service.flush_events(db)
     await admin_manager.broadcast("admin.report.changed", {"case_id": case.id, "action": "reviewed"})
     return await _case_detail(db, case, admin.id)
 
@@ -908,7 +920,9 @@ async def admin_review_jury_member(
     admin: Annotated[User, Depends(get_current_admin)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> JuryMemberRead:
-    await jury_service.review_member(db, user_id, action=payload.action, actor_id=admin.id, note=payload.note, tier=payload.tier)
+    await jury_service.review_member(
+        db, user_id, action=payload.action, actor_id=admin.id, note=payload.note, tier=payload.tier, points=payload.points
+    )
     items, _total = await jury_service.list_members(db, None, 1, 0, user_id=user_id)
     if not items:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Jury member not found")
@@ -936,6 +950,56 @@ async def admin_update_jury_settings(
     await jury_settings.update_switches(db, admin.id, payload.model_dump(exclude_none=True))
     await admin_manager.broadcast("admin.jury.settings.changed", {})
     return await _jury_settings_read(db)
+
+
+@router.get("/jury/questions", response_model=AdminQuestionPage)
+async def admin_list_jury_questions(
+    _admin: Annotated[User, Depends(get_current_admin)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    # 留空不筛选
+    verified: Literal["true", "false", ""] | None = None,
+    source: Literal["admin", "consensus", "legacy", ""] | None = None,
+    q: str | None = Query(default=None, max_length=80),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> AdminQuestionPage:
+    items, total = await bank_service.list_questions(
+        db, verified={"true": True, "false": False}.get(verified or ""), source=source or None, query=q, limit=limit, offset=offset
+    )
+    return AdminQuestionPage(items=[AdminQuestionRead(**item) for item in items], total=total)
+
+
+@router.get("/jury/questions/{case_id}", response_model=AdminQuestionDetail)
+async def admin_jury_question(
+    case_id: int,
+    _admin: Annotated[User, Depends(get_current_admin)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> AdminQuestionDetail:
+    return AdminQuestionDetail(**await bank_service.question_detail(db, case_id))
+
+
+@router.put("/jury/questions/{case_id}", response_model=AdminQuestionDetail)
+async def admin_update_jury_question(
+    case_id: int,
+    payload: AdminQuestionUpdate,
+    admin: Annotated[User, Depends(get_current_admin)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> AdminQuestionDetail:
+    # 只处理请求里出现的字段：显式传 null 表示清空，没出现的保持原样。
+    changes = payload.model_dump(exclude_unset=True)
+    return AdminQuestionDetail(**await bank_service.update_question(db, case_id, actor_id=admin.id, changes=changes))
+
+
+@router.get("/jury/exams", response_model=AdminExamPage)
+async def admin_list_jury_exams(
+    _admin: Annotated[User, Depends(get_current_admin)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    passed: Literal["true", "false", ""] | None = None,
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> AdminExamPage:
+    items, total = await bank_service.list_exams(db, passed={"true": True, "false": False}.get(passed or ""), limit=limit, offset=offset)
+    return AdminExamPage(items=[AdminExamRead(**item) for item in items], total=total)
 
 
 @router.get("/jury/opinions", response_model=AdminJuryOpinionPage)

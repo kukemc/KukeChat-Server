@@ -10,6 +10,7 @@ from sqlalchemy.orm import joinedload
 
 from app.models.conversation import Conversation, ConversationMember, GroupJoinRequest
 from app.models.enums import FriendRequestStatus, GroupJoinRequestStatus, MemberRole, MessageType, PostNotificationType, ReportStatus
+from app.models.case import JuryNotification
 from app.models.report import UserReport
 from app.models.friend import FriendRequest
 from app.models.bot import Bot, BotReview
@@ -349,6 +350,32 @@ async def _report_result_notifications(db: AsyncSession, user_id: int) -> list[U
     return items
 
 
+async def _jury_notifications(db: AsyncSession, user_id: int) -> list[UnifiedNotificationRead]:
+    """风纪委员的资格 / 层级变化：晋升、降级、被系统暂停、任期届满未能续任。"""
+    cutoff = datetime.now(UTC) - timedelta(days=30)
+    result = await db.execute(
+        select(JuryNotification)
+        .where(JuryNotification.user_id == user_id, JuryNotification.created_at >= cutoff)
+        .order_by(JuryNotification.id.desc())
+        .limit(30)
+    )
+    return [
+        UnifiedNotificationRead(
+            id=f"jury:{notification.id}",
+            category="system",
+            type="jury",
+            title=notification.title,
+            body=notification.body,
+            time=notification.created_at,
+            unread=False,
+            pending=False,
+            action="none",
+            payload={"kind": notification.kind},
+        )
+        for notification in result.scalars().all()
+    ]
+
+
 async def list_unified_notifications(db: AsyncSession, user_id: int, limit: int = 100) -> UnifiedNotificationListRead:
     groups = await _group_join_notifications(db, user_id)
     friends = await _friend_request_notifications(db, user_id)
@@ -357,7 +384,8 @@ async def list_unified_notifications(db: AsyncSession, user_id: int, limit: int 
     systems = await _managed_group_system_notifications(db, user_id)
     penalties = await _moderation_notifications(db, user_id)
     report_results = await _report_result_notifications(db, user_id)
-    items = [*friends, *groups, *posts, *interactions, *systems, *penalties, *report_results]
+    jury = await _jury_notifications(db, user_id)
+    items = [*friends, *groups, *posts, *interactions, *systems, *penalties, *report_results, *jury]
     items.sort(key=lambda item: item.time, reverse=True)
     items = items[:limit]
     counts = {"all": len(items), "friend": 0, "group": 0, "post": 0, "interact": 0, "system": 0}

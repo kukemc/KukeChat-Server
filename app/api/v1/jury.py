@@ -13,12 +13,18 @@ from app.schemas.case import (
     JuryCaseDetail,
     JuryCaseView,
     JuryHistoryItem,
+    JuryMeSettings,
     JuryNextCase,
     JuryStatus,
     JuryVoteCreate,
     JuryVoteResult,
 )
 from app.schemas.jury import (
+    ExamResult,
+    ExamStart,
+    ExamState,
+    ExamSubmit,
+    JuryAchievementPage,
     JuryConfig,
     JuryMyStats,
     JuryOpinion,
@@ -28,15 +34,22 @@ from app.schemas.jury import (
     JuryOpinionReportCreate,
     JuryOpinionState,
     JuryOverview,
+    JuryPointPage,
     JuryVoteItem,
     JuryVotePage,
+    Leaderboard,
+    PracticeAnswerCreate,
+    PracticeAnswerResult,
+    PracticeNext,
     PublicCase,
     PublicCaseDetail,
     PublicCasePage,
 )
 from app.services import jury as jury_service
+from app.services import jury_exam as exam_service
 from app.services import jury_opinions as opinion_service
 from app.services import jury_overview as overview_service
+from app.services import jury_points as points_service
 from app.websocket.manager import admin_manager
 
 
@@ -68,6 +81,34 @@ async def my_jury_stats(
     return JuryMyStats(**await jury_service.my_stats(db, current_user.id))
 
 
+@router.get("/me/points", response_model=JuryPointPage)
+async def my_jury_points(
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    limit: int = Query(default=20, ge=1, le=50),
+    offset: int = Query(default=0, ge=0),
+) -> JuryPointPage:
+    return JuryPointPage(**await points_service.list_points(db, current_user.id, limit=limit, offset=offset))
+
+
+@router.get("/me/achievements", response_model=JuryAchievementPage)
+async def my_jury_achievements(
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> JuryAchievementPage:
+    return JuryAchievementPage(items=await points_service.list_achievements(db, current_user.id))
+
+
+@router.put("/me/settings", response_model=JuryStatus)
+async def update_my_jury_settings(
+    payload: JuryMeSettings,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> JuryStatus:
+    await jury_service.update_settings(db, current_user, badge_visible=payload.badge_visible)
+    return JuryStatus(**await jury_service.my_status(db, current_user))
+
+
 @router.get("/me", response_model=JuryStatus)
 async def my_jury_status(
     current_user: Annotated[User, Depends(get_current_user)],
@@ -85,6 +126,60 @@ async def apply_for_jury(
     await jury_service.apply(db, current_user, payload.statement)
     await admin_manager.broadcast("admin.jury.changed", {"user_id": current_user.id})
     return JuryStatus(**await jury_service.my_status(db, current_user))
+
+
+@router.get("/leaderboard", response_model=Leaderboard)
+async def jury_leaderboard(
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    period: Literal["week", "month", "all"] = "week",
+    limit: int = Query(default=50, ge=1, le=100),
+) -> Leaderboard:
+    return Leaderboard(**await points_service.leaderboard(db, current_user.id, period=period, limit=limit))
+
+
+@router.get("/exam", response_model=ExamState)
+async def jury_exam_state(
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> ExamState:
+    return ExamState(**await exam_service.exam_state(db, current_user))
+
+
+@router.post("/exam/start", response_model=ExamStart)
+async def start_jury_exam(
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> ExamStart:
+    return ExamStart(**await exam_service.start_exam(db, current_user))
+
+
+@router.post("/exam/{attempt_id}/submit", response_model=ExamResult)
+async def submit_jury_exam(
+    attempt_id: int,
+    payload: ExamSubmit,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> ExamResult:
+    return ExamResult(**await exam_service.submit_exam(db, current_user, attempt_id, payload.answers))
+
+
+@router.get("/practice/next", response_model=PracticeNext)
+async def next_practice_question(
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> PracticeNext:
+    return PracticeNext(**await exam_service.practice_next(db, current_user))
+
+
+@router.post("/practice/{question_id}/answer", response_model=PracticeAnswerResult)
+async def answer_practice_question(
+    question_id: int,
+    payload: PracticeAnswerCreate,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> PracticeAnswerResult:
+    return PracticeAnswerResult(**await exam_service.practice_answer(db, current_user, question_id, payload.vote))
 
 
 @router.get("/public/cases", response_model=PublicCasePage)
@@ -137,7 +232,7 @@ async def vote_on_case(
     current_user: Annotated[User, Depends(get_current_user)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> JuryVoteResult:
-    return JuryVoteResult(**await jury_service.cast_vote(db, current_user, case_id, payload.vote, payload.note))
+    return JuryVoteResult(**await jury_service.cast_vote(db, current_user, case_id, payload.vote, payload.note, payload.category))
 
 
 @router.get("/cases/{case_id}/opinions", response_model=JuryOpinionPage)
@@ -206,13 +301,13 @@ async def my_jury_votes(
     outcome: Literal["violation", "clean", ""] | None = None,
     # 留空表示不筛选，所以不直接声明成 bool
     agreed: Literal["true", "false", ""] | None = None,
-    vote: str | None = Query(default=None, max_length=40),
+    vote: str | None = Query(default=None, max_length=80),
 ) -> JuryVotePage:
     votes = [item.strip() for item in (vote or "").split(",") if item.strip()]
     if any(item not in jury_service.VOTES for item in votes):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail={"code": "invalid_vote_filter", "message": "vote 只能是 none / l1 / l2 / l3 / abstain，多个用逗号分隔"},
+            detail={"code": "invalid_vote_filter", "message": "vote 只能是 none / l1 / l2 / l3 / abstain / recuse / need_context，多个用逗号分隔"},
         )
     items, total = await jury_service.list_votes(
         db,
