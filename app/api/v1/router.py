@@ -26,3 +26,9 @@ api_router.include_router(teamup.router, prefix="/teamup", tags=["teamup"])
 api_router.include_router(task.router, prefix="/tasks", tags=["tasks"])
 api_router.include_router(announcements.router, prefix="/announcements", tags=["announcements"])
 api_router.include_router(game.router, prefix="/game", tags=["game-mode"])
+
+# 风纪 v2 三期：判例和议事厅（docs/jury-v2.md 3.4、3.5、3.8）。和 jury / admin 用同样的前缀再挂一次
+from app.api.v1 import admin_jury_hall, jury_hall  # noqa: E402
+
+api_router.include_router(jury_hall.router, prefix="/jury", tags=["jury"])
+api_router.include_router(admin_jury_hall.router, prefix="/admin", tags=["admin"])

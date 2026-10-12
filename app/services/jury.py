@@ -1409,6 +1409,8 @@ async def opinion_counts(db: AsyncSession, case_ids: list[int]) -> dict[int, int
 
 async def case_detail(db: AsyncSession, user_id: int, review_id: int) -> dict[str, Any]:
     """投票之后看到的案件：自己的票、进度，定案后才有票数分布和结论。review_id 是评审编号。"""
+    from app.services import jury_precedents as precedent_service
+
     case, vote = await require_voted(db, user_id, review_id)
     closed = case.status != "open"
     quality_check = vote.is_quality_check
@@ -1443,6 +1445,8 @@ async def case_detail(db: AsyncSession, user_id: int, review_id: int) -> dict[st
         "opinion_count": 0 if quality_check else (await opinion_counts(db, [case.id])).get(case.id, 0),
         # 案件此刻在公示栏里时是它的公开编号；质控题恒为 null，否则等于把真实编号还了回去
         "public_case_id": case.id if not quality_check and await case_service.published_case_ids(db, [case.id]) else None,
+        # 三期：precedent（这个案件的判例）和 can_mark_precedent
+        **await precedent_service.case_fields(db, user_id, case, vote),
     }
 
 

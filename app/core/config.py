@@ -160,6 +160,26 @@ class Settings(BaseSettings):
     # 自动入库：委员全票一致且有效票不少于这么多、定案满这么久
     jury_golden_consensus_votes: int = Field(default=3, ge=3, le=15)
     jury_golden_delay_hours: int = Field(default=72, ge=0, le=24 * 365)
+    # —— 三期：判例与议事厅（docs/jury-v2.md 3.4、3.5）——
+    jury_precedent_title_max: int = Field(default=60, ge=1, le=200)
+    jury_precedent_summary_max: int = Field(default=1000, ge=1, le=10000)
+    jury_hall_title_max: int = Field(default=60, ge=1, le=200)
+    jury_hall_content_max: int = Field(default=5000, ge=1, le=50000)
+    jury_hall_comment_max: int = Field(default=1000, ge=1, le=10000)
+    # 列表里的正文只给前这么多字
+    jury_hall_list_excerpt: int = Field(default=200, ge=1, le=5000)
+    # 每人最近 24 小时最多发多少帖 / 多少条评论
+    jury_hall_posts_per_day: int = Field(default=3, ge=1, le=1000)
+    jury_hall_comments_per_day: int = Field(default=50, ge=1, le=100000)
+    # 提案表决几天；通过要求表决人数 >= max(quorum_min, 在任委员数 × quorum_ratio 向上取整)，
+    # 且 yes × pass_den >= (yes + no) × pass_num（整数比较，恰好等于也算通过）
+    jury_hall_vote_days: int = Field(default=7, ge=1, le=90)
+    jury_hall_quorum_ratio: float = Field(default=0.3, ge=0, le=1)
+    jury_hall_quorum_min: int = Field(default=3, ge=1, le=10000)
+    jury_hall_pass_num: int = Field(default=2, ge=1, le=1000)
+    jury_hall_pass_den: int = Field(default=3, ge=1, le=1000)
+    # 帖子或评论被这么多个不同的人举报后自动折叠，等管理员处理
+    jury_hall_auto_hide_reports: int = Field(default=3, ge=1, le=1000)
     task_reminder_check_interval_seconds: int = Field(default=60, ge=10, le=3600)
     task_reminder_advance_hours: int = Field(default=24, ge=1, le=168)
     smtp_enabled: bool = False

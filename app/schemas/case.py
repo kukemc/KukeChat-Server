@@ -390,6 +390,14 @@ class JuryVerdict(BaseModel):
     explanation: str | None = None
 
 
+class JuryCasePrecedent(BaseModel):
+    """案件详情里指向判例的那一小块。"""
+
+    id: int
+    title: str
+    mine: bool = False
+
+
 class JuryCaseDetail(JuryCaseContent):
     """投票之后看到的案件。只有对这个案件投过票的人能读。"""
 
@@ -408,6 +416,10 @@ class JuryCaseDetail(JuryCaseContent):
     opinion_count: int = 0
     # 案件此刻在公示栏里时是它的公开编号，否则为 null；质控题恒为 null
     public_case_id: int | None = None
+    # 这个案件是判例时为 { id, title, mine }；质控题恒为 null
+    precedent: JuryCasePrecedent | None = None
+    # 我现在能不能把它标为判例（资深、已定案、未改判、类别允许、还不是判例）
+    can_mark_precedent: bool = False
 
 
 class JuryRewardItem(BaseModel):

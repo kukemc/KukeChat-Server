@@ -29,7 +29,8 @@ from app.services import penalties as penalty_service
 logger = logging.getLogger(__name__)
 UTC = timezone.utc
 
-SOURCES = ("admin", "consensus", "legacy")
+# precedent：因为被标成判例才进的题库（jury_precedents），只给练习场
+SOURCES = ("admin", "consensus", "legacy", "precedent")
 # 自动入库：委员全票一致、有效票不少于这么多，定案满这么久
 CONSENSUS_VOTES = settings.jury_golden_consensus_votes
 AUTO_INCLUDE_DELAY_HOURS = settings.jury_golden_delay_hours
@@ -288,7 +289,7 @@ async def list_questions(
     if verified is not None:
         clauses.append(ReportCase.golden_verified.is_(verified))
     if source == "legacy":
-        clauses.append(or_(ReportCase.golden_source.is_(None), ReportCase.golden_source.not_in(("admin", "consensus"))))
+        clauses.append(or_(ReportCase.golden_source.is_(None), ReportCase.golden_source.not_in([item for item in SOURCES if item != "legacy"])))
     elif source:
         clauses.append(ReportCase.golden_source == source)
     if query and query.strip():

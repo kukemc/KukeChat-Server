@@ -8,6 +8,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 from app.schemas.case import JuryCaseMessage, JuryCasePost, JuryReasonCount, JuryStatus
+from app.schemas.jury_hall import JuryHallRules
 from app.schemas.user import UserPublic
 
 
@@ -124,6 +125,8 @@ class JuryConfig(BaseModel):
     practice: JuryDailyLimit
     recuse: JuryDailyLimit
     abstain: JuryAbstainRules
+    # —— 三期：议事厅 ——
+    hall: JuryHallRules | None = None
 
 
 # ---------------------------------------------------------------- 总览
@@ -291,6 +294,8 @@ class PublicCase(BaseModel):
     overturned: bool = False
     # 详情里是否带内容
     has_content: bool = False
+    # 这个案件是判例时是判例的 id，否则为 null
+    precedent_id: int | None = None
 
 
 class PublicCasePage(BaseModel):

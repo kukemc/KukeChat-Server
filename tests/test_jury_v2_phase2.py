@@ -1862,7 +1862,8 @@ class ConfigTests(Phase2TestCase):
         async with self.sessions() as db:
             raw = await overview_service.config(db)
             config = JuryConfig(**raw)
-            self.assertEqual(config.capabilities, [
+            # 三期会在后面继续追加，这里只看一、二期的这一段
+            self.assertEqual(config.capabilities[:13], [
                 "overview", "case_detail", "opinions", "votes", "public_cases",
                 "exam", "practice", "votes_v2", "points", "tiers", "achievements", "leaderboard", "badge",
             ])
