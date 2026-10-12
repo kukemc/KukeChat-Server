@@ -78,6 +78,7 @@ KukeChat 自己不发币、不存币。余额是算出来的：
 
 - `pattern.key` ∈ `dots` 圆点 / `grid` 细格 / `stripes` 斜纹 / `waves` 波浪 / `stars` 星点 / `hearts` 小爱心 / `pixels` 像素块 / `clouds` 云朵 / `petals` 花瓣 / `noise` 细颗粒。`opacity` 0–0.6，`scale` 0.5–2。
 - `ornaments[].key` ∈ `sparkle` 闪光 / `star` 星星 / `moon` 月亮 / `sun` 太阳 / `heart` 爱心 / `petal` 花瓣 / `cloud` 云 / `paw` 猫爪 / `leaf` 叶子 / `crown` 皇冠 / `pixel_heart` 像素爱心 / `bolt` 闪电 / `snow` 雪花。`corner` ∈ `tl` / `tr` / `bl` / `br`（装饰骑在气泡的角上，略微探出去一点）；`size` 10–28；`animated` 为 true 时轻微地闪 / 晃（同样受「减少动态效果」约束）。
+- `dark` 里只能出现 `background` / `text` / `link` / `border` / `shadow` / `pattern`，没写的沿用浅色的值；圆角、动效、角饰两种配色共用。
 - 图案和装饰都是**客户端内置**的，样式里只给名字和颜色，不能带图片地址。客户端遇到不认识的 `key` 就跳过那一项，其余照常画——所以以后加新图案要发版，但用已有图案组合出新皮肤不用。
 
 - 颜色只接受 `#rgb` / `#rrggbb` / `#rrggbbaa`；`background` 只接受一个颜色或一个 `linear-gradient(...)` / `radial-gradient(...)`（里面只能有角度、颜色和百分比）；`shadow` 只接受「偏移 模糊 [扩散] 颜色」的形式，最多两层。
