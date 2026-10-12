@@ -34,6 +34,7 @@ KukeChat 自己不发币、不存币。余额是算出来的：
   "preview_text": "今天也要开心呀",    // 预览用的示例文字，可空
   "tag": "new",                      // new / hot / limited / null
   "available_until": null,           // 限时商品的下架时间
+  "is_active": true,                 // false 表示已下架（只会出现在我已拥有的商品上）
   "owned": false,
   "equipped": false,
   "obtainable": "buy"                // 我现在能怎么得到它：buy 可以买 / level 等级够了可以免费领 / locked 等级不够且不卖 / owned 已拥有
@@ -87,7 +88,7 @@ KukeChat 自己不发币、不存币。余额是算出来的：
 
 `UserPublic` 新增 `cosmetics`：`{ "bubble": { "sku": "bubble.aurora", "style": { … } } }`，没装备时是 `{}`。消息的发送者对象里带着它，客户端据此画别人的气泡。旧客户端不认识，不受影响。
 
-装备变化时给本人的好友和所在会话的在线成员发已有的用户资料更新事件（和改昵称、头像时一样）。
+装备变化时发实时事件 `user.cosmetics.updated`：`{ "user_id": 42, "cosmetics": { … } }`，发给所有在线用户（同一个人 5 秒内最多一次，取最后的状态）。客户端收到后更新本地缓存里这个用户的 `cosmetics`，已经显示出来的消息气泡跟着变。
 
 ## 3. 接口
 
@@ -132,7 +133,7 @@ KukeChat 自己不发币、不存币。余额是算出来的：
 | 409 | `already_owned` | 已经有了 |
 | 409 | `ccw_not_bound` | 没绑定 CCW 账号 |
 | 409 | `item_locked` | 不卖，且等级不够 |
-| 402 | `insufficient_coins` | 余额不够。`detail` 里带 `balance`、`price`、`shortfall`、`donate_url` |
+| 402 | `insufficient_coins` | 余额不够。`detail` 里带 `balance`（数字，当前余额）、`price`、`shortfall`、`donate_url` |
 | 503 | `verification_unavailable` | 现在核实不了余额（CCW 接口不通），稍后再试。不会扣币 |
 
 ### 3.4 `PUT /shop/equipped`
@@ -149,6 +150,7 @@ body `{ "slot": "bubble", "sku": "bubble.aurora" }`，`sku` 传 null 表示卸�
 | --- | --- | --- |
 | `shop.changed` | `{}` | 商品目录有变化（上架、下架、改价），发给所有在线用户，同一进程 30 秒内最多一次。收到后在商店页打开时重拉 |
 | `shop.item.granted` | `{ item: { sku, name, category }, source }` | 我得到了一件商品（赠送，或升级后自动解锁） |
+| `user.cosmetics.updated` | `{ user_id, cosmetics }` | 有人换了装扮，见 2.3 |
 
 ## 5. 后台
 
