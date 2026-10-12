@@ -414,7 +414,7 @@
   ],
   // 系统自动暂停资格的条件
   "suspend": { "min_settled": 20, "agreement_rate": 0.6, "quality_min": 5, "quality_rate": 0.6 },
-  "exam": { "total": 10, "pass_score": 8, "time_limit_minutes": 60, "grace_seconds": 30,
+  "exam": { "total": 10, "pass_score": 8, "time_limit_minutes": 60, "grace_seconds": 90,
             "attempts_max": 3, "window_days": 30, "retry_hours": 24, "valid_days": 90 },
   "practice": { "daily_limit": 20 },
   "recuse": { "daily_limit": 5 },
@@ -503,7 +503,7 @@
 
 - 只判「违规 / 不违规」对不对；等级不计分，但 `answer` 里给出。
 - 没通过：24 小时后可重考，30 天内最多 3 次。
-- 交卷在 `expires_at` 之后还有 `grace_seconds`（30 秒）的宽限；再晚返回 409 `exam_closed`，这一场按 0 分、未通过记一次。客户端可以在倒计时结束前自动提交已有的答案。
+- 交卷在 `expires_at` 之后还有 `grace_seconds`（90 秒）的宽限；再晚返回 409 `exam_closed`，这一场按 0 分、未通过记一次。409 `exam_closed` 的 `detail.reason` 区分两种情况：`submitted` 这一场已经交过卷（比如在另一个设备上）、`expired` 超时作废。服务端不保存作答，超时后没法按已有的作答判分。客户端可以在倒计时结束前自动提交已有的答案。
 - 通过后 90 天内有效（期间没被任命的话要重考）。
 - 通过后不会自动提交申请，除非 `auto_appoint` 开着（此时直接任命）；否则客户端接着调 `POST /jury/apply`。
 

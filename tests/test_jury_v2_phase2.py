@@ -1889,7 +1889,7 @@ class ConfigTests(Phase2TestCase):
             self.assertEqual(config.model_dump()["tiers"], raw["tiers"])
             self.assertEqual(raw["suspend"], {"min_settled": 20, "agreement_rate": 0.6, "quality_min": 5, "quality_rate": 0.6})
             self.assertEqual(raw["exam"], {
-                "total": 10, "pass_score": 8, "time_limit_minutes": 60, "grace_seconds": 30,
+                "total": 10, "pass_score": 8, "time_limit_minutes": 60, "grace_seconds": 90,
                 "attempts_max": 3, "window_days": 30, "retry_hours": 24, "valid_days": 90,
             })
             self.assertEqual((raw["practice"], raw["recuse"]), ({"daily_limit": 20}, {"daily_limit": 5}))

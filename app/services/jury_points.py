@@ -425,7 +425,7 @@ async def demote_warning(db: AsyncSession, member: JuryMember, margin: float) ->
     line = round(rule["agreement_rate"] * 100)
     return {
         "code": "demote_risk",
-        "message": f"你最近 {sample} 张已出结论的票里，与结论一致的占 {round(rate * 100)}%；低于 {line}% 会降为{TIER_LABELS[rule['to']]}",
+        "message": f"你最近 {sample} 张已出结论的票里，与结论一致的占 {rate * 100:.1f}%；低于 {line}% 会降为{TIER_LABELS[rule['to']]}",
         "current": round(rate, 3),
         "threshold": rule["agreement_rate"],
         "sample": sample,

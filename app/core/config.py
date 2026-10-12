@@ -155,7 +155,8 @@ class Settings(BaseSettings):
     jury_exam_total: int = Field(default=10, ge=1, le=100)
     jury_exam_pass_score: int = Field(default=8, ge=1, le=100)
     jury_exam_time_limit_minutes: int = Field(default=60, ge=1, le=24 * 60)
-    jury_exam_grace_seconds: int = Field(default=30, ge=0, le=3600)
+    # 浏览器会把后台标签页的定时器降到每分钟一次，宽限太短的话自动交卷会错过
+    jury_exam_grace_seconds: int = Field(default=90, ge=0, le=3600)
     jury_exam_attempts_max: int = Field(default=3, ge=1, le=100)
     jury_exam_window_days: int = Field(default=30, ge=1, le=3650)
     jury_exam_retry_hours: int = Field(default=24, ge=0, le=24 * 365)

@@ -328,11 +328,16 @@ async def submit_exam(db: AsyncSession, user: User, attempt_id: int, raw_answers
     attempt = await db.get(JuryExamAttempt, attempt_id)
     if attempt is None or attempt.user_id != user.id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"code": "exam_not_found", "message": "没有这场考试"})
-    closed = HTTPException(status_code=status.HTTP_409_CONFLICT, detail={"code": "exam_closed", "message": "这一场已经交卷或者已经超时"})
+
+    def closed(reason: str) -> HTTPException:
+        # reason：submitted 已经交过卷（比如在另一个设备上）/ expired 超时作废
+        message = "这一场已经超时作废" if reason == "expired" else "这一场已经交过卷了"
+        return HTTPException(status_code=status.HTTP_409_CONFLICT, detail={"code": "exam_closed", "message": message, "reason": reason})
+
     if attempt.submitted_at is not None:
-        raise closed
+        raise closed("expired" if attempt.timed_out else "submitted")
     if await _settle_expired(db, [attempt], now):
-        raise closed
+        raise closed("expired")
     case_ids = [int(case_id) for case_id in json.loads(attempt.question_ids)]
     answers = _parse_answers(raw_answers, len(case_ids))
     cases = {case.id: case for case in (await db.execute(select(ReportCase).where(ReportCase.id.in_(case_ids)))).scalars().all()}

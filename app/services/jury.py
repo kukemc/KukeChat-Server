@@ -375,7 +375,7 @@ def _suspend_warning(member: JuryMember) -> dict[str, Any] | None:
     rate, sample, label = min(risky, key=lambda item: item[0])
     return {
         "code": "suspend_risk",
-        "message": f"你的{label}是 {round(rate * 100)}%（{sample} 张）；低于 {round(MIN_ACCURACY * 100)}% 会被系统暂停资格",
+        "message": f"你的{label}是 {rate * 100:.1f}%（{sample} 张）；低于 {round(MIN_ACCURACY * 100)}% 会被系统暂停资格",
         "current": round(rate, 3),
         "threshold": MIN_ACCURACY,
         "sample": sample,
@@ -390,7 +390,7 @@ async def _warnings(db: AsyncSession, member: JuryMember) -> list[dict[str, Any]
         warnings.append(
             {
                 "code": "high_abstain",
-                "message": f"你最近 {count} 张票里「拿不准」和「上下文不足」占了 {round(rate * 100)}%，超过 {round(ABSTAIN_COOLDOWN_RATE * 100)}% 会暂停发案",
+                "message": f"你最近 {count} 张票里「拿不准」和「上下文不足」占了 {rate * 100:.1f}%，超过 {round(ABSTAIN_COOLDOWN_RATE * 100)}% 会暂停发案",
                 "current": round(rate, 3),
                 "threshold": ABSTAIN_WARN_RATE,
                 "sample": count,
