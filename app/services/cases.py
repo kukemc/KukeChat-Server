@@ -996,6 +996,12 @@ async def _apply_overturn(
     case.overturned_by_id = actor_id
     case.overturn_note = text
     case.updated_at = now
+    if case.is_golden and case.golden_outcome is None:
+        # 题目的标准答案就是案件原来的结论，结论被推翻后不能再当题目；
+        # 管理员另写过标准答案的保留（出题时本来就不出被改判的案件）。
+        case.is_golden = False
+        case.golden_verified = False
+        case.golden_source = "excluded"
     # 这三个模块都在模块级导入了 cases，只能在函数里导入
     from app.services import jury as jury_service
     from app.services import jury_precedents, jury_reviews

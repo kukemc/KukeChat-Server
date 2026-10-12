@@ -35,7 +35,8 @@ UTC = timezone.utc
 SOURCES = ("admin", "consensus", "legacy", "precedent")
 # 自动入库：委员全票一致、有效票不少于这么多，定案满这么久
 CONSENSUS_VOTES = settings.jury_golden_consensus_votes
-AUTO_INCLUDE_DELAY_HOURS = settings.jury_golden_delay_hours
+# 举报人还能申请复议的那几天里结论可能被推翻，等窗口过了再自动入库
+AUTO_INCLUDE_DELAY_HOURS = max(settings.jury_golden_delay_hours, settings.jury_reconsider_window_days * 24)
 AUTO_INCLUDE_BATCH = 200
 # 已核对的题里，编号能被它整除的那一份只给练习场，其余的给考试和评审质控。按编号切是为了固定：一道题不会今天练、明天考。
 PRACTICE_EVERY = settings.jury_practice_every

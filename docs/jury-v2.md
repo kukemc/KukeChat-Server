@@ -429,7 +429,7 @@
 题库里的一道题 = 一个已经有结论的案件（内容是匿名的案件快照）。来源有两个：
 
 - 管理员在后台标注（可以写说明、改标准答案）。
-- 自动入库：委员全票一致通过（有效票 ≥ 3）、定案满 72 小时、没有被改判、没有待处理申诉的案件。有分歧的（比如 4 比 1）不入库。
+- 自动入库：委员全票一致通过（有效票 ≥ 3）、定案满 7 天（过了举报人还能申请复议的窗口）、没有被改判、没有待处理申诉的案件。有分歧的（比如 4 比 1）不入库。案件之后被改判的，自动移出题库。
 
 不入库的：涉及私聊的、色情 / 涉未成年 / 隐私类别的、公示栏里会展示内容的（公开动态且认定违规——否则考试可以去公示栏查答案）。
 
@@ -765,7 +765,7 @@
   "review_id": 12,
   "type": "appeal",                          // appeal 申诉复审 / reconsider 举报人复议（见 3.7）
   "kind": "message",                         // message / post
-  "source": "jury",                          // jury / panel / machine
+  "source": "jury",                          // jury / panel / machine（注意 ViolationRead.source 里机器处罚叫 auto_* ，两处取值不同）
   "category": "harassment", "category_label": "辱骂骚扰", "level": 2,
   "penalty": { "kind": "mute", "hours": 24 },
   "messages": [ /* 来自案件的：匿名上下文，同 JuryCaseView.messages */ ],
@@ -928,7 +928,7 @@
 - `reconsider_text`、`requested_at` 代替 `appeal_text`、`appealed_at`（后两个为 null）；
 - `category` / `category_label` / `level` / `penalty` / `content` 为 null。
 
-`POST /jury/appeals/{review_id}/vote` 对复议的取值是 `uphold` / `overturn`；投 `overturn` 时可以带 `level`（1–3）和 `category`，和普通违规票一样。两票相同即出结果；`overturn` 时案件按改判处理（1.10），等级取 `overturn` 票的较低中位数。凑不齐 3 位资深委员或 72 小时没结果时转管理员，管理员用 `POST /admin/cases/{id}/overturn` 处理。
+`POST /jury/appeals/{review_id}/vote` 对复议的取值是 `uphold` / `overturn`；投 `overturn` 时可以带 `level`（1–3）和 `category`，和普通违规票一样。两票相同即出结果；`overturn` 时案件按改判处理（1.10），等级取 `overturn` 票的较低中位数。凑不齐 3 位资深委员或 72 小时没结果时转管理员，管理员用 `POST /admin/jury/reviews/{review_id}/decide` 维持或改判（直接改判案件也会了结这条复议）。
 
 ### 3.7.1 合议、复审、机器案源、复议实现上的细节
 

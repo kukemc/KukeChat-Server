@@ -204,7 +204,7 @@ class Phase2TestCase(JuryV2TestCase):
 
 
 class BankTests(Phase2TestCase):
-    async def _consensus(self, db, votes: list[str], *, hours: float = 80, **fields) -> ReportCase:
+    async def _consensus(self, db, votes: list[str], *, hours: float = 200, **fields) -> ReportCase:
         """委员定案的案件，带上他们的票。"""
         now = datetime.now(UTC)
         case = await self._question(
