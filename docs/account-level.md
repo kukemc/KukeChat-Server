@@ -78,8 +78,8 @@
     { "key": "checkin",  "label": "当天在任意群签到", "days": 0.1 },
     { "key": "ccw_bound", "label": "已绑定 CCW 账号", "days": 0.1 },
     { "key": "jury",     "label": "风纪委员当天参与评审", "days": 0.2 },
-    { "key": "streak_7", "label": "连续活跃 7 天", "days": 0.1 },
-    { "key": "streak_30", "label": "连续活跃 30 天", "days": 0.3 }
+    { "key": "streak_7", "label": "连续活跃 7 天", "days": 0.1, "target": 7 },
+    { "key": "streak_30", "label": "连续活跃 30 天", "days": 0.3, "target": 30 }
   ],
   "milestones": [ { "level": 4, "days": 32 }, { "level": 16, "days": 320 }, { "level": 64, "days": 4352 } ]
 }
@@ -147,6 +147,17 @@
 ```jsonc
 { "items": [ { "date": "2026-10-11", "online_minutes": 184, "base": 1.0, "bonus": 0.4, "earned": 1.4 } ] }
 ```
+
+### 3.6 细节
+
+- 没有值的可选键（`target`、`current`）直接不出现，不是 null。`today.bonuses` 里发言和两个连续活跃项带 `current` / `target`。
+- `registered_days`：注册当天算第 1 天。
+- `rank` 来自 60 秒的缓存：新用户刚拿到第一个活跃天时，最多 60 秒内还是 null。
+- 排行榜不含机器人和封禁中的账号；月榜的 `gained` 只算每天结算记入的，不含老用户折算和后台手动调整。
+- 群发言、签到都按 UTC+8 的自然日归属。下线之后才满足的加成（比如 23:58 发的言），会在第二天第一次结算时补记到前一天。
+- 默认数值下，所有加成拿满正好是每日上限 2.0。
+- 通知中心里的升级通知：`id` 形如 `account_level:12`，`payload` 是 `{ level, icons }`。
+- 错误码：404 `user_not_found`。
 
 ## 4. 实时事件与通知
 
