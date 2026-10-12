@@ -132,8 +132,10 @@ class JuryHallRules(BaseModel):
     # 要展示的守则，纯文本，含换行
     guidelines: str
     report_reasons: list[str]
-    # 帖子或评论被多少个不同的人举报后自动折叠
+    # 帖子或评论被多少名在任委员举报后自动折叠（其他用户的举报只记录，不计入）
     auto_hide_reports: int = 3
+    # 每人最近 24 小时最多举报多少次
+    reports_per_day: int = 20
 
 
 # ---------------------------------------------------------------- 议事厅：帖子
@@ -318,6 +320,12 @@ class AdminHallCommentRead(BaseModel):
     deleted_at: datetime | None = None
     deleted_by_id: int | None = None
     moderation_note: str | None = None
+
+
+class AdminHallCommentModerate(BaseModel):
+    # delete 删除 / restore 恢复显示（被折叠的、或被管理员删掉的；作者自己删的不能恢复）
+    action: Literal["delete", "restore"]
+    note: str | None = Field(default=None, max_length=500)
 
 
 class AdminHallPostDetail(AdminHallPostRead):

@@ -520,7 +520,7 @@ async def _settle_reconsider(db: AsyncSession, review: JuryReview, outcome: str,
     review.outcome = outcome
     review.decided_by = "senior"
     if outcome == "uphold":
-        _notify_requester(db, review.requester_id, "reconsider_result", "你申请的复议有结果了", "资深委员复审后维持原结论：暂未发现违规。")
+        _notify_requester(db, review.requester_id, "reconsider_result", "你申请的复议有结果了", RECONSIDER_UPHELD_BY_SENIOR)
         await db.commit()
         await _notify_reconsider_upheld(db, review, case)
         return outcome
@@ -551,7 +551,11 @@ async def _settle_reconsider(db: AsyncSession, review: JuryReview, outcome: str,
     return outcome
 
 
-async def _notify_reconsider_upheld(db: AsyncSession, review: JuryReview, case: ReportCase) -> None:
+RECONSIDER_UPHELD_BY_SENIOR = "资深委员复审后维持原结论：暂未发现违规。"
+RECONSIDER_UPHELD_BY_ADMIN = "管理员复核后维持原结论：暂未发现违规。"
+
+
+async def _notify_reconsider_upheld(db: AsyncSession, review: JuryReview, case: ReportCase, body: str = RECONSIDER_UPHELD_BY_SENIOR) -> None:
     """复议维持原结论：给申请人补发一次 report.resolved（改判的那条路由 overturn_case 发）。"""
     from app.websocket.manager import manager
 
@@ -567,7 +571,7 @@ async def _notify_reconsider_upheld(db: AsyncSession, review: JuryReview, case: 
                 "case_id": case.id,
                 "status": report.status.value,
                 "title": "你申请的复议有结果了",
-                "body": "资深委员复审后维持原结论：暂未发现违规。",
+                "body": body,
             },
         )
         await case_service._broadcast_admin(case, "reconsidered")
@@ -861,8 +865,13 @@ async def admin_list(
         clauses.append(JuryReview.status == status_filter)
     total = int((await db.execute(select(func.count(JuryReview.id)).where(*clauses))).scalar_one() or 0)
     reviews = list((await db.execute(select(JuryReview).where(*clauses).order_by(JuryReview.id.desc()).offset(offset).limit(limit))).scalars().all())
+    return await admin_reads(db, reviews), total
+
+
+async def admin_reads(db: AsyncSession, reviews: list[JuryReview]) -> list[dict[str, Any]]:
+    """后台看到的复审：处罚 / 案件、申诉或复议的理由、每位复审委员的票（实名）、结果。"""
     if not reviews:
-        return [], total
+        return []
     review_ids = [review.id for review in reviews]
     vote_rows = (
         await db.execute(
@@ -923,4 +932,75 @@ async def admin_list(
                 "votes": votes[review.id],
             }
         )
-    return items, total
+    return items
+
+
+async def admin_decide(
+    db: AsyncSession, admin: User, review_id: int, action: str, *, level: int | None = None, category: str | None = None, note: str | None = None
+) -> dict[str, Any]:
+    """POST /admin/jury/reviews/{review_id}/decide：管理员给一件举报人复议出结果。
+
+    uphold：维持原结论（不违规）。overturn：改判为违规，走改判那一套（补记处罚、处理内容、同步举报和委员的一致率）。
+    转给管理员的（凑不齐人 / 超时）和还在资深阶段的都可以处理，后者等于管理员直接接手，资深委员没投完的票作废。
+    没有这个接口时，转给管理员的复议只能用改判接口处理，想维持原结论就没有出口，会一直是 pending。
+    申诉复审不在这里处理：用原有的 POST /admin/violations/{id}/appeal（那边会连带了结复审）。
+    """
+    review = await db.get(JuryReview, review_id)
+    if review is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"code": "review_not_found", "message": "复审不存在"})
+    if review.kind != "reconsider":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "appeal_review",
+                "message": f"这是一件申诉复审，请用 POST /admin/violations/{review.violation_id}/appeal 处理申诉",
+                "violation_id": review.violation_id,
+            },
+        )
+    if action not in RECONSIDER_VOTES:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail={"code": "invalid_action", "message": "处理结果只能是 uphold 或 overturn"})
+    if level is not None and (isinstance(level, bool) or not 1 <= level <= 3):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail={"code": "invalid_level", "message": "等级只能是 1–3"})
+    if category is not None and category not in penalty_service.CATEGORIES:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail={"code": "invalid_category", "message": "未知的违规类别"})
+    if review.status != "open":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail={"code": "review_closed", "message": "这件复议已经有结果了"})
+    case = await db.get(ReportCase, review.case_id) if review.case_id is not None else None
+    if case is None or case.status != "dismissed":
+        # 正常不会走到这里：案件被改判时，它的复议会一起了结（on_case_overturned）
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail={"code": "reconsider_unavailable", "message": "案件现在的结论已经不是「不违规」，没有什么可复议的"})
+    now = datetime.now(UTC)
+    text = note.strip()[:2000] if note and note.strip() else None
+    was_senior = review.stage == "senior"
+    if action == "overturn":
+        # 改判会提交事务、通知举报人（report.resolved）和投过票的委员；on_case_overturned 在同一个事务里把这件复议记成 overturn / admin
+        await case_service.overturn_case(
+            db, case.id, actor_id=admin.id, upheld=True, category=category, level=level, note=text or "举报人申请复议，管理员复核后改判为违规"
+        )
+    else:
+        review.status = "closed"
+        review.outcome = "uphold"
+        review.decided_by = "admin"
+        review.closed_at = now
+        _notify_requester(db, review.requester_id, "reconsider_result", "你申请的复议有结果了", RECONSIDER_UPHELD_BY_ADMIN)
+    db.add(
+        AdminAuditLog(
+            actor_id=admin.id,
+            action="jury.review.decide",
+            target_type="jury_review",
+            target_id=review.id,
+            details=json.dumps(
+                {"kind": review.kind, "case_id": case.id, "action": action, "stage": "senior" if was_senior else "admin", "level": level, "category": category, "note": text},
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+        )
+    )
+    await db.commit()
+    if action == "uphold":
+        await _notify_reconsider_upheld(db, review, case, RECONSIDER_UPHELD_BY_ADMIN)
+    if was_senior:
+        # 资深委员那边的待审件数变了
+        await case_service.notify_jury_queue_changed(db)
+    await db.refresh(review)
+    return (await admin_reads(db, [review]))[0]

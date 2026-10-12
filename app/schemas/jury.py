@@ -246,7 +246,8 @@ class JuryVoteItem(BaseModel):
     vote: str | None = None
     voted_at: datetime | None = None
     alias: str | None = None
-    stage: Literal["jury", "panel", "admin", "closed"]
+    # 案件现在所处的阶段。回避的记录为 null：回避的人不该知道案件的进展
+    stage: Literal["jury", "panel", "admin", "closed"] | None = None
     # 这一票是哪一轮投的：jury 原审 / panel 资深合议（stage 是案件现在所处的阶段）
     vote_stage: Literal["jury", "panel"] = "jury"
     outcome: Literal["violation", "clean"] | None = None

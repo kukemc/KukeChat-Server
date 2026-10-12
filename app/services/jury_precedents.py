@@ -99,6 +99,7 @@ def _enter_bank(db: AsyncSession, precedent: JuryPrecedent, case: ReportCase, ba
     """判例自动进练习场的题库。未核对的题只给练习场（jury_bank.question_pool），所以进去的时候一律是未核对。
 
     本来就在计分那一份里的题改成未核对：判例把内容和结论都公开了，不能再拿来考试和质控。
+    （还是判例的时候题库本身就把它挡在计分那一份之外，见 jury_bank.question_pool；这里改成未核对，是为了判例撤下之后它也不会自己回到计分那一份。）
     管理员移出过题库的（removed）尊重那次决定，不再放回去。
     """
     precedent.bank_added = False

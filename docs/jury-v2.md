@@ -542,12 +542,13 @@
 | `need_context` | `abstain` | 上下文不足，无法判断。不计入表决；同一案件累计 2 票后转出（三期起转给资深合议，之前转管理员） |
 
 - 回避之后不能看这个案件的详情和观点区（响应里 `case: null`）。
-- `/jury/votes`：回避和「上下文不足」的记录都会列出，`vote` 分别是 `recuse` / `need_context`，`vote` 筛选参数也接受这两个值。每项新增 `can_view`：回避的记录为 false（点不进详情），其余为 true。回避的记录 `agreed` 恒为 null。
+- `/jury/votes`：回避和「上下文不足」的记录都会列出，`vote` 分别是 `recuse` / `need_context`，`vote` 筛选参数也接受这两个值。每项新增 `can_view`：回避的记录为 false（点不进详情），其余为 true。**回避的记录不透露案件的任何进展**：`stage`、`outcome`、`agreed`、`closed_at`、`verdict_*`、`public_case_id` 都是 null，`opinion_count` 为 0；带 `state` / `outcome` / `agreed` 筛选时不返回回避的记录。
 - 案件详情和公示栏的 `tally` 新增一个键 `need_context`；`recuse` 不出现在 `tally` 里。`votes_cast` 仍然只数有效票。
 - 质控题上也可以回避，但下一件仍会补一道质控题。
+- 案件详情也带 `suggested_category`，`my_vote` 里带我选的 `category`（没选为 null）。
 - **投违规票时可以带 `category`**：`{ "vote": "l2", "category": "harassment", "note"?: … }`。可选的类别在 `config.categories`（`[{ key, label, default_level }]`，不含色情类）；`JuryCaseView.suggested_category` 是按举报理由映射的默认值。定案类别取违规票里的多数，平票时取默认值。
 - **严重违规要 5 票**：如果按现有票数会定为 l3，但有效票不足 5 张，案件继续收票，到 5 张再按原规则表决。
-- **质控题的位置随机**：不再固定在第 5、10、15… 件；只出已核对的题。
+- **质控题的位置随机**：不再固定在第 5、10、15… 件；只出已核对的题。质控题在投票之前展示的内容时间会整体平移到近期（它们是早就结案的旧案件，不平移的话看时间就能认出来），各条消息的间隔不变；投完揭晓后显示真实时间。客户端不用做任何事，只是别拿投票前后的时间做比较。
 - **弃权过多**：近 50 张票里「拿不准 + 上下文不足」超过 30% 时 `/jury/me.warnings` 给 `high_abstain`；超过 50% 时暂停发案 24 小时，`GET /jury/cases/next` 返回 429 `jury_cooldown`（`detail.until`）。不足 20 张票时不判断。
 
 `POST /jury/cases/{case_id}/vote` 的响应新增 `reward`（见 2.6）。
@@ -928,6 +929,28 @@
 - `category` / `category_label` / `level` / `penalty` / `content` 为 null。
 
 `POST /jury/appeals/{review_id}/vote` 对复议的取值是 `uphold` / `overturn`；投 `overturn` 时可以带 `level`（1–3）和 `category`，和普通违规票一样。两票相同即出结果；`overturn` 时案件按改判处理（1.10），等级取 `overturn` 票的较低中位数。凑不齐 3 位资深委员或 72 小时没结果时转管理员，管理员用 `POST /admin/cases/{id}/overturn` 处理。
+
+### 3.7.1 合议、复审、机器案源、复议实现上的细节
+
+- **合议**
+  - `tally.panel` 只在进过合议的案件上出现；公示栏的 `tally` / `votes` 仍只是原审的票。
+  - 合议票计入总票数、一致率和每日投票数；但 `/jury/panel/next` 不受每日 30 件上限和弃权冷却限制。合议里的回避和原审共用每天 5 次的上限。
+  - 在这个案件上有过任何分配记录的人（投过、回避过、分到手没投的）都不进它的合议。
+  - 错误码：422 `invalid_vote`（合议里投了「拿不准」或「上下文不足」）；409 `already_voted`、`already_recused`。
+- **申诉复审**
+  - 除 3.2 列的条件外，还有两种申诉直接到管理员：被 7 天上限压住、正在等管理员确认更重处置的处罚；低俗 / 擦边类。
+  - 机器处罚被撤销时，被撤回的内容不会自动恢复（只有来自案件的处罚会尝试恢复内容）。
+  - 复审转给管理员时（超时或凑不齐人），`moderation.violation.updated` 的 `action` 是 `appeal_escalated`，`appeal_stage` 变成 `admin`。
+  - 结果通知在通知中心里是 `type="jury"`，`payload.kind` 为 `appeal_result`；举报人复议的是 `reconsider_result`。
+  - 每张复审 / 复议票的 +8 只在投票响应的 `reward` 里返回，不另发 `jury.points.changed`；这条明细的 `case_id` 为 null。
+  - `/jury/appeals/mine` 对非资深委员返回空列表。
+  - 错误码：404 `review_not_found`；409 `review_closed`（已结束或已转管理员）、`already_voted`；422 `invalid_vote`。
+- **机器来源的案件**
+  - 只收纯文本的群聊消息（不带图），以及文字拿不准、图片全部被机器放行的公开动态；类别为色情、涉未成年、低俗、擦边的不收；同一条内容已经有过案件（包括已结的）就不再建。
+  - 之后有人举报了同一条内容，这个案件就按普通举报案件走（凑不齐人会转管理员）。
+  - 没人举报的机器案件在原审或合议超时 / 无共识、又没有合议可用时，以「未作处理」结案：不处罚、不进公示栏；投过票的委员仍会收到 `jury.case.settled`，这些票不计一致率（`my_vote.agreed` 为 null），`verdict.outcome` 为 `clean`、`source` 为 `auto`。
+- **重复举报**：`already_reviewed` 对管理员认定的不违规同样生效。
+- **复议**：一个案件只能复议一次。转给管理员后，管理员可以维持或改判；结果出来前 `reconsider_status` 一直是 `pending`。复议时不是我的举报返回 404 `report_not_found`。
 
 ### 3.8 后台接口
 

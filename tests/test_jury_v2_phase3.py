@@ -1569,3 +1569,317 @@ class RecallBroadcastTests(Phase3TestCase):
             # 只为接口返回的举报详情组装了一次
             self.assertEqual((built, per_user), (1, []))
             self.assertIsNotNone((await db.get(Message, message_id)).recalled_at)
+
+
+# ---------------------------------------------------------------- 第二轮修复：回避的记录不漏结论、复议转管理员后的出口、后台设置
+
+
+class RecusedRecordTests(Phase3TestCase):
+    """回避的人不该知道案件后来怎么样了（docs/jury-v2.md 2.5）。"""
+
+    # 回避的记录上，一切能反映案件进展的字段都是空的
+    HIDDEN = {
+        "stage": None, "outcome": None, "verdict_source": None, "verdict_level": None, "closed_at": None, "agreed": None,
+        "overturned": False, "is_quality_check": False, "opinion_count": 0, "can_view": False, "public_case_id": None, "alias": None,
+    }  # fmt: skip
+
+    async def _recused(self, db, name: str, **filters) -> list[dict]:
+        items, total = await jury_service.list_votes(db, self.ids[name], votes=["recuse"], **filters)
+        self.assertEqual(total, len(items))
+        return items
+
+    async def test_recused_records_reveal_nothing_about_the_case(self) -> None:
+        async with self.sessions() as db:
+            # 合议里要有人回避之后还凑得齐三位，所以多一位资深委员
+            await self._seniors(db, "juror4", "juror5", "juror6", "insider")
+            # 原审里回避，案件之后定案为违规，有观点，进了公示栏，后来又被改判
+            settled = await self._open_case(db)
+            await self._cast(db, "juror1", settled.id, "recuse", "我认识这个人")
+            for name in ("juror2", "juror3", "speaker"):
+                result = await self._cast(db, name, settled.id, "l2", "明显违规")
+            self.assertTrue(result["settled"])
+            await self._age(db, settled.id, case_service.PUBLISH_DELAY_HOURS + 1)
+            await case_service.overturn_case(db, settled.id, actor_id=self.ids["admin"], upheld=False, note="改判")
+            # 原审里回避，案件还没定案
+            pending = await self._open_case(db)
+            await self._cast(db, "juror1", pending.id, "recuse")
+            # 在质控题上回避：题目是早就结案的旧案件
+            question = await self._question(db)
+            await self._cast(db, "juror1", question.id, "recuse", quality=True)
+            # 合议里回避，案件之后由合议定案
+            split = await self._split(db, (await self._open_case(db)).id)
+            self.assertEqual(split.queue, "panel")
+            self.assertIsNone((await self._panel_cast(db, "juror4", split.id, "recuse"))["case"])
+            await self._panel_cast(db, "juror5", split.id, "none", "不算违规")
+            self.assertTrue((await self._panel_cast(db, "juror6", split.id, "none"))["settled"])
+
+            # juror1：三条回避的记录长得一模一样，看不出哪个结了、结论是什么、哪个是质控题
+            items = await self._recused(db, "juror1")
+            self.assertEqual([await self._real(db, item["case_id"]) for item in items], [question.id, pending.id, settled.id])
+            for item in items:
+                read = JuryVoteItem(**item)
+                self.assertEqual({key: item[key] for key in self.HIDDEN}, self.HIDDEN)
+                self.assertEqual((read.vote, read.stage, read.vote_stage), ("recuse", None, "jury"))
+                self.assertIsNotNone(read.voted_at)
+            # 同一个案件，投过票的人照常看得到
+            voter_rid = await self._rid(db, "juror2", settled.id)
+            voter = next(item for item in (await jury_service.list_votes(db, self.ids["juror2"]))[0] if item["case_id"] == voter_rid)
+            self.assertEqual((voter["stage"], voter["outcome"], voter["overturned"], voter["opinion_count"], voter["can_view"]), ("closed", "clean", True, 3, True))
+
+            # 带了 state / outcome / agreed 任何一个筛选，就不返回回避的记录
+            for filters in ({"state": "closed"}, {"state": "open"}, {"outcome": "violation"}, {"outcome": "clean"}, {"agreed": True}, {"agreed": False}):
+                self.assertEqual(await self._recused(db, "juror1", **filters), [], filters)
+                listed, total = await jury_service.list_votes(db, self.ids["juror1"], **filters)
+                self.assertEqual(total, len(listed))
+                self.assertNotIn("recuse", [item["vote"] for item in listed], filters)
+            # juror1 在 split 那个案件上投过票：不带 vote 筛选时，state=closed 只剩这一条
+            closed, total = await jury_service.list_votes(db, self.ids["juror1"], state="closed")
+            self.assertEqual((total, [await self._real(db, item["case_id"]) for item in closed]), (1, [split.id]))
+            self.assertEqual((await jury_service.list_votes(db, self.ids["juror1"]))[1], 4)
+
+            # 合议里的回避同理
+            panel = await self._recused(db, "juror4")
+            self.assertEqual([(await self._real(db, item["case_id"]), item["vote_stage"]) for item in panel], [(split.id, "panel")])
+            self.assertEqual({key: panel[0][key] for key in self.HIDDEN}, self.HIDDEN)
+            JuryVoteItem(**panel[0])
+            for filters in ({"state": "closed"}, {"outcome": "clean"}, {"agreed": False}):
+                self.assertEqual(await self._recused(db, "juror4", **filters), [], filters)
+            # 合议里投了票的人看得到结论
+            seat = (await jury_service.list_votes(db, self.ids["juror5"]))[0][0]
+            self.assertEqual((seat["stage"], seat["vote_stage"], seat["outcome"], seat["verdict_source"], seat["agreed"]), ("closed", "panel", "clean", "panel", True))
+            # 回避的人也收不到定案 / 改判的实时事件
+            with self._events() as events:
+                await case_service.notify_jurors_settled(db, split)
+            self.assertNotIn(self.ids["juror4"], self._per_user(events, "jury.case.settled"))
+
+
+class ReconsiderAdminTests(Phase3TestCase):
+    """复议转给管理员之后：维持原结论也要有出口（POST /admin/jury/reviews/{id}/decide）。"""
+
+    TEXT = "对方连续三条都在骂人，不是玩笑"
+    TITLE = "你申请的复议有结果了"
+
+    async def _reconsider(self, db, message: str) -> tuple[ReportCase, UserReport, JuryReview]:
+        report = await self._report(db, "alice", message)
+        await self._queue(db, report.case_id)
+        case = await self._settle(db, report.case_id, "none")
+        await review_service.request_reconsider(db, self.ids["alice"], report.id, self.TEXT)
+        review = (await db.execute(select(JuryReview).where(JuryReview.kind == "reconsider", JuryReview.case_id == case.id))).scalar_one()
+        return case, report, review
+
+    async def _status(self, db, report: UserReport) -> tuple[bool, str]:
+        read = await report_service.build_report_read(db, await report_service.get_report(db, report.id), self.ids["alice"])
+        return read.can_reconsider, read.reconsider_status
+
+    async def _decisions(self, db) -> list[dict]:
+        rows = await db.execute(select(AdminAuditLog).where(AdminAuditLog.action == "jury.review.decide").order_by(AdminAuditLog.id))
+        return [{"actor": log.actor_id, "target": (log.target_type, log.target_id), **json.loads(log.details)} for log in rows.scalars().all()]
+
+    async def _result_notices(self) -> list[str]:
+        # 用一个新会话读，和真实请求一样：通知中心按时间排序，同一个会话里刚写的对象带时区、读出来的不带，混在一起排不了
+        async with self.sessions() as db:
+            notifications = await notification_service.list_unified_notifications(db, self.ids["alice"])
+        return [item.title for item in notifications.items if item.type == "jury" and item.title == self.TITLE]
+
+    async def test_admin_upholds_a_reconsideration_that_was_handed_over(self) -> None:
+        async with self.sessions() as db:
+            admin, alice = await self._user(db, "admin"), self.ids["alice"]
+            # 凑不齐三位资深委员：复议直接到了管理员手里
+            case, report, review = await self._reconsider(db, "insult")
+            self.assertEqual((review.stage, review.status), ("admin", "open"))
+            self.assertEqual(await self._code(review_service.admin_decide(db, admin, 99999, "uphold")), (404, "review_not_found"))
+            self.assertEqual(await self._code(review_service.admin_decide(db, admin, review.id, "revoke")), (422, "invalid_action"))
+            self.assertEqual(await self._code(review_service.admin_decide(db, admin, review.id, "overturn", category="nonsense")), (422, "invalid_category"))
+            self.assertEqual(await self._code(review_service.admin_decide(db, admin, review.id, "overturn", level=4)), (422, "invalid_level"))
+            self.assertEqual(await self._status(db, report), (False, "pending"))
+
+            with self._events() as events:
+                read = AdminReviewRead(**await review_service.admin_decide(db, admin, review.id, "uphold", note=" 复核过了，确实是玩笑 "))
+            self.assertEqual((read.id, read.kind, read.status, read.outcome, read.decided_by, read.stage, read.case_id), (review.id, "reconsider", "closed", "uphold", "admin", "admin", case.id))
+            self.assertIsNotNone(read.closed_at)
+            # 案件的结论没动，举报人这边不再是 pending
+            await db.refresh(case)
+            self.assertEqual((case.status, case.overturned_at), ("dismissed", None))
+            self.assertEqual(await self._status(db, report), (False, "upheld"))
+            self.assertEqual(CaseRead(**(await case_service.build_case_reads(db, [case]))[0]).reconsider_status, "upheld")
+            resolved = self._per_user(events, "report.resolved")
+            self.assertEqual(set(resolved), {alice})
+            self.assertEqual((resolved[alice]["report_id"], resolved[alice]["title"], resolved[alice]["body"], resolved[alice]["status"]), (report.id, self.TITLE, review_service.RECONSIDER_UPHELD_BY_ADMIN, "rejected"))
+            self.assertEqual(await self._result_notices(), [self.TITLE])
+            self.assertEqual(
+                await self._decisions(db),
+                [{"actor": admin.id, "target": ("jury_review", review.id), "kind": "reconsider", "case_id": case.id, "action": "uphold", "stage": "admin", "level": None, "category": None, "note": "复核过了，确实是玩笑"}],
+            )
+            # 只能处理一次；一个案件也只能复议一次
+            self.assertEqual(await self._code(review_service.admin_decide(db, admin, review.id, "overturn")), (409, "review_closed"))
+            self.assertEqual(await self._code(review_service.request_reconsider(db, alice, report.id, self.TEXT)), (409, "reconsider_unavailable"))
+
+    async def test_admin_overturns_or_takes_over_from_the_seniors(self) -> None:
+        async with self.sessions() as db:
+            await self._seniors(db)
+            admin, alice = await self._user(db, "admin"), self.ids["alice"]
+            juror5 = await self._user(db, "juror5")
+
+            # 还在资深阶段：一位已经投了、一位分到手没投，管理员直接接手并改判
+            case, report, review = await self._reconsider(db, "insult")
+            self.assertEqual(review.stage, "senior")
+            await self._review_vote(db, "juror4", review.id, "uphold")
+            self.assertEqual((await review_service.next_review(db, juror5))["review_id"], review.id)
+            case_service._last_queue_event_at = None
+            with self._events() as events:
+                read = AdminReviewRead(**await review_service.admin_decide(db, admin, review.id, "overturn", level=3, category="harassment", note="三条都在骂人"))
+            self.assertEqual((read.status, read.outcome, read.decided_by, read.stage), ("closed", "overturn", "admin", "senior"))
+            self.assertEqual([(vote.juror.username, vote.vote) for vote in read.votes], [("juror4", "uphold"), ("juror5", None)])
+            await db.refresh(case)
+            self.assertEqual((case.status, case.verdict_category, case.verdict_level, case.overturn_note, case.overturned_by_id), ("resolved", "harassment", 3, "三条都在骂人", admin.id))
+            violation = await db.get(UserViolation, case.violation_id)
+            self.assertEqual((violation.source, violation.level, violation.actor_id), ("report", 3, admin.id))
+            self.assertIsNotNone((await db.get(Message, self.messages["insult"])).recalled_at)
+            self.assertEqual(await self._status(db, report), (False, "overturned"))
+            self.assertEqual(set(self._per_user(events, "report.resolved")), {alice})
+            self.assertIn("jury.queue.changed", [event for event, _users, _data in events])
+            # 资深委员那边：这件没了，分到手没投的再投是 409
+            self.assertIsNone(await review_service.next_review(db, juror5))
+            self.assertEqual((await jury_service.my_status(db, juror5))["senior"]["appeals"], 0)
+            self.assertEqual(await self._code(review_service.cast_vote(db, juror5, review.id, "overturn")), (409, "review_closed"))
+            # 已经投的那张票照样留着，结果是管理员给的
+            mine, _total = await review_service.my_reviews(db, self.ids["juror4"])
+            self.assertEqual((mine[0]["my_vote"], mine[0]["outcome"]), ("uphold", "overturn"))
+
+            # 不带等级、类别和说明：类别按举报理由映射，等级取类别的默认值，说明用默认的
+            other, other_report, other_review = await self._reconsider(db, "insult2")
+            read = AdminReviewRead(**await review_service.admin_decide(db, admin, other_review.id, "overturn"))
+            await db.refresh(other)
+            self.assertEqual((read.outcome, other.status, other.verdict_category, other.verdict_level, other.overturn_note),
+                             ("overturn", "resolved", "harassment", penalty_service.default_level("harassment"), "举报人申请复议，管理员复核后改判为违规"))
+            self.assertEqual([(item["action"], item["stage"], item["level"], item["category"]) for item in await self._decisions(db)], [("overturn", "senior", 3, "harassment"), ("overturn", "senior", None, None)])
+
+            # 管理员不走这个接口、直接用改判接口：进行中的复议一起了结，举报人收到通知
+            third, third_report, third_review = await self._reconsider(db, "insult3")
+            self.assertEqual((third_review.stage, third_review.status), ("senior", "open"))
+            await self._review_vote(db, "juror4", third_review.id, "uphold")
+            with self._events() as events:
+                await case_service.overturn_case(db, third.id, actor_id=admin.id, upheld=True, category="harassment", level=1, note="复核后认定违规")
+            await db.refresh(third_review)
+            self.assertEqual((third_review.status, third_review.outcome, third_review.decided_by), ("closed", "overturn", "admin"))
+            self.assertIsNotNone(third_review.closed_at)
+            self.assertEqual(await self._status(db, third_report), (False, "overturned"))
+            self.assertEqual(set(self._per_user(events, "report.resolved")), {alice})
+            self.assertEqual(len(await self._result_notices()), 3)
+            # 已经有结果的复议不能再处理
+            self.assertEqual(await self._code(review_service.admin_decide(db, admin, third_review.id, "uphold")), (409, "review_closed"))
+            self.assertEqual(len(await self._decisions(db)), 2)
+
+    async def test_appeal_reviews_are_pointed_at_the_appeal_endpoint(self) -> None:
+        async with self.sessions() as db:
+            await self._seniors(db)
+            await self._switch(db, appeals=True)
+            admin = await self._user(db, "admin")
+            violation = await self._machine_violation(db)
+            review = await self._appeal(db, violation)
+            self.assertIsNotNone(review)
+            for action in ("uphold", "overturn"):
+                with self.assertRaises(HTTPException) as caught:
+                    await review_service.admin_decide(db, admin, review.id, action)
+                detail = caught.exception.detail
+                self.assertEqual((caught.exception.status_code, detail["code"], detail["violation_id"]), (409, "appeal_review", violation.id))
+                self.assertIn(f"POST /admin/violations/{violation.id}/appeal", detail["message"])
+            await db.refresh(review)
+            await db.refresh(violation)
+            self.assertEqual((review.status, review.outcome, violation.appeal_status, violation.appeal_stage), ("open", None, "pending", "senior"))
+            self.assertEqual(await self._decisions(db), [])
+
+
+class RoundTwoSettingsTests(Phase3TestCase):
+    async def test_settings_list_every_hall_precedent_and_quality_threshold(self) -> None:
+        thresholds = jury_settings.thresholds()
+        names = [name for name in type(settings).model_fields if name.startswith(("jury_hall_", "jury_precedent_", "jury_quality_"))]
+        self.assertGreaterEqual(len(names), 20)
+        for name in names:
+            self.assertEqual(thresholds[name.removeprefix("jury_")], getattr(settings, name), name)
+        self.assertEqual(
+            {key: thresholds[key] for key in ("hall_reports_per_day", "hall_auto_hide_reports", "quality_recuse_retry_days", "quality_shift_min_hours", "quality_shift_max_hours", "precedent_summary_max")},
+            {"hall_reports_per_day": 20, "hall_auto_hide_reports": 3, "quality_recuse_retry_days": 7, "quality_shift_min_hours": 2, "quality_shift_max_hours": 40, "precedent_summary_max": 1000},
+        )
+
+
+class RoundTwoEndpointTests(Phase3TestCase):
+    async def asyncSetUp(self) -> None:
+        await super().asyncSetUp()
+        self.acting = "juror1"
+        api = FastAPI()
+        api.include_router(jury_api.router, prefix="/jury")
+        api.include_router(senior_api.router, prefix="/jury")
+        api.include_router(admin_api.router, prefix="/admin")
+        api.include_router(reports_api.router, prefix="/reports")
+
+        async def isolated_db():
+            async with self.sessions() as session:
+                yield session
+
+        async def acting_user(db: Annotated[AsyncSession, Depends(get_db)]) -> User:
+            return await db.get(User, self.ids[self.acting])
+
+        api.dependency_overrides[get_db] = isolated_db
+        api.dependency_overrides[get_current_user] = acting_user
+        self.client = httpx.AsyncClient(transport=httpx.ASGITransport(app=api), base_url="http://testserver")
+
+    async def asyncTearDown(self) -> None:
+        await self.client.aclose()
+        await super().asyncTearDown()
+
+    async def test_recused_votes_and_review_decisions_over_http(self) -> None:
+        async with self.sessions() as db:
+            settled = await self._open_case(db)
+            await self._cast(db, "juror1", settled.id, "recuse")
+            for name in ("juror2", "juror3", "speaker"):
+                await self._cast(db, name, settled.id, "l2")
+            # 没有资深委员：复议直接到管理员手里
+            report = await self._report(db, "alice", "insult")
+            await self._queue(db, report.case_id)
+            dismissed = await self._settle(db, report.case_id, "none")
+            await review_service.request_reconsider(db, self.ids["alice"], report.id, "对方连续三条都在骂人，不是玩笑")
+            review_id = (await db.execute(select(JuryReview.id))).scalar_one()
+            second = await self._report(db, "alice", "club_insult")
+            await self._queue(db, second.case_id)
+            await self._settle(db, second.case_id, "none", jurors=("juror4", "juror5", "juror6"))
+            await review_service.request_reconsider(db, self.ids["alice"], second.id, "社团里那句话是在针对我，请再看一下")
+            second_review = (await db.execute(select(JuryReview.id).where(JuryReview.case_id == second.case_id))).scalar_one()
+        client = self.client
+
+        # 我的评审：回避的记录 stage 为 null，带进展类筛选时不返回
+        votes = (await client.get("/jury/votes", params={"vote": "recuse"})).json()
+        self.assertEqual(votes["total"], 1)
+        item = votes["items"][0]
+        self.assertEqual((item["vote"], item["stage"], item["outcome"], item["closed_at"], item["agreed"], item["can_view"]), ("recuse", None, None, None, None, False))
+        for params in ({"vote": "recuse", "state": "closed"}, {"vote": "recuse", "outcome": "violation"}, {"vote": "recuse", "agreed": "false"}):
+            self.assertEqual((await client.get("/jury/votes", params=params)).json(), {"items": [], "total": 0}, params)
+        # 不限 vote 时，state=closed 只剩真正投过票的那一条
+        closed = (await client.get("/jury/votes", params={"state": "closed"})).json()
+        self.assertEqual((closed["total"], [entry["vote"] for entry in closed["items"]]), (1, ["none"]))
+        # 留空等同于不筛选：回避的记录照常列出
+        self.assertEqual((await client.get("/jury/votes?state=&outcome=&agreed=&vote=recuse")).json()["total"], 1)
+
+        # 后台：给转过来的复议出结果
+        self.acting = "admin"
+        pending = (await client.get("/admin/jury/reviews", params={"kind": "reconsider", "status": "open"})).json()
+        self.assertEqual((pending["total"], {entry["stage"] for entry in pending["items"]}), (2, {"admin"}))
+        self.assertEqual((await client.post(f"/admin/jury/reviews/{review_id}/decide", json={"action": "keep"})).status_code, 422)
+        self.assertEqual((await client.post(f"/admin/jury/reviews/{review_id}/decide", json={"action": "overturn", "level": 4})).status_code, 422)
+        missing = await client.post("/admin/jury/reviews/99999/decide", json={"action": "uphold"})
+        self.assertEqual((missing.status_code, missing.json()["detail"]["code"]), (404, "review_not_found"))
+        upheld = await client.post(f"/admin/jury/reviews/{review_id}/decide", json={"action": "uphold", "note": "复核过了"})
+        self.assertEqual((upheld.status_code, upheld.json()["id"], upheld.json()["status"], upheld.json()["outcome"], upheld.json()["decided_by"]), (200, review_id, "closed", "uphold", "admin"))
+        again = await client.post(f"/admin/jury/reviews/{review_id}/decide", json={"action": "uphold"})
+        self.assertEqual((again.status_code, again.json()["detail"]["code"]), (409, "review_closed"))
+        self.assertEqual((await client.get(f"/admin/cases/{dismissed.id}")).json()["reconsider_status"], "upheld")
+        overturned = await client.post(f"/admin/jury/reviews/{second_review}/decide", json={"action": "overturn", "level": 2, "category": "harassment", "note": "确实是在针对人"})
+        self.assertEqual((overturned.status_code, overturned.json()["outcome"], overturned.json()["case_id"]), (200, "overturn", second.case_id))
+        detail = (await client.get(f"/admin/cases/{second.case_id}")).json()
+        self.assertEqual((detail["status"], detail["verdict_level"], detail["overturn_note"], detail["reconsider_status"]), ("resolved", 2, "确实是在针对人", "overturned"))
+        self.assertEqual((await client.get("/admin/jury/reviews", params={"status": "open"})).json()["total"], 0)
+
+        # 举报人这边
+        self.acting = "alice"
+        mine = {entry["id"]: entry["reconsider_status"] for entry in (await client.get("/reports/me")).json()}
+        self.assertEqual((mine[report.id], mine[second.id]), ("upheld", "overturned"))

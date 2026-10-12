@@ -263,6 +263,8 @@ async def init_db() -> None:
                 ("user_violations", "appeal_stage", "appeal_stage VARCHAR(8)"),
                 ("user_violations", "appeal_result", "appeal_result VARCHAR(8)"),
                 ("user_violations", "appeal_decided_by", "appeal_decided_by VARCHAR(8)"),
+                # 回避过的质控题再出给同一个人时复用原来那一行，之前回避了几次记在这里
+                ("jury_votes", "past_recusals", "past_recusals INTEGER NOT NULL DEFAULT 0"),
             ):
                 if table_name not in table_names:
                     continue

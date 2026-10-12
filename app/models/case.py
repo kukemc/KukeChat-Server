@@ -170,6 +170,9 @@ class JuryVote(Base):
     is_quality_check: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
     # 主动回避的时间。回避不算投票（voted_at 保持为空），这一行留着是为了不再把同一个案件分给他
     recused_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 这一行以前被回避过几次。只有质控题会这样：回避过的质控题隔一段时间可以再出给同一个人，
+    # 一个案件对一个人只有一行（唯一约束），再出时复用这一行并清掉上次的回避，次数记在这里
+    past_recusals: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     # 这一票是哪一轮的：jury（原审）/ panel（资深合议）。原审的计票只数 jury 轮
     stage: Mapped[str] = mapped_column(String(8), default="jury", server_default="jury")
 

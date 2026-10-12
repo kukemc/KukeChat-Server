@@ -498,6 +498,8 @@ class JuryMemberRead(JuryStats):
     # 「拿不准 + 上下文不足」占全部票的比例 / 回避占全部分配的比例
     abstain_rate: float = 0
     recuse_rate: float = 0
+    # 在质控题上回避的次数（同一道题隔几天再出、又回避的重复计）
+    quality_recused: int = 0
     badge_visible: bool = False
     # 本次任职到现在多少天；不是在任状态为 0
     days_served: int = 0

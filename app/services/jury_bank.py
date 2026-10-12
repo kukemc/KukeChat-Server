@@ -3,6 +3,7 @@
 一道题 = 一个已经有结论的案件，report_cases.is_golden 表示「在题库里」。题有「已核对」标记：
 已核对的用于入门考试和评审中的质控计分，未核对的只用于练习。
 练习场会公布标准答案，所以练习的题和计分的题不能是同一批：已核对的题按编号固定切出一份只给练习场，见 question_pool。
+判例把内容和结论都对在任委员公开了：案件只要还是有效的判例，就恒属于练习那一份，无论核对没核对、编号是多少。
 这个模块不依赖 jury.py（评审分案时要用这里的规则），需要委员视图的地方在函数里再导入。
 """
 
@@ -14,11 +15,12 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import HTTPException, status
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.models.case import JuryExamAttempt, JuryPracticeAnswer, JuryVote, ReportCase
+from app.models.jury_hall import JuryPrecedent
 from app.models.penalty import UserViolation
 from app.models.report import AdminAuditLog
 from app.models.user import User
@@ -186,14 +188,39 @@ async def auto_include(db: AsyncSession) -> int:
 # ---------------------------------------------------------------- 出题
 
 
-def question_pool(case: ReportCase) -> str | None:
+def question_pool(case: ReportCase, precedent: bool = False) -> str | None:
     """这道题给谁用：practice 只给练习场 / scored 给入门考试和评审质控；不在题库里为 None。
 
     未核对的题全部只给练习场。已核对的题里编号能被 PRACTICE_EVERY 整除的也只给练习场，其余的练习场不出。
+    precedent：这个案件现在是不是有效的判例（precedent_case_ids / is_precedent 查出来传进来）。是的话恒属于练习那一份；
+    不传就是「不看判例」的原规则，也是判例撤下之后恢复的规则。
     """
     if not case.is_golden:
         return None
+    if precedent:
+        return "practice"
     return "scored" if case.golden_verified and case.id % PRACTICE_EVERY != 0 else "practice"
+
+
+def _precedent_clause() -> Any:
+    """SQL 里的「这个案件现在是有效的判例」：判例没有撤下，案件没有被改判（被改判的判例会被撤下，可能还没来得及）。"""
+    return and_(
+        exists().where(JuryPrecedent.case_id == ReportCase.id, JuryPrecedent.status == "active"),
+        ReportCase.overturned_at.is_(None),
+    )
+
+
+async def precedent_case_ids(db: AsyncSession, cases: list[ReportCase]) -> set[int]:
+    """这些案件里现在是有效判例的那些（口径同 _precedent_clause）。"""
+    case_ids = [case.id for case in cases if case.status != "open" and case.overturned_at is None]
+    if not case_ids:
+        return set()
+    rows = await db.execute(select(JuryPrecedent.case_id).where(JuryPrecedent.case_id.in_(case_ids), JuryPrecedent.status == "active"))
+    return set(rows.scalars().all())
+
+
+async def is_precedent(db: AsyncSession, case: ReportCase) -> bool:
+    return case.id in await precedent_case_ids(db, [case])
 
 
 def bank_clauses(*, pool: str) -> list[Any]:
@@ -206,9 +233,10 @@ def bank_clauses(*, pool: str) -> list[Any]:
     ]
     practice_share = ReportCase.id % PRACTICE_EVERY == 0
     if pool == "scored":
-        clauses.extend([ReportCase.golden_verified.is_(True), ~practice_share])
+        # 有效的判例不出：内容和结论对在任委员是公开的，拿来考试、质控等于送分
+        clauses.extend([ReportCase.golden_verified.is_(True), ~practice_share, ~_precedent_clause()])
     else:
-        clauses.append(or_(ReportCase.golden_verified.is_(False), practice_share))
+        clauses.append(or_(ReportCase.golden_verified.is_(False), practice_share, _precedent_clause()))
     return clauses
 
 
@@ -245,6 +273,7 @@ async def _answer_stats(db: AsyncSession, case_ids: list[int]) -> dict[int, tupl
 
 async def question_reads(db: AsyncSession, cases: list[ReportCase]) -> list[dict[str, Any]]:
     stats = await _answer_stats(db, [case.id for case in cases])
+    precedents = await precedent_case_ids(db, cases)
     items: list[dict[str, Any]] = []
     for case in cases:
         answer = question_answer(case)
@@ -259,8 +288,8 @@ async def question_reads(db: AsyncSession, cases: list[ReportCase]) -> list[dict
                 "verdict_source": case.verdict_source,
                 "in_bank": bool(case.is_golden),
                 "verified": bool(case.is_golden and case.golden_verified),
-                # practice 只给练习场 / scored 给考试和质控；不在题库里为 null
-                "pool": question_pool(case),
+                # practice 只给练习场 / scored 给考试和质控；不在题库里为 null。仍是判例的恒为 practice
+                "pool": question_pool(case, case.id in precedents),
                 "source": question_source(case) if case.is_golden else None,
                 "outcome": answer["outcome"],
                 "level": answer["level"],

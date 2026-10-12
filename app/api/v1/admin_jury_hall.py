@@ -15,6 +15,8 @@ from app.core.dependencies import get_current_admin
 from app.models.user import User
 from app.schemas.jury_hall import (
     AdminHallAnnouncementCreate,
+    AdminHallCommentModerate,
+    AdminHallCommentRead,
     AdminHallDecision,
     AdminHallPostDetail,
     AdminHallPostPage,
@@ -129,6 +131,17 @@ async def admin_handle_hall_report(
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> AdminHallReportRead:
     return AdminHallReportRead(**await hall_service.admin_handle_report(db, admin, report_id, payload.action, payload.note))
+
+
+@router.post("/jury/hall/comments/{comment_id}/moderate", response_model=AdminHallCommentRead)
+async def admin_moderate_hall_comment(
+    comment_id: int,
+    payload: AdminHallCommentModerate,
+    admin: Annotated[User, Depends(get_current_admin)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> AdminHallCommentRead:
+    """不经过举报，直接删除 / 恢复一条评论。"""
+    return AdminHallCommentRead(**await hall_service.admin_moderate_comment(db, admin, comment_id, payload.action, payload.note))
 
 
 @router.get("/jury/hall/posts/{post_id}", response_model=AdminHallPostDetail)

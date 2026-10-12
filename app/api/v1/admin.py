@@ -66,7 +66,7 @@ from app.schemas.case import (
     JuryMemberReview,
     JuryVoteSummary,
 )
-from app.schemas.jury_senior import AdminReviewPage, AdminReviewRead
+from app.schemas.jury_senior import AdminReviewDecide, AdminReviewPage, AdminReviewRead
 from app.schemas.jury import (
     AdminExamPage,
     AdminExamRead,
@@ -984,6 +984,22 @@ async def admin_list_jury_reviews(
     """资深复审（申诉复审、举报人复议）的监控：每件带复审委员的票（实名）和结果。"""
     items, total = await review_service.admin_list(db, kind=kind or None, status_filter=status_filter or None, limit=limit, offset=offset)
     return AdminReviewPage(items=[AdminReviewRead(**item) for item in items], total=total)
+
+
+@router.post("/jury/reviews/{review_id}/decide", response_model=AdminReviewRead)
+async def admin_decide_jury_review(
+    review_id: int,
+    payload: AdminReviewDecide,
+    admin: Annotated[User, Depends(get_current_admin)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> AdminReviewRead:
+    """给一件举报人复议出结果：维持原结论，或改判为违规。申诉复审返回 409，请用 POST /admin/violations/{id}/appeal。"""
+    item = await review_service.admin_decide(
+        db, admin, review_id, payload.action, level=payload.level, category=payload.category, note=payload.note
+    )
+    if payload.action == "overturn":
+        await admin_manager.broadcast("admin.report.changed", {"case_id": item["case_id"], "action": "overturned"})
+    return AdminReviewRead(**item)
 
 
 @router.get("/jury/questions", response_model=AdminQuestionPage)

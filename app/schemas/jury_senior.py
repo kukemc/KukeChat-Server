@@ -195,6 +195,18 @@ class AdminReviewRead(BaseModel):
     votes: list[AdminReviewVote] = Field(default_factory=list)
 
 
+class AdminReviewDecide(BaseModel):
+    """管理员给一件举报人复议出结果。申诉复审不走这里（用 POST /admin/violations/{id}/appeal）。"""
+
+    # uphold 维持原结论（不违规）/ overturn 改判为违规
+    action: Literal["uphold", "overturn"]
+    # 以下两项只在 overturn 时有用：不给时等级按类别的默认值、类别按举报理由映射
+    level: int | None = Field(default=None, ge=1, le=3)
+    category: str | None = Field(default=None, max_length=40)
+    # overturn 时会成为改判说明（出现在公示栏和委员的案件详情里）；uphold 时只留在审计日志里
+    note: str | None = Field(default=None, max_length=2000)
+
+
 class AdminReviewPage(BaseModel):
     items: list[AdminReviewRead] = Field(default_factory=list)
     total: int = 0

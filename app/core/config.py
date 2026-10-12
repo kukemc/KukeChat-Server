@@ -107,6 +107,12 @@ class Settings(BaseSettings):
     jury_quality_min_gap: int = Field(default=2, ge=0, le=1000)
     jury_quality_max_gap: int = Field(default=9, ge=1, le=10000)
     jury_recuse_daily_limit: int = Field(default=5, ge=0, le=1000)
+    # 在质控题上回避过的，过这么多天之后同一道题可以再出给他（回避不算「见过」，否则连着回避就能把计分题耗光）
+    jury_quality_recuse_retry_days: int = Field(default=7, ge=1, le=3650)
+    # 质控题 / 考试题是早就结案的旧案件：展示时把内容的时间整体平移，让被举报的那条看起来发于「分到手之前的这么多小时」
+    #（范围和真实待评审案件的年龄相仿），每条分配记录稳定地取一个值
+    jury_quality_shift_min_hours: int = Field(default=2, ge=0, le=24 * 30)
+    jury_quality_shift_max_hours: int = Field(default=40, ge=1, le=24 * 30)
     # 弃权过多：近 window 张票里「拿不准 + 上下文不足」的比例，不足 min_votes 张不判断
     jury_abstain_window: int = Field(default=50, ge=1, le=10000)
     jury_abstain_min_votes: int = Field(default=20, ge=1, le=10000)
@@ -193,8 +199,10 @@ class Settings(BaseSettings):
     jury_hall_quorum_min: int = Field(default=3, ge=1, le=10000)
     jury_hall_pass_num: int = Field(default=2, ge=1, le=1000)
     jury_hall_pass_den: int = Field(default=3, ge=1, le=1000)
-    # 帖子或评论被这么多个不同的人举报后自动折叠，等管理员处理
+    # 帖子或评论被这么多名在任委员举报后自动折叠，等管理员处理（其他用户的举报只记录，不计入）
     jury_hall_auto_hide_reports: int = Field(default=3, ge=1, le=1000)
+    # 每人最近 24 小时最多举报多少次（帖子和评论合计）
+    jury_hall_reports_per_day: int = Field(default=20, ge=1, le=100000)
     task_reminder_check_interval_seconds: int = Field(default=60, ge=10, le=3600)
     task_reminder_advance_hours: int = Field(default=24, ge=1, le=168)
     smtp_enabled: bool = False

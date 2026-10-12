@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import logging
 import random
@@ -14,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import HTTPException, status
+from sqlalchemy import case as sa_case
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -61,6 +64,11 @@ TREND_DAYS = 30
 SEVERE_MIN_VOTES = settings.jury_severe_min_votes
 NEED_CONTEXT_VOTES = settings.jury_need_context_votes
 RECUSE_DAILY_LIMIT = settings.jury_recuse_daily_limit
+# 在质控题上回避过的，过这么多天之后同一道题可以再出给他
+QUALITY_RECUSE_RETRY_DAYS = settings.jury_quality_recuse_retry_days
+# 质控题 / 考试题展示时，被举报的那条内容看起来发于「分到手之前」多少小时（见 disguised_age）
+QUALITY_SHIFT_MIN_HOURS = settings.jury_quality_shift_min_hours
+QUALITY_SHIFT_MAX_HOURS = settings.jury_quality_shift_max_hours
 # 弃权过多：近 ABSTAIN_WINDOW 张票里「拿不准 + 上下文不足」的比例，不足 ABSTAIN_MIN_VOTES 张不判断
 ABSTAIN_WINDOW = settings.jury_abstain_window
 ABSTAIN_MIN_VOTES = settings.jury_abstain_min_votes
@@ -206,18 +214,57 @@ def _iso(moment: datetime) -> str:
     return moment.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
-def snapshot_time(value: Any) -> str | None:
-    """快照里的时间是当时直接 isoformat() 存下来的字符串，不带时区后缀，实际是 UTC。
-
-    输出时统一成带 Z 的 ISO 字符串；本来就带时区的换算到 UTC，认不出来的原样返回。
-    """
+def _snapshot_moment(value: Any) -> datetime | None:
+    """快照里的时间 -> 带时区的 datetime；空的、认不出来的返回 None。"""
     if not isinstance(value, str) or not value:
         return None
     try:
         moment = datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith(("Z", "z")) else value)
     except ValueError:
+        return None
+    return penalty_service.aware(moment)
+
+
+def snapshot_time(value: Any, shift: timedelta | None = None) -> str | None:
+    """快照里的时间是当时直接 isoformat() 存下来的字符串，不带时区后缀，实际是 UTC。
+
+    输出时统一成带 Z 的 ISO 字符串；本来就带时区的换算到 UTC，认不出来的原样返回。
+    shift：整体平移多少（质控题 / 考试题用，见 _time_shift）。
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    moment = _snapshot_moment(value)
+    if moment is None:
         return value
-    return _iso(penalty_service.aware(moment))
+    return _iso(moment + shift if shift is not None else moment)
+
+
+def disguised_age(*seed: Any) -> timedelta:
+    """质控题 / 考试题展示时，被举报的那条内容「看起来」发于基准时间之前多久。
+
+    同样的 seed 恒得到同一个值（重复取同一道题时不变），精确到秒，落在 QUALITY_SHIFT_MIN_HOURS 到 QUALITY_SHIFT_MAX_HOURS 之间。
+    掺了服务端密钥：否则委员可以自己按评审编号算出这个值，再和看到的时间一比就认出了质控题。
+    """
+    low = QUALITY_SHIFT_MIN_HOURS * 3600
+    high = max(low, QUALITY_SHIFT_MAX_HOURS * 3600)
+    digest = hmac.new(settings.jwt_secret_key.encode("utf-8"), ":".join(str(part) for part in seed).encode("utf-8"), hashlib.sha256).digest()
+    return timedelta(seconds=low + int.from_bytes(digest[:8], "big") % (high - low + 1))
+
+
+def _time_shift(target: Any, times: list[Any], base: datetime, seed: tuple[Any, ...]) -> timedelta | None:
+    """旧案件当质控题 / 考试题展示时，内容的时间要整体平移多少；内容里没有能用的时间返回 None。
+
+    质控题是早就结案的旧案件，内容是几周前的，而真实待评审案件的内容都是近几天的 —— 不平移的话光看时间就能认出来。
+    平移后被举报的那条（target）落在 base（分到手 / 开考的时间）之前 disguised_age 那么久，各条之间的间隔保持不变；
+    它之后的上下文也不能显得比 base 还晚，所以最晚的一条至少也在 base 之前 QUALITY_SHIFT_MIN_HOURS。
+    """
+    moments = [moment for moment in (_snapshot_moment(value) for value in times) if moment is not None]
+    reference = _snapshot_moment(target) or (max(moments) if moments else None)
+    if reference is None:
+        return None
+    trailing = max(timedelta(0), max(moments) - reference) if moments else timedelta(0)
+    age = max(disguised_age(*seed), trailing + timedelta(hours=QUALITY_SHIFT_MIN_HOURS))
+    return base - age - reference
 
 
 async def ensure_term(db: AsyncSession, member: JuryMember | None, user: User | None = None, now: datetime | None = None) -> bool:
@@ -727,6 +774,11 @@ async def _assignable_cases(db: AsyncSession, juror_id: int, *, golden: bool, li
     """
     now = datetime.now(UTC)
     seen = select(JuryVote.case_id).where(JuryVote.juror_id == juror_id)
+    if golden:
+        # 在质控题上回避不算「见过」：过了 QUALITY_RECUSE_RETRY_DAYS 天可以再出给他（不然连着回避就能把计分题耗光）。
+        # 还没过这么多天的照旧排除 —— 刚回避的那道宁可不出。
+        retry_before = now - timedelta(days=QUALITY_RECUSE_RETRY_DAYS)
+        seen = seen.where(or_(JuryVote.is_quality_check.is_(False), JuryVote.recused_at.is_(None), JuryVote.recused_at > retry_before))
     stmt = select(ReportCase.id).where(ReportCase.jury_eligible.is_(True), ReportCase.jury_block_reason.is_(None), ReportCase.id.not_in(seen))
     if golden:
         # 评审中的质控题只出已核对、且不在练习场那一份里的题；这位委员在练习场做过的（当时还没核对）也不出 —— 他看过标准答案。
@@ -739,6 +791,14 @@ async def _assignable_cases(db: AsyncSession, juror_id: int, *, golden: bool, li
         # 入门考试里见过的题也不出：考完会公布每道题的标准答案。
         examined = await _exam_question_ids(db, juror_id)
         case_ids = [case_id for case_id in case_ids if case_id not in examined]
+        # 没见过的优先；以前回避过、现在可以再出的排在后面（先出回避得最早的）。
+        recused = {
+            case_id: penalty_service.aware(recused_at)
+            for case_id, recused_at in (
+                await db.execute(select(JuryVote.case_id, JuryVote.recused_at).where(JuryVote.juror_id == juror_id, JuryVote.recused_at.is_not(None)))
+            ).all()
+        }
+        case_ids.sort(key=lambda case_id: (case_id in recused, recused.get(case_id, now)))
     context = await _conflict_context(db, juror_id)
     fresh_after = now - timedelta(hours=ASSIGNMENT_TTL_HOURS)
     group_content = await jury_settings.is_enabled(db, "public_group_content") if golden else False
@@ -900,16 +960,30 @@ async def next_case(db: AsyncSession, user: User) -> dict[str, Any] | None:
         case = await _pick_case(db, user.id, golden=False)
     if case is None:
         return None
-    assignment = JuryVote(case_id=case.id, juror_id=user.id, assigned_at=now, is_quality_check=quality_check)
-    db.add(assignment)
+    assignment = (
+        (await db.execute(select(JuryVote).where(JuryVote.case_id == case.id, JuryVote.juror_id == user.id))).scalar_one_or_none() if quality_check else None
+    )
+    if assignment is not None:
+        # 以前回避过的质控题再出给他：一个案件对一个人只有一行，复用它，上次的回避记到 past_recusals 里。
+        assignment.past_recusals = (assignment.past_recusals or 0) + 1
+        assignment.vote = None
+        assignment.note = None
+        assignment.recused_at = None
+        assignment.assigned_at = now
+    else:
+        assignment = JuryVote(case_id=case.id, juror_id=user.id, assigned_at=now, is_quality_check=quality_check)
+        db.add(assignment)
     if quality_check:
         member.force_quality = False
     await db.commit()
     return await juror_case_view(db, case, assignment)
 
 
-def _anonymize_messages(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
-    """快照里的全部上下文（前后最多各 10 条），每条带相对被举报消息的位置。"""
+def _anonymize_messages(snapshot: dict[str, Any], disguise: tuple[datetime, tuple[Any, ...]] | None = None) -> list[dict[str, Any]]:
+    """快照里的全部上下文（前后最多各 10 条），每条带相对被举报消息的位置。
+
+    disguise：(基准时间, seed)，给了就把所有消息的时间整体平移（质控题 / 考试题，见 _time_shift）。
+    """
     messages = [item for item in snapshot.get("messages") or [] if isinstance(item, dict)]
     target_index = next((index for index, item in enumerate(messages) if item.get("is_target")), None)
     if target_index is None:
@@ -918,6 +992,11 @@ def _anonymize_messages(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
     if target_index is None:
         return []
     target_sender = messages[target_index].get("sender_id")
+    shift = (
+        _time_shift(messages[target_index].get("created_at"), [item.get("created_at") for item in messages], disguise[0], disguise[1])
+        if disguise is not None
+        else None
+    )
     aliases: dict[Any, str] = {target_sender: "被举报人"}
     items: list[dict[str, Any]] = []
     for index, item in enumerate(messages):
@@ -934,7 +1013,7 @@ def _anonymize_messages(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
                 # 已撤回的上下文消息不展示内容；被举报的那条始终展示，否则没法评审。
                 "content": item.get("content") if (item.get("is_target") or not item.get("recalled_at")) else None,
                 "images": images,
-                "created_at": snapshot_time(item.get("created_at")),
+                "created_at": snapshot_time(item.get("created_at"), shift),
                 "offset": index - target_index,
             }
         )
@@ -942,13 +1021,26 @@ def _anonymize_messages(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 async def juror_case_view(
-    db: AsyncSession, case: ReportCase, assignment: JuryVote | None = None, *, with_content: bool = True
+    db: AsyncSession,
+    case: ReportCase,
+    assignment: JuryVote | None = None,
+    *,
+    with_content: bool = True,
+    disguise: tuple[datetime, tuple[Any, ...]] | None = None,
 ) -> dict[str, Any]:
     """委员看到的案件：匿名化的内容和举报理由分布，不含任何身份信息。
 
     case_id 是这位委员的评审编号（分配记录的 id），不是案件的真实编号 —— 见 docs/jury-v2.md 1.0。
     没有分配记录的调用方（考试、练习、后台题库）只用内容字段，case_id 为 None。
+
+    disguise：(基准时间, seed)，给了就把内容的时间整体平移，考试题用。还没投的质控题不用传，这里自己按分配记录算；
+    投完之后（已经揭晓是质控题）案件详情不带分配记录来取内容，看到的是真实时间。
     """
+    if disguise is None and assignment is not None and assignment.is_quality_check and assignment.voted_at is None:
+        assigned = penalty_service.aware(assignment.assigned_at)
+        if assigned is not None:
+            # seed 里带上分到手的时间：回避过的质控题再出时复用同一行，这样每次出的平移量不一样
+            disguise = (assigned, ("quality", assignment.id, int(assigned.timestamp())))
     reasons = await db.execute(select(UserReport.reason, func.count()).where(UserReport.case_id == case.id).group_by(UserReport.reason))
     suggested = case_service.default_category(case)
     view: dict[str, Any] = {
@@ -971,13 +1063,14 @@ async def juror_case_view(
         return view
     snapshot = await case_service.case_snapshot(db, case)
     if case.target_type == "message":
-        view["messages"] = _anonymize_messages(snapshot)
+        view["messages"] = _anonymize_messages(snapshot, disguise)
     elif case.target_type == "post":
         post = snapshot.get("post") if isinstance(snapshot.get("post"), dict) else {}
+        shift = _time_shift(post.get("created_at"), [post.get("created_at")], disguise[0], disguise[1]) if disguise is not None else None
         view["post"] = {
             "content": post.get("content"),
             "image_urls": [url for url in post.get("image_urls") or [] if isinstance(url, str)],
-            "created_at": snapshot_time(post.get("created_at")),
+            "created_at": snapshot_time(post.get("created_at"), shift),
         }
     return view
 
@@ -1540,6 +1633,10 @@ async def list_votes(
     # 回避的记录没有 voted_at，用回避时间排
     moment = func.coalesce(JuryVote.voted_at, JuryVote.recused_at)
     clauses = [JuryVote.juror_id == juror_id, moment.is_not(None)]
+    if state is not None or outcome is not None or agreed is not None:
+        # 这三个筛选看的都是案件的进展 / 结论：回避的人不该知道，带了其中任何一个就不返回回避的记录
+        # （否则 ?vote=recuse&state=closed 一筛就知道案件结没结、结论是什么）。原审和合议里的回避都一样。
+        clauses.append(JuryVote.recused_at.is_(None))
     if state == "open":
         clauses.append(ReportCase.status == "open")
     elif state == "closed":
@@ -1572,7 +1669,7 @@ async def list_votes(
     items: list[dict[str, Any]] = []
     for vote, case in rows:
         recused = vote.recused_at is not None
-        # 回避的人看不了这个案件，结论也不在列表里透露。
+        # 回避的人看不了这个案件：结论、进展（stage）、是不是质控题都不在列表里透露，下面这些字段对回避的记录一律是空的。
         closed = case.status != "open" and not recused
         items.append(
             {
@@ -1583,7 +1680,7 @@ async def list_votes(
                 "vote": vote.vote,
                 "voted_at": penalty_service.aware(vote.voted_at or vote.recused_at),
                 "alias": vote.alias,
-                "stage": case_stage(case),
+                "stage": case_stage(case) if not recused else None,
                 # 这一票是哪一轮投的；stage 是案件现在所处的阶段
                 "vote_stage": vote.stage or "jury",
                 "outcome": ("violation" if case.status == "resolved" else "clean") if closed else None,
@@ -1592,7 +1689,8 @@ async def list_votes(
                 "closed_at": penalty_service.aware(case.closed_at) if not recused else None,
                 "agreed": vote.agreed if closed else None,
                 "overturned": case.overturned_at is not None and not recused,
-                "is_quality_check": vote.is_quality_check,
+                # 回避掉的质控题不标出来：没投就不揭晓，而且这道题过些天还会再出给他
+                "is_quality_check": vote.is_quality_check and not recused,
                 "opinion_count": 0 if vote.is_quality_check or recused else opinions.get(case.id, 0),
                 # 回避的记录点不进详情
                 "can_view": not recused,
@@ -1687,6 +1785,7 @@ async def list_members(
     user_ids = [member.user_id for member, _user in members]
     undecided: dict[int, int] = {}
     recused: dict[int, int] = {}
+    quality_recused: dict[int, int] = {}
     exams: dict[int, dict[str, Any]] = {}
     if user_ids:
         undecided = dict(
@@ -1698,13 +1797,15 @@ async def list_members(
                 )
             ).all()
         )
-        recused = dict(
-            (
-                await db.execute(
-                    select(JuryVote.juror_id, func.count()).where(JuryVote.juror_id.in_(user_ids), JuryVote.recused_at.is_not(None)).group_by(JuryVote.juror_id)
-                )
-            ).all()
-        )
+        # 回避的次数 = 现在还标着回避的分配 + 质控题再出时被清掉的那些（past_recusals，只有质控题有）
+        current = func.sum(sa_case((JuryVote.recused_at.is_not(None), 1), else_=0))
+        current_quality = func.sum(sa_case((JuryVote.recused_at.is_not(None) & JuryVote.is_quality_check.is_(True), 1), else_=0))
+        past = func.coalesce(func.sum(JuryVote.past_recusals), 0)
+        for juror_id, total_recused, total_quality in (
+            await db.execute(select(JuryVote.juror_id, current + past, current_quality + past).where(JuryVote.juror_id.in_(user_ids)).group_by(JuryVote.juror_id))
+        ).all():
+            recused[juror_id] = int(total_recused or 0)
+            quality_recused[juror_id] = int(total_quality or 0)
         attempts = await db.execute(
             select(JuryExamAttempt)
             .where(JuryExamAttempt.user_id.in_(user_ids), JuryExamAttempt.submitted_at.is_not(None))
@@ -1739,6 +1840,8 @@ async def list_members(
                 "exam_passed_at": exam.get("passed_at"),
                 "abstain_rate": round(int(undecided.get(member.user_id, 0)) / votes_total, 3) if votes_total else 0,
                 "recuse_rate": round(recuses / (votes_total + recuses), 3) if votes_total + recuses else 0,
+                # 在质控题上回避了几次：有人专门躲质控的话这个数会很显眼
+                "quality_recused": int(quality_recused.get(member.user_id, 0)),
                 "badge_visible": bool(member.badge_visible),
                 "days_served": points_service.days_served(member, now),
             }

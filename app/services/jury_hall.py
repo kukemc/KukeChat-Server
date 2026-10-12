@@ -47,8 +47,11 @@ QUORUM_RATIO = settings.jury_hall_quorum_ratio
 QUORUM_MIN = settings.jury_hall_quorum_min
 PASS_NUM = settings.jury_hall_pass_num
 PASS_DEN = settings.jury_hall_pass_den
-# 帖子或评论被这么多个不同的人举报后自动折叠
+# 帖子或评论被这么多名在任委员举报后自动折叠；其他用户的举报只记录、进后台待处理列表，不计入
+#（否则随便几个小号就能把任何内容藏到管理员处理为止）
 AUTO_HIDE_REPORTS = settings.jury_hall_auto_hide_reports
+# 每人最近 24 小时最多举报多少次（帖子和评论合计）
+REPORTS_PER_DAY = settings.jury_hall_reports_per_day
 
 KINDS = ("announcement", "proposal", "discussion")
 # 委员能发的两种；公告只能在后台发
@@ -76,7 +79,7 @@ def guidelines() -> str:
             "3. 不泄露身份和隐私。不贴没有匿名的聊天记录，不猜测、不公开当事人或评审委员是谁。",
             "4. 提案要说清楚：现在的规则是什么、想改成什么、为什么。一个提案只说一件事。",
             f"5. 规则由管理员修改，提案通过后由管理员决定是否采纳。提案由在任委员表决 {VOTE_DAYS} 天，参与人数和赞成比例都达标即为通过，管理员会说明采纳或不采纳的理由。",
-            "6. 违反守则的帖子和评论可以举报，被多人举报后会先折叠，由管理员处理。",
+            "6. 违反守则的帖子和评论可以举报，由管理员处理；被多名在任委员举报的会先折叠。",
         ]
     )
 
@@ -99,6 +102,7 @@ def config_view() -> dict[str, Any]:
         "guidelines": guidelines(),
         "report_reasons": list(REPORT_REASONS),
         "auto_hide_reports": AUTO_HIDE_REPORTS,
+        "reports_per_day": REPORTS_PER_DAY,
     }
 
 
@@ -240,9 +244,14 @@ async def ensure_text_allowed(user: User, text: str, context_id: str) -> None:
         raise _error(status.HTTP_422_UNPROCESSABLE_ENTITY, "content_rejected", "内容未通过审核，请修改后重试")
 
 
-async def _check_rate(db: AsyncSession, model: Any, user_id: int, limit: int, noun: str, now: datetime, *clauses: Any) -> None:
-    """每人每天的上限，和评审上限一样按最近 24 小时滚动。删掉的也算，否则可以靠删了重发绕过去。"""
-    scope = (model.author_id == user_id, *clauses)
+async def _check_rate(
+    db: AsyncSession, model: Any, user_id: int, limit: int, noun: str, now: datetime, *clauses: Any, owner: Any | None = None
+) -> None:
+    """每人每天的上限，和评审上限一样按最近 24 小时滚动。删掉的也算，否则可以靠删了重发绕过去。
+
+    owner：记「是谁的」的那一列，默认是 author_id（举报表里是 reporter_id）。
+    """
+    scope = ((owner if owner is not None else model.author_id) == user_id, *clauses)
     count = await db.execute(select(func.count()).select_from(model).where(*scope, model.created_at >= now - ROLLING_WINDOW))
     if int(count.scalar_one() or 0) < limit:
         return
@@ -670,18 +679,29 @@ async def _report_target(db: AsyncSession, target_type: str, target_id: int) -> 
     return comment, post
 
 
-async def _pending_reports(db: AsyncSession, target_type: str, target_id: int) -> int:
+async def _juror_reports(db: AsyncSession, target_type: str, target_id: int, now: datetime) -> int:
+    """这个目标上待处理的举报里，有多少条来自此刻在任的委员。自动折叠只看这个数。"""
     # 一个人对一个目标只能举报一次（唯一约束），所以条数就是人数
     result = await db.execute(
         select(func.count())
         .select_from(JuryHallReport)
-        .where(JuryHallReport.target_type == target_type, JuryHallReport.target_id == target_id, JuryHallReport.status == "pending")
+        .join(JuryMember, JuryMember.user_id == JuryHallReport.reporter_id)
+        .where(
+            JuryHallReport.target_type == target_type,
+            JuryHallReport.target_id == target_id,
+            JuryHallReport.status == "pending",
+            _serving_clause(now),
+        )
     )
     return int(result.scalar_one() or 0)
 
 
 async def create_report(db: AsyncSession, user: User, target_type: str, target_id: int, reason: str | None, details: str | None) -> dict[str, Any]:
-    """POST /jury/hall/reports：任何登录用户都可以举报帖子或评论。被够多的人举报后先折叠，等管理员处理。"""
+    """POST /jury/hall/reports：任何登录用户都可以举报帖子或评论，都会记下来给管理员处理。
+
+    自动折叠只看在任委员的举报：够多的在任委员举报后先折叠，等管理员处理；其他用户的举报不计入、也不触发折叠。
+    每人每天的举报次数有上限。
+    """
     if target_type not in {"post", "comment"}:
         raise _error(status.HTTP_422_UNPROCESSABLE_ENTITY, "invalid_target", "只能举报帖子或评论")
     target, post = await _report_target(db, target_type, target_id)
@@ -705,7 +725,15 @@ async def create_report(db: AsyncSession, user: User, target_type: str, target_i
     )
     if existing.scalar_one_or_none() is not None:
         raise already
-    db.add(JuryHallReport(target_type=target_type, target_id=target_id, post_id=post.id, reporter_id=user.id, reason=reason, details=text or None))
+    now = datetime.now(UTC)
+    await _check_rate(db, JuryHallReport, user.id, REPORTS_PER_DAY, "举报次数", now, owner=JuryHallReport.reporter_id)
+    # 举报人此刻是不是在任委员：先查好，下面 flush 冲突回滚之后会话里的对象都过期了
+    by_juror = jury_service._is_serving(await jury_service.get_member(db, user.id), now)
+    db.add(
+        JuryHallReport(
+            target_type=target_type, target_id=target_id, post_id=post.id, reporter_id=user.id, reason=reason, details=text or None, created_at=now
+        )
+    )
     try:
         await db.flush()
     except IntegrityError:
@@ -713,7 +741,8 @@ async def create_report(db: AsyncSession, user: User, target_type: str, target_i
         raise already from None
     # 公告不自动折叠：否则随便几个人就能把管理员的公告藏起来。举报照样记下来给管理员看。
     foldable = not (target_type == "post" and post.kind == "announcement")
-    hidden = foldable and target.state == "visible" and await _pending_reports(db, target_type, target_id) >= AUTO_HIDE_REPORTS
+    # 只有在任委员的举报才可能触发折叠，数的也只是在任委员的举报
+    hidden = foldable and by_juror and target.state == "visible" and await _juror_reports(db, target_type, target_id, now) >= AUTO_HIDE_REPORTS
     if hidden:
         target.state = "hidden"
     await db.commit()
@@ -838,26 +867,68 @@ async def admin_post_detail(db: AsyncSession, post_id: int) -> dict[str, Any]:
         ).scalars()
     )
     users = await _users(db, {comment.author_id for comment in comments})
+    return {**(await admin_post_reads(db, [post]))[0], "comments": [_admin_comment_read(comment, users) for comment in comments]}
+
+
+def _admin_comment_read(comment: JuryHallComment, users: dict[int, User]) -> dict[str, Any]:
+    """后台看到的一条评论：原文，含已删除 / 被折叠的。"""
     return {
-        **(await admin_post_reads(db, [post]))[0],
-        "comments": [
-            {
-                "id": comment.id,
-                "post_id": comment.post_id,
-                "parent_id": comment.parent_id,
-                "reply_to_id": comment.reply_to_id,
-                "author_id": comment.author_id,
-                "author": users.get(comment.author_id),
-                "content": comment.content,
-                "state": comment.state,
-                "created_at": penalty_service.aware(comment.created_at),
-                "deleted_at": penalty_service.aware(comment.deleted_at),
-                "deleted_by_id": comment.deleted_by_id,
-                "moderation_note": comment.moderation_note,
-            }
-            for comment in comments
-        ],
+        "id": comment.id,
+        "post_id": comment.post_id,
+        "parent_id": comment.parent_id,
+        "reply_to_id": comment.reply_to_id,
+        "author_id": comment.author_id,
+        "author": users.get(comment.author_id),
+        "content": comment.content,
+        "state": comment.state,
+        "created_at": penalty_service.aware(comment.created_at),
+        "deleted_at": penalty_service.aware(comment.deleted_at),
+        "deleted_by_id": comment.deleted_by_id,
+        "moderation_note": comment.moderation_note,
     }
+
+
+async def admin_moderate_comment(db: AsyncSession, admin: User, comment_id: int, action: str, note: str | None) -> dict[str, Any]:
+    """POST /admin/jury/hall/comments/{id}/moderate：不经过举报，直接删除 / 恢复一条评论。
+
+    delete：删除，这条评论上待处理的举报记成已处理。
+    restore：把被折叠的、或被管理员删掉的恢复显示，这条评论上待处理的举报记成不成立；作者自己删掉的不能恢复。
+    状态没变就什么都不做（重复调用是幂等的）。
+    """
+    if action not in {"delete", "restore"}:
+        raise _error(status.HTTP_422_UNPROCESSABLE_ENTITY, "invalid_action", "未知的处置动作")
+    comment = await db.get(JuryHallComment, comment_id)
+    if comment is None:
+        raise _comment_not_found()
+    post = await db.get(JuryHallPost, comment.post_id)
+    now = datetime.now(UTC)
+    text = note.strip()[:500] if note and note.strip() else None
+    before = comment.state
+    same_target = (JuryHallReport.target_type == "comment", JuryHallReport.target_id == comment.id)
+    if action == "delete":
+        if comment.state != "deleted":
+            _mark_deleted(comment, admin.id, now, text)
+            await _close_reports(db, admin.id, now, "handled", text, *same_target)
+    elif comment.state != "visible":
+        if comment.state == "deleted" and comment.deleted_by_id == comment.author_id:
+            raise _error(status.HTTP_409_CONFLICT, "comment_not_restorable", "这条评论是作者自己删除的，不能恢复")
+        comment.state = "visible"
+        comment.deleted_at = None
+        comment.deleted_by_id = None
+        comment.moderation_note = text
+        # 恢复等于认定举报不成立；不了结的话，下一位委员一举报又会立刻折叠
+        await _close_reports(db, admin.id, now, "dismissed", text, *same_target)
+    changed = comment.state != before
+    if changed:
+        _audit(
+            db, admin.id, f"comment.{action}", "jury_hall_comment", comment.id, {"post_id": comment.post_id, "from": before, "to": comment.state, "note": text}
+        )
+    await db.commit()
+    if changed:
+        if post is not None and post.state != "deleted":
+            await _notify(db, post, "updated")
+        await _broadcast_admin(comment.post_id, f"comment_{action}")
+    return _admin_comment_read(comment, await _users(db, {comment.author_id}))
 
 
 async def admin_create_announcement(db: AsyncSession, admin: User, title: str | None, content: str | None, pinned: bool = False) -> dict[str, Any]:

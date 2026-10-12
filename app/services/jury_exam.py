@@ -192,8 +192,11 @@ async def _question_views(db: AsyncSession, attempt: JuryExamAttempt) -> list[di
     case_ids = [int(case_id) for case_id in json.loads(attempt.question_ids)]
     cases = {case.id: case for case in (await db.execute(select(ReportCase).where(ReportCase.id.in_(case_ids)))).scalars().all()}
     questions: list[dict[str, Any]] = []
+    started = penalty_service.aware(attempt.started_at)
     for index, case_id in enumerate(case_ids, start=1):
-        view = await jury_service.juror_case_view(db, cases[case_id])
+        # 考试题和质控题是同一批旧案件：内容的时间同样平移到开考前不久，否则考生能据此认出哪些案件是旧的。
+        # 按场次和题号取值，同一场里重复读（GET /jury/exam 的 active）看到的时间不变。
+        view = await jury_service.juror_case_view(db, cases[case_id], disguise=(started, ("exam", attempt.id, index)))
         questions.append(
             {
                 "question": index,
@@ -468,7 +471,11 @@ async def practice_answer(db: AsyncSession, user: User, question_id: int, vote: 
     now = datetime.now(UTC)
     case = await db.get(ReportCase, question_id)
     # 只认练习场那一份里的题：否则拿任意题号来「练习」就能问出考试题和质控题的标准答案。
-    if case is None or bank_service.question_pool(case) != "practice" or not await _usable_questions(db, user.id, [case.id], limit=1):
+    if (
+        case is None
+        or bank_service.question_pool(case, await bank_service.is_precedent(db, case)) != "practice"
+        or not await _usable_questions(db, user.id, [case.id], limit=1)
+    ):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"code": "question_not_found", "message": "题目不存在"})
     left, _stats = await _practice_numbers(db, user.id, now)
     if left <= 0:

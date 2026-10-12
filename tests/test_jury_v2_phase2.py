@@ -2081,3 +2081,270 @@ class HttpPhase2Tests(Phase2TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------- 第二轮修复：质控题的内容时间、在质控题上回避
+
+
+def _moment(text: str) -> datetime:
+    return datetime.fromisoformat(text.replace("Z", "+00:00"))
+
+
+class QualityDisguiseTests(Phase2TestCase):
+    """质控题 / 考试题是早就结案的旧案件：投票之前展示的内容时间整体平移到近期。"""
+
+    GAPS = (-900, -40, 0, 25, 600)
+    MIN, MAX = timedelta(hours=2), timedelta(hours=40)
+
+    def _old_messages(self, days: float = 30, gaps: tuple[int, ...] = GAPS) -> str:
+        """一份几周前的群聊快照：被举报的那条在 days 天前，其余各条和它差 gaps 秒。时间的格式和真实快照一样（不带时区的 UTC）。"""
+        target = datetime.now(UTC) - timedelta(days=days)
+        messages = [
+            {
+                "sender_id": self.ids["offender"] if gap == 0 else self.ids["bob"],
+                "content": f"第 {index} 条",
+                "type": "text",
+                "is_target": gap == 0,
+                "created_at": (target + timedelta(seconds=gap)).replace(tzinfo=None).isoformat(),
+            }
+            for index, gap in enumerate(gaps)
+        ]
+        return json.dumps({"messages": messages, "message": next(item for item in messages if item["is_target"])})
+
+    def _old_post(self, days: float = 30) -> str:
+        return json.dumps({"post": {"content": "低价卖号", "image_urls": [], "created_at": (datetime.now(UTC) - timedelta(days=days)).replace(tzinfo=None).isoformat()}})
+
+    async def _force_quality(self, db, name: str) -> dict:
+        member = await self._member(db, name)
+        member.votes_since_quality = jury_service.QUALITY_MAX_GAP + 1
+        await db.commit()
+        return await jury_service.next_case(db, await self._user(db, name))
+
+    def test_the_disguised_age_is_stable_secret_and_within_range(self) -> None:
+        ages = [jury_service.disguised_age("quality", seed, 1760000000) for seed in range(300)]
+        self.assertTrue(all(self.MIN <= age <= self.MAX for age in ages))
+        # 精确到秒，不是整点，也不是所有人都一样
+        self.assertGreater(len(set(ages)), 250)
+        self.assertEqual(ages, [jury_service.disguised_age("quality", seed, 1760000000) for seed in range(300)])
+        self.assertNotEqual(jury_service.disguised_age("quality", 7, 1), jury_service.disguised_age("exam", 7, 1))
+        # 掺了服务端密钥：只知道评审编号算不出来
+        with patch.object(jury_service.settings, "jwt_secret_key", "another-secret-key-that-is-long-enough-000"):
+            self.assertNotEqual([jury_service.disguised_age("quality", seed, 1760000000) for seed in range(300)], ages)
+        # 范围是配置项
+        with patch.object(jury_service, "QUALITY_SHIFT_MIN_HOURS", 5), patch.object(jury_service, "QUALITY_SHIFT_MAX_HOURS", 5):
+            self.assertEqual(jury_service.disguised_age("x"), timedelta(hours=5))
+
+    def test_time_shift_keeps_gaps_and_never_shows_the_future(self) -> None:
+        base = datetime(2026, 10, 12, 8, 0, tzinfo=UTC)
+        target, later = "2026-09-01T00:00:00.250000", "2026-09-03T03:00:00"
+        # 被举报那条之后的上下文隔了两天多：整体再往前挪，让最晚的一条也落在基准时间之前 2 小时
+        shift = jury_service._time_shift(target, ["2026-08-31T23:50:00", target, later], base, ("seed",))
+        self.assertEqual(_moment(jury_service.snapshot_time(later, shift)), base - self.MIN)
+        self.assertEqual(_moment(jury_service.snapshot_time(later, shift)) - _moment(jury_service.snapshot_time(target, shift)), _moment(later + "Z") - _moment(target + "Z"))
+        # 没有能用的时间：不平移；被举报那条没有时间时以最晚的一条为准
+        self.assertIsNone(jury_service._time_shift(None, [None, "昨天", ""], base, ("seed",)))
+        fallback = jury_service._time_shift(None, [target, later], base, ("seed",))
+        self.assertTrue(self.MIN <= base - _moment(jury_service.snapshot_time(later, fallback)) <= self.MAX)
+        # 认不出来的时间原样返回，空的还是 None
+        self.assertEqual((jury_service.snapshot_time("昨天", shift), jury_service.snapshot_time(None, shift)), ("昨天", None))
+
+    async def test_quality_check_times_look_recent_until_the_vote(self) -> None:
+        async with self.sessions() as db:
+            question = await self._question(db, snapshot=self._old_messages())
+            juror = await self._user(db, "juror1")
+            view = await self._force_quality(db, "juror1")
+            self.assertEqual(await self._real(db, view["case_id"]), question.id)
+            JuryCaseView(**view)
+            times = [_moment(item["created_at"]) for item in view["messages"]]
+            target = times[self.GAPS.index(0)]
+            # 被举报的那条看起来发于分到手之前 2–40 小时，各条之间的间隔一秒不差
+            self.assertTrue(self.MIN <= view["assigned_at"] - target <= self.MAX, view["assigned_at"] - target)
+            self.assertEqual([(moment - target).total_seconds() for moment in times], list(self.GAPS))
+            self.assertTrue(all(item["created_at"].endswith("Z") for item in view["messages"]))
+            # 重复取同一个案件：时间不变
+            self.assertEqual((await jury_service.next_case(db, juror))["messages"], view["messages"])
+        # 换一个会话（分到手的时间从库里读回来是不带时区的）也不变
+        async with self.sessions() as db:
+            juror = await self._user(db, "juror1")
+            self.assertEqual((await jury_service.next_case(db, juror))["messages"], view["messages"])
+
+            # 投票之后（已经揭晓是质控题）恢复真实时间
+            result = await jury_service.cast_vote(db, juror, view["case_id"], "l2", None)
+            self.assertTrue(result["case"]["is_quality_check"])
+            for detail in (result["case"], await jury_service.case_detail(db, juror.id, view["case_id"])):
+                real = [_moment(item["created_at"]) for item in detail["messages"]]
+                self.assertLess(abs((datetime.now(UTC) - real[self.GAPS.index(0)]) - timedelta(days=30)), timedelta(minutes=5))
+                self.assertEqual([(moment - real[self.GAPS.index(0)]).total_seconds() for moment in real], list(self.GAPS))
+
+            # 别的委员拿到同一道题：各取各的值，也都在范围里
+            other = await self._force_quality(db, "juror2")
+            self.assertEqual(await self._real(db, other["case_id"]), question.id)
+            other_target = _moment(other["messages"][self.GAPS.index(0)]["created_at"])
+            self.assertTrue(self.MIN <= other["assigned_at"] - other_target <= self.MAX)
+
+    async def test_posts_are_shifted_too_and_real_cases_are_left_alone(self) -> None:
+        async with self.sessions() as db:
+            # 真实的待评审案件不动：内容是什么时间就显示什么时间
+            real_case = await self._open_case(db, snapshot=self._old_post(days=3))
+            juror = await self._user(db, "juror1")
+            with patch.object(jury_service, "_quality_roll", return_value=0.99):
+                view = await jury_service.next_case(db, juror)
+            self.assertEqual(await self._real(db, view["case_id"]), real_case.id)
+            self.assertLess(abs((datetime.now(UTC) - _moment(view["post"]["created_at"])) - timedelta(days=3)), timedelta(minutes=5))
+            await jury_service.cast_vote(db, juror, view["case_id"], "l2", None)
+
+            self._serial += 1
+            question = await self._question(db, target_type="post", target_key=f"post:{70000 + self._serial}", snapshot=self._old_post())
+            quality = await self._force_quality(db, "juror1")
+            self.assertEqual(await self._real(db, quality["case_id"]), question.id)
+            age = quality["assigned_at"] - _moment(quality["post"]["created_at"])
+            self.assertTrue(self.MIN <= age <= self.MAX, age)
+            self.assertEqual(set(quality), set(view))
+            result = await jury_service.cast_vote(db, juror, quality["case_id"], "l2", None)
+            self.assertLess(abs((datetime.now(UTC) - _moment(result["case"]["post"]["created_at"])) - timedelta(days=30)), timedelta(minutes=5))
+
+    async def test_exam_questions_are_shifted_and_practice_is_not(self) -> None:
+        async with self.sessions() as db:
+            for index in range(3):
+                await self._question(db, upheld=index % 2 == 0, snapshot=self._old_messages(days=20 + index))
+            practice = await self._question(db, verified=False, source="legacy", snapshot=self._old_messages(days=45))
+            carol = await self._eligible_user(db, "carol")
+            with patch.object(exam_service, "EXAM_TOTAL", 3), patch.object(exam_service, "EXAM_PASS_SCORE", 1):
+                started = ExamStart(**await exam_service.start_exam(db, carol))
+                attempt = await db.get(JuryExamAttempt, started.attempt_id)
+                began = penalty_service.aware(attempt.started_at)
+                self.assertEqual(len(started.questions), 3)
+                ages = []
+                for question in started.questions:
+                    times = [_moment(item.created_at) for item in question.messages]
+                    target = times[self.GAPS.index(0)]
+                    ages.append(began - target)
+                    self.assertTrue(self.MIN <= began - target <= self.MAX, began - target)
+                    self.assertEqual([(moment - target).total_seconds() for moment in times], list(self.GAPS))
+                # 每道题各取各的值
+                self.assertEqual(len(set(ages)), 3)
+                # 同一场里重复读：时间不变
+                state = ExamState(**await exam_service.exam_state(db, carol))
+                self.assertEqual([question.model_dump() for question in state.active.questions], [question.model_dump() for question in started.questions])
+            # 练习场不动
+            page = PracticeNext(**await exam_service.practice_next(db, carol))
+            self.assertEqual(page.question.question_id, practice.id)
+            shown = _moment(page.question.messages[self.GAPS.index(0)].created_at)
+            self.assertLess(abs((datetime.now(UTC) - shown) - timedelta(days=45)), timedelta(minutes=5))
+
+
+class QualityRecusalTests(Phase2TestCase):
+    """在质控题上回避不算「见过」：过几天同一道题可以再出，题库不会被回避耗光。"""
+
+    async def _take(self, db, name: str = "juror1", *, force: bool = False) -> dict | None:
+        """取下一件；随机位置关掉，所以只有强制（force，或者欠着一道）时才会出质控题。"""
+        if force:
+            (await self._member(db, name)).votes_since_quality = jury_service.QUALITY_MAX_GAP + 1
+            await db.commit()
+        with patch.object(jury_service, "_quality_roll", return_value=0.99):
+            return await jury_service.next_case(db, await self._user(db, name))
+
+    async def _row(self, db, review_id: int) -> JuryVote:
+        row = await db.get(JuryVote, review_id)
+        await db.refresh(row)
+        return row
+
+    async def _backdate_recusal(self, db, review_id: int, days: float) -> None:
+        (await self._row(db, review_id)).recused_at = datetime.now(UTC) - timedelta(days=days)
+        await db.commit()
+
+    async def _answer(self, db, view: dict, name: str = "juror1") -> dict:
+        case = await db.get(ReportCase, await self._real(db, view["case_id"]))
+        return await jury_service.cast_vote(db, await self._user(db, name), view["case_id"], "l2" if bank_service.question_upheld(case) else "none", None)
+
+    async def test_recused_quality_checks_return_later_and_unseen_ones_go_first(self) -> None:
+        async with self.sessions() as db:
+            questions = {(await self._question(db)).id, (await self._question(db, upheld=False)).id}
+            normal = await self._open_case(db)
+            juror = await self._user(db, "juror1")
+            member = await self._member(db, "juror1")
+            self.assertEqual(jury_service.QUALITY_RECUSE_RETRY_DAYS, 7)
+
+            first = await self._take(db, force=True)
+            first_case = await self._real(db, first["case_id"])
+            self.assertIn(first_case, questions)
+            await jury_service.cast_vote(db, juror, first["case_id"], "recuse", "不想答")
+            # 回避后下一件仍补一道质控题：从没见过的里选
+            second = await self._take(db)
+            second_case = await self._real(db, second["case_id"])
+            self.assertEqual({first_case, second_case}, questions)
+            await jury_service.cast_vote(db, juror, second["case_id"], "recuse", None)
+            await db.refresh(member)
+            self.assertTrue(member.force_quality)
+
+            # 两道都刚回避过：欠着的那道宁可不出，也不再出刚回避的 —— 发的是普通案件
+            third = await self._take(db)
+            self.assertEqual(await self._real(db, third["case_id"]), normal.id)
+            self.assertFalse((await self._row(db, third["case_id"])).is_quality_check)
+            await db.refresh(member)
+            self.assertTrue(member.force_quality)
+            await jury_service.cast_vote(db, juror, third["case_id"], "l2", None)
+            self.assertIsNone(await self._take(db))
+            # 回避的记录里看不出那是质控题，也看不出案件的进展
+            items, total = await jury_service.list_votes(db, juror.id, votes=["recuse"])
+            self.assertEqual((total, {(item["is_quality_check"], item["stage"], item["can_view"]) for item in items}), (2, {(False, None, False)}))
+
+            # 过了 7 天：第一道可以再出（复用原来那一行，评审编号不变）；第二道才回避 3 天，还不行
+            await self._backdate_recusal(db, first["case_id"], 8)
+            await self._backdate_recusal(db, second["case_id"], 3)
+            again = await self._take(db)
+            self.assertEqual((again["case_id"], await self._real(db, again["case_id"])), (first["case_id"], first_case))
+            row = await self._row(db, again["case_id"])
+            self.assertEqual((row.vote, row.note, row.recused_at, row.voted_at, row.past_recusals, row.is_quality_check), (None, None, None, None, 1, True))
+            self.assertLess(datetime.now(UTC) - penalty_service.aware(row.assigned_at), timedelta(minutes=1))
+            await db.refresh(member)
+            self.assertFalse(member.force_quality)
+            # 重复取还是这一件；回避记录里只剩第二道
+            self.assertEqual((await self._take(db))["case_id"], first["case_id"])
+            self.assertEqual((await jury_service.list_votes(db, juror.id, votes=["recuse"]))[1], 1)
+            result = await self._answer(db, again)
+            self.assertTrue(result["case"]["is_quality_check"])
+            await db.refresh(member)
+            self.assertEqual((member.golden_total, member.golden_correct), (1, 1))
+
+            # 答过的才算「见过」：不会再出。第二道也到期了，但题库里新来了一道没见过的 —— 没见过的优先
+            fresh = await self._question(db)
+            await self._backdate_recusal(db, second["case_id"], 9)
+            unseen = await self._take(db, force=True)
+            self.assertEqual(await self._real(db, unseen["case_id"]), fresh.id)
+            await self._answer(db, unseen)
+            late = await self._take(db, force=True)
+            self.assertEqual((late["case_id"], await self._real(db, late["case_id"])), (second["case_id"], second_case))
+            # 再回避一次：又欠一道，但已经没有别的可出
+            await jury_service.cast_vote(db, juror, late["case_id"], "recuse", None)
+            self.assertIsNone(await self._take(db))
+            row = await self._row(db, second["case_id"])
+            self.assertEqual((row.vote, row.past_recusals), ("recuse", 1))
+            self.assertIsNotNone(row.recused_at)
+
+            # 后台：在质控题上回避了几次（再出之后又回避的重复计），回避率照样算上被清掉的那几次
+            items, _total = await jury_service.list_members(db, "active", 50, 0)
+            reads = {item["user_id"]: JuryMemberRead(**item) for item in items}
+            mine = reads[juror.id]
+            self.assertEqual((mine.votes_total, mine.quality_recused, mine.recuse_rate, mine.golden_total), (3, 3, 0.5, 2))
+            self.assertEqual((reads[self.ids["juror2"]].quality_recused, reads[self.ids["juror2"]].recuse_rate), (0, 0))
+
+    async def test_recusing_real_cases_is_not_counted_as_dodging_quality_checks(self) -> None:
+        async with self.sessions() as db:
+            question = await self._question(db)
+            real = await self._open_case(db)
+            # 真实案件上的回避是永久的：过多久都不会再分给他，哪怕这个案件后来进了计分题库
+            await self._cast(db, "juror1", real.id, "recuse")
+            for name in ("juror2", "juror3", "juror4"):
+                await self._cast(db, name, real.id, "l2")
+            await db.refresh(real)
+            real.is_golden, real.golden_verified, real.golden_source = True, True, "consensus"
+            await db.commit()
+            await self._backdate_recusal(db, await self._rid(db, "juror1", real.id), 30)
+            view = await self._take(db, force=True)
+            self.assertEqual(await self._real(db, view["case_id"]), question.id)
+            await self._answer(db, view)
+            self.assertIsNone(await self._take(db, force=True))
+            items, _total = await jury_service.list_members(db, "active", 50, 0)
+            mine = {item["user_id"]: item for item in items}[self.ids["juror1"]]
+            self.assertEqual((mine["quality_recused"], mine["recuse_rate"]), (0, 0.5))

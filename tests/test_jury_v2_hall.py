@@ -30,6 +30,7 @@ from app.models.user import User
 from app.schemas.case import JuryCaseDetail
 from app.schemas.jury import AdminQuestionRead, JuryConfig, PracticeNext, PublicCase, PublicCaseDetail
 from app.schemas.jury_hall import (
+    AdminHallCommentRead,
     AdminHallPostDetail,
     AdminHallPostRead,
     AdminHallReportRead,
@@ -1015,6 +1016,7 @@ class HallReportTests(HallTestCase):
     async def test_reports_fold_content_and_admin_handles_them(self) -> None:
         async with self.sessions() as db:
             admin, juror2, juror3, juror5, alice, bob = [await self._user(db, name) for name in ("admin", "juror2", "juror3", "juror5", "alice", "bob")]
+            juror6, speaker = await self._user(db, "juror6"), await self._user(db, "speaker")
             post_id = (await self._hall_post(db, "juror2", "discussion", "一个会被举报的帖子", "正文原文"))["id"]
             comment_id = (await self._comment(db, "juror3", post_id, "一条会被举报的评论"))["id"]
             reply_id = (await self._comment(db, "juror5", post_id, "它下面的回复", comment_id))["id"]
@@ -1042,9 +1044,12 @@ class HallReportTests(HallTestCase):
             seen = {viewer.username: (await hall_service.get_post(db, viewer, post_id))["reported"] for viewer in (bob, alice, juror5)}
             self.assertEqual(seen, {"bob": True, "alice": True, "juror5": False})
 
-            # 第三个不同的人举报之后自动折叠：留一个占位，标题和正文都不给
+            # 自动折叠只数在任委员的举报：bob、alice 不是委员，juror5 是第三个举报的人，但只是第一位委员
+            self.assertEqual((await report(juror5, "post", post_id, "泄露身份或隐私"))["state"], "visible")
+            self.assertEqual((await report(juror6, "post", post_id))["state"], "visible")
+            # 第三位在任委员举报之后自动折叠：留一个占位，标题和正文都不给
             with self._events() as events:
-                self.assertEqual((await report(juror5, "post", post_id, "泄露身份或隐私"))["state"], "hidden")
+                self.assertEqual((await report(speaker, "post", post_id))["state"], "hidden")
             self.assertEqual([data for name, _users, data in events if name == "jury.hall.changed"], [{"post_id": post_id, "kind": "discussion", "action": "updated"}])
             folded = HallPost(**await hall_service.get_post(db, juror2, post_id))
             self.assertEqual((folded.state, folded.title, folded.content, folded.can_comment, folded.can_edit, folded.can_delete, folded.mine), ("hidden", hall_service.HIDDEN_TITLE, None, False, False, True, True))
@@ -1056,28 +1061,32 @@ class HallReportTests(HallTestCase):
 
             # 评论同理：折叠后留占位，content 为 null；回复还在
             await report(alice, "comment", comment_id, "与风纪无关")
-            self.assertEqual((await report(juror2, "comment", comment_id))["state"], "hidden")
+            for juror in (juror2, juror5):
+                self.assertEqual((await report(juror, "comment", comment_id))["state"], "visible")
+            self.assertEqual((await report(juror6, "comment", comment_id))["state"], "hidden")
             comments = {item["id"]: item for item in (await hall_service.list_comments(db, bob, post_id))[0]}
             self.assertEqual((comments[comment_id]["state"], comments[comment_id]["content"], comments[comment_id]["reported"]), ("hidden", None, True))
             self.assertEqual((comments[reply_id]["state"], comments[reply_id]["content"], comments[reply_id]["reported"]), ("visible", "它下面的回复", False))
-            self.assertFalse({item["id"]: item for item in (await hall_service.list_comments(db, juror5, post_id))[0]}[comment_id]["reported"])
-            # 阈值是配置项
+            self.assertFalse({item["id"]: item for item in (await hall_service.list_comments(db, juror3, post_id))[0]}[comment_id]["reported"])
+            # 阈值是配置项；阈值再低，不是委员的人举报也不折叠
             with patch.object(hall_service, "AUTO_HIDE_REPORTS", 1):
-                self.assertEqual((await report(bob, "comment", reply_id))["state"], "hidden")
-            # 公告不自动折叠，举报照样记下来
-            for viewer in (bob, alice, juror5, juror2):
+                self.assertEqual((await report(bob, "comment", reply_id))["state"], "visible")
+                self.assertEqual((await report(juror2, "comment", reply_id))["state"], "hidden")
+            # 公告不自动折叠（三位在任委员举报了也不），举报照样记下来
+            for viewer in (bob, juror5, juror2, juror6):
                 self.assertEqual((await report(viewer, "post", notice_id, "与风纪无关"))["state"], "visible")
 
             # 后台：逐条举报，带目标的原文和真实作者
             items, total = await hall_service.admin_list_reports(db, status_filter="pending", limit=100)
-            self.assertEqual(total, 11)
+            self.assertEqual(total, 16)
             reads = [AdminHallReportRead(**item) for item in items]
             on_post = [read for read in reads if (read.target_type, read.target_id) == ("post", post_id)]
-            self.assertEqual(sorted(read.reporter.username for read in on_post), ["alice", "bob", "juror5"])
-            self.assertEqual({(read.target.content, read.target.state, read.target.author.username, read.target.pending_reports, read.target.post_title) for read in on_post}, {("正文原文", "hidden", "juror2", 3, "一个会被举报的帖子")})
+            # 不是委员的人的举报照常在待处理列表里
+            self.assertEqual(sorted(read.reporter.username for read in on_post), ["alice", "bob", "juror5", "juror6", "speaker"])
+            self.assertEqual({(read.target.content, read.target.state, read.target.author.username, read.target.pending_reports, read.target.post_title) for read in on_post}, {("正文原文", "hidden", "juror2", 5, "一个会被举报的帖子")})
             self.assertEqual({read.details for read in on_post}, {"这是一段足够长的说明", None})
             listed_admin = {item["id"]: item["pending_reports"] for item in (await hall_service.admin_list_posts(db))[0]}
-            self.assertEqual(listed_admin, {post_id: 7, notice_id: 4})
+            self.assertEqual(listed_admin, {post_id: 12, notice_id: 4})
 
             # 驳回：帖子恢复显示，这个帖子上其余待处理的举报一起了结；评论的举报不受影响
             with self._events() as events:
@@ -1088,7 +1097,7 @@ class HallReportTests(HallTestCase):
             self.assertEqual((restored["state"], restored["title"], restored["content"], restored["reported"]), ("visible", "一个会被举报的帖子", "正文原文", True))
             self.assertEqual(await self._code(hall_service.admin_handle_report(db, admin, on_post[1].id, "dismiss", None)), (409, "report_handled"))
             self.assertEqual(await self._code(hall_service.admin_handle_report(db, admin, 99999, "dismiss", None)), (404, "report_not_found"))
-            self.assertEqual((await hall_service.admin_list_reports(db, status_filter="dismissed"))[1], 3)
+            self.assertEqual((await hall_service.admin_list_reports(db, status_filter="dismissed"))[1], 5)
             # 驳回过的人不能再举报一次；新的举报重新从零数
             self.assertEqual(await self._code(report(bob, "post", post_id)), (409, "already_reported"))
 
@@ -1102,7 +1111,7 @@ class HallReportTests(HallTestCase):
             row = await db.get(JuryHallComment, comment_id)
             self.assertEqual((row.deleted_by_id, row.moderation_note), (admin.id, "人身攻击"))
             self.assertEqual(await self._code(report(alice, "comment", comment_id)), (404, "comment_not_found"))
-            self.assertEqual((await hall_service.admin_list_reports(db, status_filter="handled"))[1], 3)
+            self.assertEqual((await hall_service.admin_list_reports(db, status_filter="handled"))[1], 5)
             # 删帖子：帖子和它下面评论的举报一起了结
             on_reply = next(read for read in reads if (read.target_type, read.target_id) == ("comment", reply_id))
             await report(juror3, "post", post_id)
@@ -1188,7 +1197,7 @@ class HallListTests(HallTestCase):
                     "vote_days": 7, "quorum_ratio": 0.3, "quorum_min": 3,
                     "pass_num": 2, "pass_den": 3, "pass_ratio": 0.6667,
                     "report_reasons": ["人身攻击", "讨论未结案件", "泄露身份或隐私", "与风纪无关", "其他"],
-                    "auto_hide_reports": 3,
+                    "auto_hide_reports": 3, "reports_per_day": 20,
                 },
             )  # fmt: skip
             for phrase in ("不要讨论具体的未结案件", "对事不对人", "规则由管理员修改，提案通过后由管理员决定是否采纳"):
@@ -1409,3 +1418,328 @@ class HttpHallTests(HallTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------- 第二轮修复：举报、题库分池、接上的调用点、后台直接处理评论
+
+
+class HallReportRuleTests(HallTestCase):
+    async def _reports_on(self, db, target_type: str, target_id: int) -> list[JuryHallReport]:
+        rows = await db.execute(
+            select(JuryHallReport).where(JuryHallReport.target_type == target_type, JuryHallReport.target_id == target_id).order_by(JuryHallReport.id)
+        )
+        return list(rows.scalars().all())
+
+    async def test_only_reports_from_serving_jurors_fold_content(self) -> None:
+        async with self.sessions() as db:
+            post_id = (await self._hall_post(db, "juror2", "discussion", "三个小号藏不掉的帖子", "正文原文"))["id"]
+
+            async def report(name: str) -> str:
+                return (await hall_service.create_report(db, await self._user(db, name), "post", post_id, "与风纪无关", None))["state"]
+
+            # 四个不是委员的人（含管理员）：都记下来，进后台待处理列表，但不折叠
+            for name in ("alice", "bob", "offender", "admin"):
+                self.assertEqual(await report(name), "visible")
+            self.assertEqual((await hall_service.admin_list_reports(db, status_filter="pending"))[1], 4)
+            self.assertEqual((await hall_service.admin_list_posts(db))[0][0]["pending_reports"], 4)
+            # 两位在任委员：还不到三位
+            for name in ("juror5", "juror6"):
+                self.assertEqual(await report(name), "visible")
+            # 举报之后被停职的不再算数：此刻在任的举报人只剩 juror6 和刚举报的 juror3
+            (await self._member(db, "juror5")).status = "suspended"
+            await db.commit()
+            self.assertEqual(await report("juror3"), "visible")
+            # 任期已经届满的、被停职的人来举报：不计入，也不触发折叠（哪怕阈值降到 1）
+            (await self._member(db, "speaker")).term_ends_at = datetime.now(UTC) - timedelta(minutes=1)
+            (await self._member(db, "lurker")).status = "suspended"
+            await db.commit()
+            with patch.object(hall_service, "AUTO_HIDE_REPORTS", 1):
+                self.assertEqual(await report("speaker"), "visible")
+                self.assertEqual(await report("lurker"), "visible")
+            # 第三位在任委员
+            with self._events() as events:
+                self.assertEqual(await report("juror4"), "hidden")
+            self.assertEqual([data["action"] for name, _users, data in events if name == "jury.hall.changed"], ["updated"])
+            self.assertEqual(len(await self._reports_on(db, "post", post_id)), 10)
+            self.assertEqual((await hall_service.get_post(db, await self._user(db, "bob"), post_id))["state"], "hidden")
+
+    async def test_reports_are_rate_limited_per_person(self) -> None:
+        async with self.sessions() as db:
+            bob, alice = await self._user(db, "bob"), await self._user(db, "alice")
+            posts = [(await self._hall_post(db, "juror2", "discussion", f"帖子 {index}"))["id"] for index in range(3)]
+            comment_id = (await self._comment(db, "juror3", posts[0], "一条评论"))["id"]
+            self.assertEqual((hall_service.REPORTS_PER_DAY, hall_service.config_view()["reports_per_day"]), (20, 20))
+            with patch.object(hall_service, "REPORTS_PER_DAY", 2):
+                await hall_service.create_report(db, bob, "post", posts[0], "与风纪无关", None)
+                # 帖子和评论合计
+                await hall_service.create_report(db, bob, "comment", comment_id, "与风纪无关", None)
+                with self.assertRaises(HTTPException) as caught:
+                    await hall_service.create_report(db, bob, "post", posts[1], "与风纪无关", None)
+                detail = caught.exception.detail
+                self.assertEqual((caught.exception.status_code, detail["code"]), (429, "hall_rate_limited"))
+                first = (await self._reports_on(db, "post", posts[0]))[0]
+                self.assertEqual(detail["resets_at"], jury_service._iso(penalty_service.aware(first.created_at) + timedelta(hours=24)))
+                # 被拒绝的那次没有记下来；别人不受影响
+                self.assertEqual(await self._reports_on(db, "post", posts[1]), [])
+                self.assertEqual((await hall_service.create_report(db, alice, "post", posts[1], "与风纪无关", None))["state"], "visible")
+                # 重复举报先报 409（不占额度，也不因为超限变成 429）
+                self.assertEqual(await self._code(hall_service.create_report(db, bob, "post", posts[0], "与风纪无关", None)), (409, "already_reported"))
+                # 管理员处理掉的举报也算在额度里
+                await hall_service.admin_handle_report(db, await self._user(db, "admin"), first.id, "dismiss", None)
+                self.assertEqual(await self._code(hall_service.create_report(db, bob, "post", posts[1], "与风纪无关", None)), (429, "hall_rate_limited"))
+                # 按最近 24 小时滚动：最早那一次滑出窗口后又有名额
+                first.created_at = datetime.now(UTC) - timedelta(hours=25)
+                await db.commit()
+                self.assertEqual((await hall_service.create_report(db, bob, "post", posts[1], "与风纪无关", None))["state"], "visible")
+                self.assertEqual(await self._code(hall_service.create_report(db, bob, "post", posts[2], "与风纪无关", None)), (429, "hall_rate_limited"))
+
+
+class PrecedentPoolTests(HallTestCase):
+    async def _forced_quality_check(self, db, name: str) -> int | None:
+        """强制让这位委员的下一件出质控题并答对，返回那道题的案件编号；出不了返回 None。"""
+        member = await self._member(db, name)
+        member.votes_since_quality = jury_service.QUALITY_MAX_GAP + 1
+        await db.commit()
+        user = await self._user(db, name)
+        view = await jury_service.next_case(db, user)
+        if view is None:
+            return None
+        case_id = await self._real(db, view["case_id"])
+        upheld = bank_service.question_upheld(await db.get(ReportCase, case_id))
+        result = await jury_service.cast_vote(db, user, view["case_id"], "l2" if upheld else "none", None)
+        self.assertTrue(result["case"]["is_quality_check"])
+        return case_id
+
+    async def test_a_live_precedent_stays_in_the_practice_pool_even_when_verified(self) -> None:
+        async with self.sessions() as db:
+            admin = await self._user(db, "admin")
+            scored = await self._question(db)
+            other = await self._question(db, upheld=False)
+            self.assertEqual(await bank_service.verified_count(db), 2)
+            made = await precedent_service.admin_create(db, admin, scored.id, "反复辱骂群成员属于辱骂骚扰", "连续几条都指向同一个人。")
+            await db.refresh(scored)
+            self.assertFalse(scored.golden_verified)
+            # 管理员在题库里又把它标成已核对：按编号它本来会回到计分那一份，而判例对在任委员公开内容和结论
+            read = AdminQuestionRead(**await bank_service.update_question(db, scored.id, actor_id=admin.id, changes={"verified": True}))
+            self.assertEqual((read.verified, read.pool), (True, "practice"))
+            await db.refresh(scored)
+            self.assertTrue(await bank_service.is_precedent(db, scored))
+            self.assertFalse(await bank_service.is_precedent(db, other))
+            # 不看判例的原规则会把它划进计分那一份；看了就恒是练习
+            self.assertEqual((bank_service.question_pool(scored), bank_service.question_pool(scored, True)), ("scored", "practice"))
+            listed = {item["case_id"]: (item["verified"], item["pool"]) for item in (await bank_service.list_questions(db))[0]}
+            self.assertEqual(listed, {scored.id: (True, "practice"), other.id: (True, "scored")})
+            self.assertEqual(await bank_service.verified_count(db), 1)
+
+            # 评审中的质控题不出它
+            self.assertEqual([await self._forced_quality_check(db, "juror3") for _ in range(2)], [other.id, None])
+            # 入门考试不抽它
+            carol = await self._eligible_user(db, "carol")
+            with patch.object(exam_service, "EXAM_TOTAL", 1):
+                for _ in range(5):
+                    self.assertEqual(await exam_service._draw_questions(db, carol.id, []), [other.id])
+            with patch.object(exam_service, "EXAM_TOTAL", 2):
+                self.assertEqual(await exam_service._draw_questions(db, carol.id, []), [])
+            # 练习场出它，也能作答；计分那一份里的照旧问不出答案
+            page = PracticeNext(**await exam_service.practice_next(db, carol))
+            self.assertEqual((page.question.question_id, page.question.verified, page.round.total), (scored.id, True, 1))
+            self.assertTrue((await exam_service.practice_answer(db, carol, scored.id, "l2"))["correct"])
+            self.assertEqual(await self._code(exam_service.practice_answer(db, carol, other.id, "none")), (404, "question_not_found"))
+
+            # 判例撤下之后恢复按原规则：已核对、编号不在练习那一份里 -> 回到计分那一份
+            await precedent_service.admin_withdraw(db, admin, made["id"])
+            await db.refresh(scored)
+            self.assertFalse(await bank_service.is_precedent(db, scored))
+            again = (await bank_service.question_reads(db, [scored]))[0]
+            self.assertEqual((again["in_bank"], again["verified"], again["pool"]), (True, True, "scored"))
+            self.assertEqual(await bank_service.verified_count(db), 2)
+            self.assertEqual(await self._code(exam_service.practice_answer(db, carol, scored.id, "l2")), (404, "question_not_found"))
+            self.assertEqual({await self._forced_quality_check(db, "juror4") for _ in range(2)}, {scored.id, other.id})
+
+
+class WiringTests(HallTestCase):
+    async def test_the_background_loop_settles_due_proposals(self) -> None:
+        async with self.sessions() as db:
+            passed = (await self._hall_post(db, "juror1", "proposal", "提案一"))["id"]
+            await self._ballots(db, passed, 3, 0)
+            await self._expire(db, passed)
+            with self._events() as events:
+                self.assertEqual(await case_service.sweep_jury_hall(db), {"proposals": 1})
+            self.assertEqual([data for name, _users, data in events if name == "jury.hall.changed"], [{"post_id": passed, "kind": "proposal", "action": "closed"}])
+            self.assertEqual((await self._hall_row(db, passed)).status, "passed")
+            self.assertEqual(await case_service.sweep_jury_hall(db), {"proposals": 0})
+            unread = (await self._hall_post(db, "juror2", "proposal", "提案二"))["id"]
+            await self._expire(db, unread)
+
+        # 真正的定时循环里也有这一项：没人读议事厅，到期的提案照样出结果
+        async def stop(_seconds: float) -> None:
+            raise asyncio.CancelledError
+
+        with patch.object(case_service, "AsyncSessionLocal", self.sessions), patch.object(case_service.asyncio, "sleep", stop):
+            with self.assertRaises(asyncio.CancelledError):
+                await case_service._jury_sweep_worker()
+        async with self.sessions() as db:
+            row = await db.get(JuryHallPost, unread)
+            self.assertEqual(row.status, "rejected")
+            self.assertIsNotNone(row.settled_at)
+
+    async def test_overturning_a_case_withdraws_its_precedent_in_the_same_transaction(self) -> None:
+        async with self.sessions() as db:
+            case_id = await self._jury_case(db, "insult")
+            await self._settle(db, case_id)
+            created = await self._mark(db, "juror1", case_id)
+            self.assertTrue((await db.get(ReportCase, case_id)).is_golden)
+            await case_service.overturn_case(db, case_id, actor_id=self.ids["admin"], upheld=False, note="结合上下文是玩笑")
+        # 换一个会话直接看库里：没有经过任何会惰性撤下判例的读接口
+        async with self.sessions() as db:
+            row = await db.get(JuryPrecedent, created["id"])
+            self.assertEqual((row.status, row.withdrawn_by_id, row.withdraw_note, row.bank_added), ("withdrawn", None, "案件被改判，判例自动撤下", False))
+            self.assertIsNotNone(row.withdrawn_at)
+            case = await db.get(ReportCase, case_id)
+            # 因为成了判例才进题库的那道题一并移出
+            self.assertEqual((case.is_golden, case.golden_source), (False, "excluded"))
+            self.assertEqual(await precedent_service.sync_overturned(db), 0)
+            log = (await db.execute(select(AdminAuditLog).where(AdminAuditLog.action == "case.overturned"))).scalar_one()
+            self.assertTrue(json.loads(log.details)["precedent_withdrawn"])
+
+            # 没有判例的案件改判：钩子什么也不做
+            plain = await self._settle_case(db, THREE_FOR)
+            await case_service.overturn_case(db, plain.id, actor_id=self.ids["admin"], upheld=False, note="改判")
+            logs = (await db.execute(select(AdminAuditLog).where(AdminAuditLog.action == "case.overturned").order_by(AdminAuditLog.id))).scalars().all()
+            self.assertFalse(json.loads(logs[-1].details)["precedent_withdrawn"])
+
+
+class HallCommentModerationTests(HallTestCase):
+    async def test_admin_deletes_and_restores_comments_directly(self) -> None:
+        async with self.sessions() as db:
+            admin, juror2, juror5, juror6, bob = [await self._user(db, name) for name in ("admin", "juror2", "juror5", "juror6", "bob")]
+            post_id = (await self._hall_post(db, "juror2"))["id"]
+            first = (await self._comment(db, "juror3", post_id, "第一条评论"))["id"]
+            second = (await self._comment(db, "juror5", post_id, "第二条评论"))["id"]
+            await hall_service.create_report(db, bob, "comment", first, "人身攻击", None)
+
+            async def moderate(comment_id: int, action: str, note: str | None = None) -> AdminHallCommentRead:
+                return AdminHallCommentRead(**await hall_service.admin_moderate_comment(db, admin, comment_id, action, note))
+
+            async def shown() -> list[tuple[int, str]]:
+                return [(item["id"], item["state"]) for item in (await hall_service.list_comments(db, bob, post_id))[0]]
+
+            async def reports(comment_id: int) -> list[tuple[str, int | None]]:
+                rows = await db.execute(
+                    select(JuryHallReport.status, JuryHallReport.handled_by_id)
+                    .where(JuryHallReport.target_type == "comment", JuryHallReport.target_id == comment_id)
+                    .order_by(JuryHallReport.id)
+                )
+                return [(status, handled_by_id) for status, handled_by_id in rows.all()]
+
+            self.assertEqual(await self._code(moderate(99999, "delete")), (404, "comment_not_found"))
+            self.assertEqual(await self._code(moderate(first, "hide")), (422, "invalid_action"))
+
+            # 直接删除，不用等有人举报；这条评论上待处理的举报记成已处理
+            with self._events() as events:
+                removed = await moderate(first, "delete", " 人身攻击 ")
+            self.assertEqual(
+                (removed.id, removed.post_id, removed.state, removed.content, removed.deleted_by_id, removed.moderation_note, removed.author.username),
+                (first, post_id, "deleted", "第一条评论", admin.id, "人身攻击", "juror3"),
+            )
+            self.assertIsNotNone(removed.deleted_at)
+            self.assertEqual([data for name, _users, data in events if name == "jury.hall.changed"], [{"post_id": post_id, "kind": "discussion", "action": "updated"}])
+            self.assertEqual((await shown(), await reports(first)), ([(second, "visible")], [("handled", admin.id)]))
+            self.assertEqual((await hall_service.get_post(db, bob, post_id))["comment_count"], 1)
+            # 重复删除是幂等的：不再发事件、不再记审计
+            with self._events() as events:
+                self.assertEqual((await moderate(first, "delete", "再删一次")).moderation_note, "人身攻击")
+            self.assertEqual(events, [])
+
+            # 恢复管理员删掉的
+            with self._events() as events:
+                restored = await moderate(first, "restore", "误删")
+            self.assertEqual((restored.state, restored.deleted_at, restored.deleted_by_id, restored.moderation_note), ("visible", None, None, "误删"))
+            self.assertEqual([data["action"] for name, _users, data in events if name == "jury.hall.changed"], ["updated"])
+            self.assertEqual(await shown(), [(first, "visible"), (second, "visible")])
+            # 本来就显示着的：什么都不做
+            self.assertEqual((await moderate(first, "restore")).moderation_note, "误删")
+            # 作者自己删掉的不能恢复
+            await hall_service.delete_comment(db, juror5, second)
+            self.assertEqual(await self._code(moderate(second, "restore")), (409, "comment_not_restorable"))
+
+            # 被委员举报折叠的：恢复显示，举报记成不成立，新的举报重新从零数
+            third = (await self._comment(db, "juror3", post_id, "第三条评论"))["id"]
+            with patch.object(hall_service, "AUTO_HIDE_REPORTS", 2):
+                await hall_service.create_report(db, juror5, "comment", third, "与风纪无关", None)
+                self.assertEqual((await hall_service.create_report(db, juror6, "comment", third, "与风纪无关", None))["state"], "hidden")
+                self.assertEqual((await moderate(third, "restore")).state, "visible")
+                self.assertEqual(await reports(third), [("dismissed", admin.id), ("dismissed", admin.id)])
+                self.assertEqual((await hall_service.create_report(db, juror2, "comment", third, "与风纪无关", None))["state"], "visible")
+
+            self.assertEqual(await self._audit_actions(db, "jury.hall.comment."), ["jury.hall.comment.delete", "jury.hall.comment.restore", "jury.hall.comment.restore"])
+            log = (await db.execute(select(AdminAuditLog).where(AdminAuditLog.action == "jury.hall.comment.delete"))).scalar_one()
+            self.assertEqual((log.actor_id, log.target_type, log.target_id), (admin.id, "jury_hall_comment", first))
+            self.assertEqual(json.loads(log.details), {"post_id": post_id, "from": "visible", "to": "deleted", "note": "人身攻击"})
+
+
+class HttpRoundTwoHallTests(HallTestCase):
+    async def asyncSetUp(self) -> None:
+        await super().asyncSetUp()
+        self.acting = "admin"
+        api = FastAPI()
+        api.include_router(jury_api.router, prefix="/jury")
+        api.include_router(admin_api.router, prefix="/admin")
+        api.include_router(hall_api.router, prefix="/jury")
+        api.include_router(admin_hall_api.router, prefix="/admin")
+
+        async def isolated_db():
+            async with self.sessions() as session:
+                yield session
+
+        async def acting_user(db: Annotated[AsyncSession, Depends(get_db)]) -> User:
+            return await db.get(User, self.ids[self.acting])
+
+        api.dependency_overrides[get_db] = isolated_db
+        api.dependency_overrides[get_current_user] = acting_user
+        self.client = httpx.AsyncClient(transport=httpx.ASGITransport(app=api), base_url="http://testserver")
+
+    async def asyncTearDown(self) -> None:
+        await self.client.aclose()
+        await super().asyncTearDown()
+
+    async def test_the_real_router_mounts_the_new_admin_routes(self) -> None:
+        from app.api.v1.router import api_router
+
+        api = FastAPI()
+        api.include_router(api_router)
+        paths = api.openapi()["paths"]
+        self.assertEqual(set(paths["/api/v1/admin/jury/hall/comments/{comment_id}/moderate"]), {"post"})
+        self.assertEqual(set(paths["/api/v1/admin/jury/reviews/{review_id}/decide"]), {"post"})
+
+    async def test_comment_moderation_report_limit_and_settings_routes(self) -> None:
+        async with self.sessions() as db:
+            post_id = (await self._hall_post(db, "juror2"))["id"]
+            comment_id = (await self._comment(db, "juror3", post_id, "一条评论"))["id"]
+        client = self.client
+        removed = await client.post(f"/admin/jury/hall/comments/{comment_id}/moderate", json={"action": "delete", "note": "人身攻击"})
+        self.assertEqual((removed.status_code, removed.json()["id"], removed.json()["state"], removed.json()["moderation_note"]), (200, comment_id, "deleted", "人身攻击"))
+        self.assertEqual((await client.get(f"/admin/jury/hall/posts/{post_id}")).json()["comments"][0]["state"], "deleted")
+        restored = await client.post(f"/admin/jury/hall/comments/{comment_id}/moderate", json={"action": "restore"})
+        self.assertEqual((restored.status_code, restored.json()["state"], restored.json()["deleted_at"]), (200, "visible", None))
+        self.assertEqual((await client.post(f"/admin/jury/hall/comments/{comment_id}/moderate", json={"action": "hide"})).status_code, 422)
+        missing = await client.post("/admin/jury/hall/comments/99999/moderate", json={"action": "delete"})
+        self.assertEqual((missing.status_code, missing.json()["detail"]["code"]), (404, "comment_not_found"))
+
+        # 后台设置里能看到议事厅、判例和这一轮新增的配置项
+        thresholds = (await client.get("/admin/jury/settings")).json()["thresholds"]
+        self.assertEqual(
+            (thresholds["hall_reports_per_day"], thresholds["hall_auto_hide_reports"], thresholds["hall_vote_days"], thresholds["precedent_title_max"]),
+            (20, 3, 7, 60),
+        )
+        self.assertEqual((thresholds["quality_recuse_retry_days"], thresholds["quality_shift_min_hours"], thresholds["quality_shift_max_hours"]), (7, 2, 40))
+        self.assertEqual((await client.get("/jury/config")).json()["hall"]["reports_per_day"], 20)
+
+        # 举报的频率限制：429 的结构
+        self.acting = "bob"
+        with patch.object(hall_service, "REPORTS_PER_DAY", 1):
+            body = {"target_type": "post", "target_id": post_id, "reason": "与风纪无关"}
+            self.assertEqual((await client.post("/jury/hall/reports", json=body)).json(), {"target_type": "post", "target_id": post_id, "state": "visible"})
+            limited = await client.post("/jury/hall/reports", json={**body, "target_type": "comment", "target_id": comment_id})
+            self.assertEqual((limited.status_code, limited.json()["detail"]["code"]), (429, "hall_rate_limited"))
+            self.assertTrue(limited.json()["detail"]["resets_at"].endswith("Z"))

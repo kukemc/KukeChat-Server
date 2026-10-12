@@ -868,9 +868,21 @@ async def sweep_senior_queues(db: AsyncSession) -> dict[str, int]:
     return {"panel": await jury_panel.sweep(db), "reviews": await jury_reviews.sweep(db)}
 
 
+async def sweep_jury_hall(db: AsyncSession) -> dict[str, int]:
+    """定时循环里议事厅那一件事：表决到期的提案出结果（通过 / 未通过）。读帖子时也会惰性结算，这里保证没人看的时候也按时出结果。"""
+    from app.services import jury_hall
+
+    return {"proposals": await jury_hall.settle_due_proposals(db)}
+
+
 async def _jury_sweep_worker() -> None:
     while True:
-        for name, job in (("queue sweep", sweep_jury_queue), ("housekeeping", sweep_jury_housekeeping), ("senior sweep", sweep_senior_queues)):
+        for name, job in (
+            ("queue sweep", sweep_jury_queue),
+            ("housekeeping", sweep_jury_housekeeping),
+            ("senior sweep", sweep_senior_queues),
+            ("hall sweep", sweep_jury_hall),
+        ):
             try:
                 async with AsyncSessionLocal() as db:
                     await job(db)
@@ -984,12 +996,15 @@ async def _apply_overturn(
     case.overturned_by_id = actor_id
     case.overturn_note = text
     case.updated_at = now
+    # 这三个模块都在模块级导入了 cases，只能在函数里导入
     from app.services import jury as jury_service
-    from app.services import jury_reviews
+    from app.services import jury_precedents, jury_reviews
 
     await jury_service.resettle_votes(db, case, upheld)
     # 这个案件有还没出结果的举报人复议时，改判就是它的结果
     await jury_reviews.on_case_overturned(db, case, upheld=upheld)
+    # 被改判的案件不能再当判例：撤下（因它才进题库的题一并移出）
+    info["precedent_withdrawn"] = await jury_precedents.on_case_overturned(db, case)
     db.add(
         AdminAuditLog(
             actor_id=actor_id,
@@ -1003,6 +1018,7 @@ async def _apply_overturn(
                     "content_restored": info["content_restored"],
                     "revoked_violation_ids": [violation.id for violation in info["revoked"]],
                     "violation_id": info["violation_id"],
+                    "precedent_withdrawn": info["precedent_withdrawn"],
                     "note": text,
                     "source": source,
                 },
