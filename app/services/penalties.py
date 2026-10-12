@@ -384,6 +384,10 @@ def violation_payload(violation: UserViolation) -> dict[str, Any]:
         "under_review": violation.review_status == "pending",
         "appeal_status": violation.appeal_status,
         "can_appeal": violation.status == "active" and violation.appeal_status == "none",
+        # 申诉现在在谁手里（senior 资深复审中 / admin 等管理员），只在待处理时有值；结果和结果是谁给的
+        "appeal_stage": (violation.appeal_stage or "admin") if violation.appeal_status == "pending" else None,
+        "appeal_result": violation.appeal_result,
+        "appeal_decided_by": violation.appeal_decided_by,
         "created_at": created_at.isoformat() if created_at else None,
         "expires_at": expires_at.isoformat() if expires_at else None,
     }
@@ -438,6 +442,8 @@ def describe_violation(violation: UserViolation) -> tuple[str, str]:
         parts.append("申诉处理中。")
     elif violation.appeal_status == "rejected":
         parts.append("申诉未通过。")
+    elif violation.appeal_result == "reduced":
+        parts.append("申诉后处罚已减轻：禁言 / 封禁已解除，违规记录保留。")
     return title, "".join(parts)
 
 
@@ -591,6 +597,11 @@ async def revoke_violation(
             details=_audit_json({"violation_id": violation.id, "reason": violation.revoke_reason}),
         )
     )
+    if violation.appeal_status == "pending":
+        # 申诉还没有结果（可能正在资深复审里）：处罚都没了，复审到此为止。
+        from app.services import jury_reviews
+
+        await jury_reviews.on_violation_revoked(db, violation, now)
     if sync_case and violation.case_id is not None:
         # 依赖方向是 cases -> penalties，这里只能在函数里引。
         from app.services import cases as case_service
@@ -700,34 +711,109 @@ async def submit_appeal(db: AsyncSession, user_id: int, violation_id: int, text:
     content = text.strip()
     if len(content) < 5:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="请写明申诉理由（至少 5 个字）")
+    now = datetime.now(UTC)
     violation.appeal_status = "pending"
     violation.appeal_text = content[:2000]
-    violation.appealed_at = datetime.now(UTC)
+    violation.appealed_at = now
+    # 默认到管理员（和三期之前一样）；开关 appeals 打开且条件都满足时先进资深复审，见 jury_reviews.appeal_block_reason。
+    violation.appeal_stage = "admin"
+    violation.appeal_result = None
+    violation.appeal_decided_by = None
+    from app.services import jury_reviews
+
+    try:
+        review = await jury_reviews.open_appeal_review(db, violation, now)
+    except Exception:
+        # 资深复审这一步出任何问题都不能让申诉交不上去：照旧到管理员。
+        logger.exception("Failed to route appeal to senior review", extra={"violation_id": violation.id})
+        violation.appeal_stage = "admin"
+        review = None
     await db.commit()
+    if review is not None:
+        from app.services import cases as case_service
+
+        await case_service.notify_jury_queue_changed(db)
     return violation
 
 
+async def _restore_penalty(db: AsyncSession, violation: UserViolation, before: dict[str, Any] | None, now: datetime) -> None:
+    """管理员推翻了资深复审的「减轻」：把这条处罚的禁言 / 封禁恢复成原来的样子。原本就已经到期的只改回记录。"""
+    if before is None or before["kind"] not in {"mute", "ban"}:
+        return
+    kind, ends_at, permanent = before["kind"], aware(before["ends_at"]), bool(before["permanent"])
+    violation.penalty_kind = kind
+    violation.penalty_ends_at = ends_at
+    violation.penalty_permanent = permanent
+    user = await db.get(User, violation.user_id)
+    if user is None or (not permanent and (ends_at is None or ends_at <= now)):
+        return
+    reason = _penalty_reason(violation.category, violation.level, violation.points_total_after, violation.summary)
+    if kind == "mute":
+        current = aware(user.muted_until)
+        user.muted_until = max(current, ends_at) if current is not None else ends_at
+        user.mute_reason = reason
+        return
+    if user.status == UserStatus.DISABLED:
+        # 期间又被别的处罚封了：不缩短已有的封禁
+        current = aware(user.banned_until)
+        if current is None:
+            permanent = True
+        elif not permanent and current > ends_at:
+            ends_at = current
+    user.status = UserStatus.DISABLED
+    user.banned_until = None if permanent else ends_at
+    user.banned_at = now
+    user.ban_reason = reason
+    await db.execute(update(AuthSession).where(AuthSession.user_id == user.id, AuthSession.revoked_at.is_(None)).values(revoked_at=now))
+
+
 async def review_appeal(db: AsyncSession, violation_id: int, *, reviewer_id: int, accept: bool, note: str | None) -> UserViolation:
+    """管理员处理申诉。待处理的申诉（无论在资深复审里还是已经到管理员），以及资深复审已经给了结果的，都可以处理：
+    管理员的结论覆盖复审的结果，进行中的复审就此关闭。"""
     violation = await _get_violation(db, violation_id)
-    if violation.appeal_status != "pending":
+    overriding = violation.appeal_status != "pending" and violation.appeal_decided_by == "senior"
+    if violation.appeal_status != "pending" and not overriding:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No pending appeal for this violation")
+    if overriding and not accept and violation.status != "active":
+        # 复审已经把处罚撤销了（案件也跟着改判了）：没法原样恢复，要重新处罚得另记一条或改判案件。
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "appeal_already_revoked", "message": "资深复审已经撤销了这条处罚，不能再驳回申诉；需要的话请重新记一条处罚或改判案件"},
+        )
     now = datetime.now(UTC)
+    from app.services import jury_reviews
+
+    review = await jury_reviews.on_admin_appeal_decision(db, violation, accept=accept, now=now)
+    previous = violation.appeal_result if overriding else None
     violation.appeal_status = "accepted" if accept else "rejected"
     violation.appeal_reviewer_id = reviewer_id
     violation.appeal_note = note.strip()[:1000] if note else None
     violation.appeal_reviewed_at = now
+    violation.appeal_stage = None
+    violation.appeal_result = "revoked" if accept else "upheld"
+    violation.appeal_decided_by = "admin"
     if accept and violation.status == "active":
         await revoke_violation(db, violation.id, actor_id=reviewer_id, reason=f"申诉通过：{violation.appeal_note or ''}".rstrip("："))
+    elif not accept and previous == "reduced" and review is not None:
+        await _restore_penalty(db, violation, jury_reviews._parse_penalty_before(review.penalty_before), now)
+    details: dict[str, Any] = {"violation_id": violation.id, "accepted": accept, "note": violation.appeal_note}
+    if review is not None:
+        # 有过资深复审：记下管理员覆盖的是什么（进行中的为 null）
+        details["senior_review"] = {"review_id": review.id, "result": previous}
     db.add(
         AdminAuditLog(
             actor_id=reviewer_id,
             action="violation.appeal.reviewed",
             target_type="user",
             target_id=violation.user_id,
-            details=_audit_json({"violation_id": violation.id, "accepted": accept, "note": violation.appeal_note}),
+            details=_audit_json(details),
         )
     )
     await db.commit()
+    if review is not None:
+        from app.services import cases as case_service
+
+        await case_service.notify_jury_queue_changed(db)
     return violation
 
 

@@ -3,6 +3,7 @@
 同一个目标的举报合并成一个案件，只审一次，结论回写给案件里的每一条举报。
 案件有三个去处：机器预审能直接下结论的当场结案；群聊消息和公开内容交给风纪委员；
 其余（私聊、举报用户、举报会话，以及风纪委员没有共识的）留给管理员。
+委员没能定案的先尝试资深合议（queue = panel），凑不齐人或合议超时再转管理员。
 """
 
 from __future__ import annotations
@@ -56,6 +57,11 @@ HIDDEN_CONTENT_CATEGORIES = {"privacy", "sexual", "minor_sexual", "vulgar", "sug
 # 结论来自这些来源、且有委员真实投过票的案件才可能进公示栏（机器自动结案的不进）。
 PUBLISHABLE_SOURCES = {"jury", "panel", "admin"}
 QUEUE_EVENT_INTERVAL_SECONDS = 30.0
+# 一条消息 / 动态被认定不违规后这么多天内不能再举报（docs/jury-v2.md 3.7）
+CLEARED_BLOCK_DAYS = settings.jury_cleared_block_days
+# 能算「认定不违规」的结论来源；机器来源的案件「未作处理」（auto）不算
+CLEARED_SOURCES = ("jury", "panel", "admin")
+MACHINE_REASON_PREFIX = "机器筛查"
 # 按案件批量查东西时一批多少个：一条查询里的绑定参数要留在老版本 SQLite 的 999 个以内
 LOOKUP_BATCH = 200
 
@@ -65,6 +71,26 @@ _jury_sweep_task: asyncio.Task[None] | None = None
 
 def reason_category(reason: str | None) -> str:
     return REPORT_REASONS.get(reason or "", ("other", 0.8))[0]
+
+
+def is_unattended(case: ReportCase) -> bool:
+    """机器来源、至今没有人举报的案件：没有举报人在等结果。"""
+    return case.case_origin == "machine" and not case.report_count
+
+
+def default_category(case: ReportCase) -> str:
+    """定案时没人指定类别的默认值：按举报理由映射；没有举报的机器案件用机器给的类别。"""
+    if is_unattended(case) and case.machine_category in penalty_service.CATEGORIES:
+        return case.machine_category
+    return reason_category(case.primary_reason)
+
+
+def machine_reasons(case: ReportCase) -> list[dict[str, Any]]:
+    """没有举报的机器案件给委员 / 公示栏看的「举报理由」：一项「机器筛查 · 类别」。有举报的案件返回空列表。"""
+    if not is_unattended(case):
+        return []
+    label = penalty_service.category_label(case.machine_category) if case.machine_category else None
+    return [{"reason": f"{MACHINE_REASON_PREFIX} · {label}" if label else MACHINE_REASON_PREFIX, "count": 1}]
 
 
 def validate_report_payload(target_type: ReportTargetType, reason: str, details: str | None, attachments: list[str], evidence_message_ids: list[int]) -> None:
@@ -249,11 +275,70 @@ def _leave_jury_queue(case: ReportCase, now: datetime, outcome: str | None) -> N
 
 
 async def escalate_from_jury(db: AsyncSession, case: ReportCase, now: datetime, outcome: str) -> None:
-    """委员没能定案（no_consensus / need_context / timeout）时把案件转出去。调用方负责 commit 和通知。
+    """委员没能定案（no_consensus / need_context / timeout）时把案件转出去。调用方负责 commit，之后调 notify_escalated。
 
-    「转到哪里」只在这一处决定：现在一律转管理员；三期会改成先尝试资深合议，凑不齐人再转管理员。
+    「转到哪里」只在这一处决定：此刻凑得齐合议庭的进资深合议；凑不齐的转管理员（和三期之前一样）。
+    机器来源、没有举报人的案件不转管理员，凑不齐人就以「未作处理」结案。
     """
+    from app.services import jury_panel
+
     _leave_jury_queue(case, now, outcome)
+    try:
+        convene = await jury_panel.can_convene(db, case, now)
+    except Exception:
+        # 查不出能不能凑齐人时按凑不齐处理：案件不能因为合议这一步卡在委员队列里
+        logger.exception("Failed to check panel availability", extra={"case_id": case.id})
+        convene = False
+    if convene:
+        case.queue = "panel"
+        case.panel_at = now
+        case.panel_outcome = None
+        return
+    case.panel_outcome = "unavailable"
+    if is_unattended(case):
+        await _close_unhandled(db, case)
+
+
+async def leave_panel(db: AsyncSession, case: ReportCase, now: datetime, outcome: str | None) -> None:
+    """合议没能定案时把案件转出去。outcome 取 timeout / unavailable / manual；因敏感类别被撤出来的传 None。
+
+    调用方负责 commit，之后调 notify_escalated。去向和 escalate_from_jury 凑不齐人时一样。
+    """
+    case.queue = "admin"
+    case.panel_outcome = outcome
+    case.updated_at = now
+    if is_unattended(case):
+        await _close_unhandled(db, case)
+
+
+async def _close_unhandled(db: AsyncSession, case: ReportCase) -> None:
+    """机器来源、没有举报人的案件没人能定案：以「未作处理」结案。
+
+    不是「认定不违规」：不记处罚、不进公示栏、不算委员的一致率，之后有人举报同一条内容照常受理。
+    """
+    await _close(
+        db,
+        case,
+        upheld=False,
+        source="auto",
+        actor_id=None,
+        category=None,
+        level=None,
+        note="机器筛查的内容，委员没有形成结论，未作处理",
+        violation_id=None,
+        action="none",
+    )
+
+
+async def notify_escalated(db: AsyncSession, case: ReportCase) -> None:
+    """escalate_from_jury / leave_panel 提交之后调用：通知后台，让委员重拉角标。"""
+    if case.status != "open":
+        # 没人能定案的机器案件已经结了：投过票的委员刷新一下详情
+        await _broadcast_admin(case, "closed")
+        await notify_jurors_settled(db, case)
+    else:
+        await _broadcast_admin(case, "escalated")
+    await notify_jury_queue_changed(db)
 
 
 async def route_case(db: AsyncSession, case: ReportCase, now: datetime) -> None:
@@ -324,6 +409,10 @@ async def attach_report(db: AsyncSession, report: UserReport, *, weight: float) 
         if case.queue == "jury":
             # 已经在委员队列里的也要撤出来。事务提交后由调用方发 jury.queue.changed。
             _leave_jury_queue(case, now, None)
+            setattr(case, "_left_jury_queue", True)
+        elif case.queue == "panel":
+            # 合议中的同理（案件此时已经有举报，不会走到「未作处理」）
+            await leave_panel(db, case, now, None)
             setattr(case, "_left_jury_queue", True)
     return case, created
 
@@ -444,6 +533,9 @@ async def _close(
         case.jury_outcome = "consensus" if source == "jury" else "manual"
         if source != "jury":
             case.escalated_at = now
+    if case.queue == "panel" and case.panel_outcome is None:
+        # 在合议里结的案：合议自己定的是 consensus，管理员直接接手的算 manual。
+        case.panel_outcome = "consensus" if source == "panel" else "manual"
     if source in PUBLISHABLE_SOURCES:
         voted = await db.execute(
             select(JuryVote.id).where(JuryVote.case_id == case.id, JuryVote.voted_at.is_not(None), JuryVote.is_quality_check.is_(False)).limit(1)
@@ -513,7 +605,8 @@ def _parse_snapshot(text: str | None) -> dict[str, Any]:
 
 async def case_snapshot(db: AsyncSession, case: ReportCase) -> dict[str, Any]:
     if case.first_report_id is None:
-        return {}
+        # 机器来源的案件没有首条举报，建案时把快照存在了案件自己身上
+        return _parse_snapshot(case.snapshot)
     report = await db.get(UserReport, case.first_report_id)
     return _parse_snapshot(report.target_snapshot) if report is not None else {}
 
@@ -521,7 +614,7 @@ async def case_snapshot(db: AsyncSession, case: ReportCase) -> dict[str, Any]:
 async def case_snapshots(db: AsyncSession, cases: list[ReportCase]) -> dict[int, dict[str, Any]]:
     """case_snapshot 的批量版：案件 id -> 快照，没有快照的给空字典。"""
     by_report = {case.first_report_id: case.id for case in cases if case.first_report_id is not None}
-    snapshots: dict[int, dict[str, Any]] = {case.id: {} for case in cases}
+    snapshots: dict[int, dict[str, Any]] = {case.id: {} if case.first_report_id is not None else _parse_snapshot(case.snapshot) for case in cases}
     report_ids = list(by_report)
     for start in range(0, len(report_ids), LOOKUP_BATCH):
         rows = await db.execute(
@@ -545,7 +638,7 @@ async def _punish(
     note: str | None,
 ) -> tuple[str, int, int | None, str, dict[str, Any] | None]:
     """认定违规时的落地动作：处理内容、记处罚。返回 (类别, 等级, 违规记录 id, 动作名, 之后要广播的信息)。"""
-    category = category or reason_category(case.primary_reason)
+    category = category or default_category(case)
     if category not in penalty_service.CATEGORIES:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Unknown violation category")
     if level is None:
@@ -564,7 +657,8 @@ async def _punish(
             user_id=case.reported_user_id,
             category=category,
             level=level,
-            source="jury" if source == "jury" else "report",
+            # 资深合议和委员是同一档：同样受 7 天封禁上限约束
+            source="jury" if source in {"jury", "panel"} else "report",
             target_type=target_type,
             target_id=(case.message_id if case.target_type == "message" else case.target_id) if target_type else None,
             conversation_id=case.conversation_id,
@@ -598,7 +692,7 @@ async def resolve_case(
     note: str | None = None,
     malicious_reporter_ids: set[int] | None = None,
 ) -> ReportCase:
-    """给案件下结论。source 取 jury / admin。提交事务并推送通知。"""
+    """给案件下结论。source 取 jury / panel / admin。提交事务并推送通知。"""
     case = await db.get(ReportCase, case_id)
     if case is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Case not found")
@@ -686,6 +780,7 @@ async def move_case(db: AsyncSession, case_id: int, queue: str, *, actor_id: int
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="该案件涉及私聊或账号本身，不能交给风纪委员")
     now = datetime.now(UTC)
     was_jury = case.queue == "jury"
+    was_panel = case.queue == "panel"
     if queue == "jury":
         if await is_sensitive(db, case):
             case.jury_block_reason = "sensitive"
@@ -701,15 +796,18 @@ async def move_case(db: AsyncSession, case_id: int, queue: str, *, actor_id: int
     else:
         case.queue = queue
         case.updated_at = now
+    if was_panel and case.queue != "panel":
+        # 管理员把合议中的案件挪走，合议到此为止
+        case.panel_outcome = "manual"
     await db.commit()
     await _broadcast_admin(case, "queued")
-    if was_jury != (case.queue == "jury"):
+    if was_panel or was_jury != (case.queue == "jury"):
         await notify_jury_queue_changed(db)
     return case
 
 
 async def escalate_stale_jury_cases(db: AsyncSession) -> int:
-    """风纪委员人手不够或都要回避时，案件不能一直挂着：超时未决的交回管理员。
+    """风纪委员人手不够或都要回避时，案件不能一直挂着：超时未决的转出去（资深合议或管理员，见 escalate_from_jury）。
 
     从进入委员队列算起，不被后续举报重置；上线前就在队列里的案件没有 queued_at，退回按 updated_at 算。
     """
@@ -726,8 +824,7 @@ async def escalate_stale_jury_cases(db: AsyncSession) -> int:
     if cases:
         await db.commit()
         for case in cases:
-            await _broadcast_admin(case, "escalated")
-        await notify_jury_queue_changed(db)
+            await notify_escalated(db, case)
     return len(cases)
 
 
@@ -764,9 +861,16 @@ async def sweep_jury_housekeeping(db: AsyncSession) -> dict[str, int]:
     return {"terms": await jury_service.renew_expired_terms(db), "questions": await jury_bank.auto_include(db)}
 
 
+async def sweep_senior_queues(db: AsyncSession) -> dict[str, int]:
+    """定时循环里资深委员那两条队列：合议超时 / 凑不齐人的转出去，申诉复审和复议超时的转管理员。"""
+    from app.services import jury_panel, jury_reviews
+
+    return {"panel": await jury_panel.sweep(db), "reviews": await jury_reviews.sweep(db)}
+
+
 async def _jury_sweep_worker() -> None:
     while True:
-        for name, job in (("queue sweep", sweep_jury_queue), ("housekeeping", sweep_jury_housekeeping)):
+        for name, job in (("queue sweep", sweep_jury_queue), ("housekeeping", sweep_jury_housekeeping), ("senior sweep", sweep_senior_queues)):
             try:
                 async with AsyncSessionLocal() as db:
                     await job(db)
@@ -837,8 +941,12 @@ async def _apply_overturn(
     category: str | None,
     level: int | None,
     note: str | None,
+    source: str = "admin",
 ) -> dict[str, Any]:
-    """改判的落库部分，不提交事务。返回事务提交之后要用的信息。"""
+    """改判的落库部分，不提交事务。返回事务提交之后要用的信息。
+
+    source 是谁改判的：admin，或 panel（举报人复议由资深委员改判，补记的处罚同样受 7 天上限约束）。
+    """
     now = datetime.now(UTC)
     text = note.strip()[:2000] if note else None
     reports = await case_reports(db, case.id)
@@ -846,7 +954,7 @@ async def _apply_overturn(
     before = {"status": case.status, "category": case.verdict_category, "level": case.verdict_level}
     if upheld:
         category, level, violation_id, action, info["broadcast"] = await _punish(
-            db, case, source="admin", actor_id=actor_id, category=category, level=level, delete_content=True, override=None, note=text
+            db, case, source=source, actor_id=actor_id, category=category, level=level, delete_content=True, override=None, note=text
         )
         case.status = "resolved"
         case.verdict_category = category
@@ -877,8 +985,11 @@ async def _apply_overturn(
     case.overturn_note = text
     case.updated_at = now
     from app.services import jury as jury_service
+    from app.services import jury_reviews
 
     await jury_service.resettle_votes(db, case, upheld)
+    # 这个案件有还没出结果的举报人复议时，改判就是它的结果
+    await jury_reviews.on_case_overturned(db, case, upheld=upheld)
     db.add(
         AdminAuditLog(
             actor_id=actor_id,
@@ -893,6 +1004,7 @@ async def _apply_overturn(
                     "revoked_violation_ids": [violation.id for violation in info["revoked"]],
                     "violation_id": info["violation_id"],
                     "note": text,
+                    "source": source,
                 },
                 ensure_ascii=False,
             ),
@@ -905,11 +1017,12 @@ async def overturn_case(
     db: AsyncSession,
     case_id: int,
     *,
-    actor_id: int,
+    actor_id: int | None,
     upheld: bool,
     category: str | None = None,
     level: int | None = None,
     note: str | None,
+    source: str = "admin",
 ) -> dict[str, Any]:
     """改判一个已结案件。返回 {"case", "content_restored", "violation_id", "revoked_violation_ids"}。
 
@@ -923,7 +1036,7 @@ async def overturn_case(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail={"code": "case_not_closed", "message": "案件还没有结论，不能改判"})
     if upheld == (case.status == "resolved"):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail={"code": "verdict_unchanged", "message": "改判结果和现有结论相同"})
-    info = await _apply_overturn(db, case, actor_id=actor_id, upheld=upheld, category=category, level=level, note=note)
+    info = await _apply_overturn(db, case, actor_id=actor_id, upheld=upheld, category=category, level=level, note=note, source=source)
     await db.commit()
     await penalty_service.flush_notifications(db)
     for violation in info["revoked"]:
@@ -1049,7 +1162,7 @@ async def notify_case_closed(db: AsyncSession, case: ReportCase) -> None:
     await _broadcast_admin(case, "closed")
     await notify_jurors_settled(db, case)
     await _flush_jury_events(db)
-    if case.queue == "jury":
+    if case.queue in {"jury", "panel"}:
         await notify_jury_queue_changed(db)
 
 
@@ -1143,6 +1256,27 @@ async def list_cases(
     return list(result.scalars().all()), total, counts
 
 
+async def recently_cleared_case(db: AsyncSession, key: str, now: datetime | None = None) -> ReportCase | None:
+    """这个目标近期是不是已经被认定过不违规（docs/jury-v2.md 3.7）。
+
+    只认真正下过的结论：案件 dismissed、结论来自委员 / 合议 / 管理员、之后没有被改判过。
+    """
+    cutoff = (now or datetime.now(UTC)) - timedelta(days=CLEARED_BLOCK_DAYS)
+    result = await db.execute(
+        select(ReportCase)
+        .where(
+            ReportCase.target_key == key,
+            ReportCase.status == "dismissed",
+            ReportCase.verdict_source.in_(CLEARED_SOURCES),
+            ReportCase.overturned_at.is_(None),
+            ReportCase.closed_at >= cutoff,
+        )
+        .order_by(ReportCase.id.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
 async def case_reports(db: AsyncSession, case_id: int) -> list[UserReport]:
     result = await db.execute(select(UserReport).where(UserReport.case_id == case_id).order_by(UserReport.id.asc()))
     return list(result.scalars().all())
@@ -1154,6 +1288,9 @@ async def build_case_reads(db: AsyncSession, cases: list[ReportCase]) -> list[di
     if user_ids:
         users = {user.id: user for user in (await db.execute(select(User).where(User.id.in_(user_ids)))).scalars().all()}
     published = await published_case_ids(db, [case.id for case in cases if case.publishable])
+    from app.services import jury_reviews
+
+    reconsiders = await jury_reviews.reconsider_statuses(db, [case.id for case in cases])
     items: list[dict[str, Any]] = []
     for case in cases:
         snapshot = await case_snapshot(db, case)
@@ -1195,6 +1332,11 @@ async def build_case_reads(db: AsyncSession, cases: list[ReportCase]) -> list[di
                 "published_at": closed_at + timedelta(hours=PUBLISH_DELAY_HOURS) if case.id in published and closed_at else None,
                 "overturned_at": penalty_service.aware(case.overturned_at),
                 "overturn_note": case.overturn_note,
+                # —— 三期 ——
+                "case_origin": case.case_origin or "report",
+                "panel_at": penalty_service.aware(case.panel_at),
+                "panel_outcome": case.panel_outcome,
+                "reconsider_status": reconsiders.get(case.id, "none"),
             }
         )
     return items

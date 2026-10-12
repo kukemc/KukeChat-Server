@@ -1862,7 +1862,8 @@ class ConfigTests(Phase2TestCase):
         async with self.sessions() as db:
             raw = await overview_service.config(db)
             config = JuryConfig(**raw)
-            self.assertEqual(config.capabilities, [
+            # 一期、二期的能力排在最前面、顺序不变；三期追加的在 test_jury_v2_phase3.py 里查
+            self.assertEqual(config.capabilities[:13], [
                 "overview", "case_detail", "opinions", "votes", "public_cases",
                 "exam", "practice", "votes_v2", "points", "tiers", "achievements", "leaderboard", "badge",
             ])
@@ -1871,10 +1872,11 @@ class ConfigTests(Phase2TestCase):
             self.assertEqual((categories["harassment"].label, categories["harassment"].default_level, categories["fraud"].default_level), ("辱骂骚扰", 2, 3))
             self.assertEqual(set(categories) & {"sexual", "minor_sexual", "vulgar", "suggestive", "unverified_media", "admin_action"}, set())
             self.assertIn("privacy", categories)
-            self.assertEqual(raw["points"], {
+            # 三期多了三个键（panel_agreed / panel_disagreed / review_vote），原有的不变
+            self.assertLessEqual({
                 "vote_agreed": 10, "vote_disagreed": 3, "quality_correct": 5, "quality_wrong": -5,
                 "daily_first": 2, "streak_7": 10, "opinion_liked": 5, "exam_passed": 20, "overturn_adjust": 7,
-            })
+            }.items(), raw["points"].items())
             self.assertEqual(raw["tiers"], [
                 {"key": "trainee", "label": "见习委员", "requirements": None, "demote_below": None},
                 {"key": "regular", "label": "正式委员",

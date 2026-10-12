@@ -9,6 +9,8 @@ from app.models.case import (
     JuryOpinionReport,
     JuryPointLog,
     JuryPracticeAnswer,
+    JuryReview,
+    JuryReviewVote,
     JuryVote,
     ReportCase,
 )
@@ -79,6 +81,8 @@ __all__ = [
     "JuryExamAttempt",
     "JuryPracticeAnswer",
     "JuryNotification",
+    "JuryReview",
+    "JuryReviewVote",
     "FavoriteSticker",
     "StickerAsset",
     "SystemSetting",

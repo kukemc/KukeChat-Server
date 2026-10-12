@@ -22,7 +22,9 @@ from app.services import cases as case_service
 from app.services import jury as jury_service
 from app.services import jury_exam as exam_service
 from app.services import jury_opinions as opinion_service
+from app.services import jury_panel as panel_service
 from app.services import jury_points as points_service
+from app.services import jury_reviews as review_service
 from app.services import jury_settings
 from app.services import penalties as penalty_service
 
@@ -49,6 +51,9 @@ VOTE_OPTIONS: list[dict[str, Any]] = [
     {"value": "need_context", "kind": "abstain", "label": "上下文不足", "hint": "看完全部上下文仍然无法判断，不计入表决"},
 ]
 
+# 三期里资深委员那部分的能力：资深合议、申诉复审、机器案源；举报人复议做完了才下发。
+SENIOR_CAPABILITIES = ["panel", "appeal_review", "machine_cases", *(["reconsider"] if review_service.RECONSIDER_ENABLED else [])]
+
 _overview_cache: dict[str, Any] = {"at": None, "data": None}
 
 
@@ -65,7 +70,7 @@ async def config(db: AsyncSession) -> dict[str, Any]:
     switches = await jury_settings.get_switches(db)
     return {
         "version": 2,
-        "capabilities": list(CAPABILITIES),
+        "capabilities": [*CAPABILITIES, *SENIOR_CAPABILITIES],
         "switches": {name: switches[name] for name in jury_settings.PUBLIC_SWITCHES},
         "tiers": [
             {
@@ -109,6 +114,22 @@ async def config(db: AsyncSession) -> dict[str, Any]:
             "min_recent_messages": jury_service.MIN_RECENT_MESSAGES,
             "recent_activity_days": jury_service.RECENT_ACTIVITY_DAYS,
         },
+        # —— 三期：资深合议、申诉复审、举报人复议 ——
+        "panel": {
+            "seats": panel_service.PANEL_SEATS,
+            "consensus_votes": panel_service.PANEL_CONSENSUS_VOTES,
+            "timeout_hours": panel_service.PANEL_TIMEOUT_HOURS,
+        },
+        "appeals": {
+            "seats": review_service.REVIEW_SEATS,
+            "consensus_votes": review_service.REVIEW_CONSENSUS_VOTES,
+            "timeout_hours": review_service.REVIEW_TIMEOUT_HOURS,
+        },
+        "reconsider": (
+            {"window_days": review_service.RECONSIDER_WINDOW_DAYS, "text_min": review_service.RECONSIDER_TEXT_MIN}
+            if review_service.RECONSIDER_ENABLED
+            else None
+        ),
         # —— 二期 ——
         "categories": [
             {"key": key, "label": penalty_service.category_label(key), "default_level": penalty_service.default_level(key)}
@@ -210,8 +231,10 @@ async def _community(db: AsyncSession) -> dict[str, Any]:
                 day[key] += 1
     return {
         "jurors": jurors,
-        # panel（资深合议）三期才有
-        "backlog": {"jury": await _count(db, ReportCase.status == "open", ReportCase.queue == "jury"), "panel": 0},
+        "backlog": {
+            "jury": await _count(db, ReportCase.status == "open", ReportCase.queue == "jury"),
+            "panel": await _count(db, ReportCase.status == "open", ReportCase.queue == "panel"),
+        },
         "settled": {
             "d7": await _count(db, *settled, ReportCase.closed_at >= now - timedelta(days=7)),
             "d30": await _count(db, *settled, ReportCase.closed_at >= now - timedelta(days=30)),
@@ -292,8 +315,10 @@ async def _public_items(db: AsyncSession, cases: list[ReportCase], group_content
             {
                 "case_id": case.id,
                 "kind": case.target_type,
-                "reasons": reasons[case.id],
+                # 机器来源的案件没有举报：理由是一项「机器筛查 · 类别」
+                "reasons": reasons[case.id] or case_service.machine_reasons(case),
                 "report_count": case.report_count,
+                "case_origin": case.case_origin or "report",
                 "outcome": verdict["outcome"],
                 "category": verdict["category"],
                 "category_label": verdict["category_label"],

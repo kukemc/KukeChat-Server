@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -9,6 +9,17 @@ from app.schemas.user import UserPublic
 
 TaskStatus = Literal["pending", "in_progress", "completed", "cancelled"]
 TaskPriority = Literal["low", "normal", "high", "urgent"]
+
+
+def _to_utc(value: datetime | None) -> datetime | None:
+    """带时区的时间先换算成 UTC。
+
+    SQLite 只存年月日时分秒，时区信息会被直接丢掉；不换算的话，客户端传
+    `18:00+08:00` 存下来就是 18:00，之后被当成 UTC，提醒会晚 8 小时。不带时区的按 UTC 理解，保持原样。
+    """
+    if value is None or value.tzinfo is None:
+        return value
+    return value.astimezone(timezone.utc)
 
 
 class TaskCreate(BaseModel):
@@ -37,6 +48,11 @@ class TaskCreate(BaseModel):
     @classmethod
     def normalize_description(cls, value: str) -> str:
         return value.strip()
+
+    @field_validator("start_at", "due_at", "remind_at")
+    @classmethod
+    def normalize_times(cls, value: datetime | None) -> datetime | None:
+        return _to_utc(value)
 
     @field_validator("assignee_ids", "watcher_ids")
     @classmethod
@@ -75,6 +91,11 @@ class TaskUpdate(BaseModel):
     @classmethod
     def normalize_description(cls, value: str | None) -> str | None:
         return value.strip() if value is not None else None
+
+    @field_validator("start_at", "due_at", "remind_at")
+    @classmethod
+    def normalize_times(cls, value: datetime | None) -> datetime | None:
+        return _to_utc(value)
 
     @field_validator("assignee_ids", "watcher_ids")
     @classmethod

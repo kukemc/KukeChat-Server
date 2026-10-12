@@ -157,6 +157,20 @@ async def create_report(db: AsyncSession, reporter_id: int, payload: ReportCreat
                 "detail": "A pending report already exists for this target",
             },
         )
+    if open_case is None and payload.target_type in {ReportTargetType.MESSAGE, ReportTargetType.POST}:
+        # 同一条消息 / 动态近期已经被认定过不违规：不再为它重开案件（原来可以无限重复举报，每次开一个新的）。
+        cleared = await case_service.recently_cleared_case(
+            db, case_service.target_key(payload.target_type, payload.target_id, conversation_id, message_id, reported_user_id)
+        )
+        if cleared is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "already_reviewed",
+                    "message": f"这条内容近期已经评审过，结论是不违规，{case_service.CLEARED_BLOCK_DAYS} 天内不再重复受理",
+                    "case_id": cleared.id,
+                },
+            )
 
     report = UserReport(
         reporter_id=reporter_id,
@@ -399,25 +413,25 @@ def _parse_target_snapshot(report: UserReport) -> dict:
     return snapshot if isinstance(snapshot, dict) else {}
 
 
-async def _message_report_snapshot(db: AsyncSession, message: Message, conversation: Conversation | None, reporter_id: int) -> dict:
-    membership = await db.execute(
-        select(ConversationMember).where(
-            ConversationMember.conversation_id == message.conversation_id,
-            ConversationMember.user_id == reporter_id,
+async def _message_report_snapshot(db: AsyncSession, message: Message, conversation: Conversation | None, reporter_id: int | None) -> dict:
+    """被举报的消息和它前后各 10 条上下文。上下文按举报人能看到的范围取；
+    reporter_id 为 None 是机器来源的案件（没有举报人），取会话里实际的前后文。"""
+    member = None
+    if reporter_id is not None:
+        membership = await db.execute(
+            select(ConversationMember).where(
+                ConversationMember.conversation_id == message.conversation_id,
+                ConversationMember.user_id == reporter_id,
+            )
         )
-    )
-    member = membership.scalar_one_or_none()
+        member = membership.scalar_one_or_none()
     min_message_id = member.cleared_before_message_id if member and member.cleared_before_message_id is not None else None
-    before_conditions = [
-        Message.conversation_id == message.conversation_id,
-        Message.id < message.id,
-        Message.id.not_in(select(MessageVisibility.message_id).where(MessageVisibility.user_id == reporter_id)),
-    ]
-    after_conditions = [
-        Message.conversation_id == message.conversation_id,
-        Message.id > message.id,
-        Message.id.not_in(select(MessageVisibility.message_id).where(MessageVisibility.user_id == reporter_id)),
-    ]
+    before_conditions = [Message.conversation_id == message.conversation_id, Message.id < message.id]
+    after_conditions = [Message.conversation_id == message.conversation_id, Message.id > message.id]
+    if reporter_id is not None:
+        hidden = select(MessageVisibility.message_id).where(MessageVisibility.user_id == reporter_id)
+        before_conditions.append(Message.id.not_in(hidden))
+        after_conditions.append(Message.id.not_in(hidden))
     if min_message_id is not None:
         before_conditions.append(Message.id > min_message_id)
         after_conditions.append(Message.id > min_message_id)
@@ -689,6 +703,9 @@ async def build_report_read(db: AsyncSession, report: UserReport, viewer_id: int
     result_title = result_text = None
     if report.status != ReportStatus.PENDING:
         result_title, result_text = case_service.report_result_text(report)
+    from app.services import jury_reviews
+
+    reconsider = await jury_reviews.report_fields(db, report, viewer_id)
     return ReportRead(
         id=report.id,
         reporter_id=report.reporter_id,
@@ -716,6 +733,8 @@ async def build_report_read(db: AsyncSession, report: UserReport, viewer_id: int
         reported_user=reported_user,
         target=target,
         snapshot=target_snapshot if include_snapshot and target_snapshot else None,
+        can_reconsider=reconsider["can_reconsider"],
+        reconsider_status=reconsider["reconsider_status"],
     )
 
 

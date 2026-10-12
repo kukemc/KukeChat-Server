@@ -96,6 +96,19 @@ class JuryDailyLimit(BaseModel):
     daily_limit: int
 
 
+class JurySeniorRules(BaseModel):
+    """资深合议 / 申诉复审：几个席位、几票一致即出结果、多久没结果转管理员。"""
+
+    seats: int
+    consensus_votes: int
+    timeout_hours: int
+
+
+class JuryReconsiderRules(BaseModel):
+    window_days: int
+    text_min: int
+
+
 class JuryAbstainRules(BaseModel):
     window: int
     min_votes: int
@@ -113,6 +126,10 @@ class JuryConfig(BaseModel):
     rules: JuryRules
     opinions: JuryOpinionRules
     eligibility: JuryEligibilityRules
+    # —— 三期：资深合议、申诉复审；reconsider 只在 capabilities 里有 reconsider 时才有 ——
+    panel: JurySeniorRules
+    appeals: JurySeniorRules
+    reconsider: JuryReconsiderRules | None = None
     # —— 二期 ——
     # 投违规票时可选的类别（不含色情类）
     categories: list[JuryCategoryOption]
@@ -227,6 +244,8 @@ class JuryVoteItem(BaseModel):
     voted_at: datetime | None = None
     alias: str | None = None
     stage: Literal["jury", "panel", "admin", "closed"]
+    # 这一票是哪一轮投的：jury 原审 / panel 资深合议（stage 是案件现在所处的阶段）
+    vote_stage: Literal["jury", "panel"] = "jury"
     outcome: Literal["violation", "clean"] | None = None
     verdict_source: str | None = None
     verdict_level: int | None = None
@@ -291,6 +310,8 @@ class PublicCase(BaseModel):
     overturned: bool = False
     # 详情里是否带内容
     has_content: bool = False
+    # report / machine（机器拿不准的内容，没有举报人）
+    case_origin: Literal["report", "machine"] = "report"
 
 
 class PublicCasePage(BaseModel):

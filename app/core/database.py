@@ -253,6 +253,33 @@ async def init_db() -> None:
                     text("UPDATE jury_members SET serving_since = COALESCE(reviewed_at, applied_at) WHERE serving_since IS NULL AND status = 'active'")
                 )
 
+            # 风纪三期（资深合议、申诉复审、机器案源、复议）。新表 jury_reviews / jury_review_votes 由上面的 create_all 建。
+            for table_name, column_name, column_sql in (
+                ("report_cases", "case_origin", "case_origin VARCHAR(12) NOT NULL DEFAULT 'report'"),
+                ("report_cases", "snapshot", "snapshot TEXT"),
+                ("report_cases", "panel_at", "panel_at DATETIME"),
+                ("report_cases", "panel_outcome", "panel_outcome VARCHAR(16)"),
+                ("jury_votes", "stage", "stage VARCHAR(8) NOT NULL DEFAULT 'jury'"),
+                ("user_violations", "appeal_stage", "appeal_stage VARCHAR(8)"),
+                ("user_violations", "appeal_result", "appeal_result VARCHAR(8)"),
+                ("user_violations", "appeal_decided_by", "appeal_decided_by VARCHAR(8)"),
+            ):
+                if table_name not in table_names:
+                    continue
+                columns = await conn.execute(text(f"PRAGMA table_info({table_name})"))
+                if column_name not in {row[1] for row in columns}:
+                    await conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_sql}"))
+            # 存量申诉的回填，可重复执行：上线前的申诉都是管理员处理的。
+            if "user_violations" in table_names:
+                await conn.execute(text("UPDATE user_violations SET appeal_stage = 'admin' WHERE appeal_status = 'pending' AND appeal_stage IS NULL"))
+                await conn.execute(
+                    text(
+                        "UPDATE user_violations SET appeal_decided_by = 'admin', "
+                        "appeal_result = CASE WHEN appeal_status = 'accepted' THEN 'revoked' ELSE 'upheld' END "
+                        "WHERE appeal_status IN ('accepted', 'rejected') AND appeal_decided_by IS NULL"
+                    )
+                )
+
             await conn.execute(text("UPDATE users SET presence_status = lower(presence_status) WHERE presence_status IN ('ONLINE', 'AWAY', 'BUSY', 'DND', 'CREATING', 'GAMING', 'CUSTOM')"))
             await conn.execute(text("UPDATE posts SET visibility = lower(visibility) WHERE visibility IN ('PUBLIC', 'FRIENDS', 'PRIVATE')"))
             await conn.execute(text("UPDATE posts SET moderation_status = lower(moderation_status) WHERE moderation_status IN ('PENDING', 'APPROVED', 'REJECTED')"))

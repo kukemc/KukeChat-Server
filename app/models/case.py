@@ -89,6 +89,15 @@ class ReportCase(Base):
     overturned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     overturned_by_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     overturn_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # —— 三期：资深合议与机器案源 ——
+    # 案件是怎么来的：report（有人举报）/ machine（机器拿不准的内容，没有举报人）
+    case_origin: Mapped[str] = mapped_column(String(12), default="report", server_default="report")
+    # 机器来源的案件没有举报，快照存在案件自己身上（结构和 user_reports.target_snapshot 相同）
+    snapshot: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 进入资深合议的时间：48 小时的期限从这里算起。为空表示没进过合议
+    panel_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 合议的去向：consensus（合议定案）/ timeout（超时转管理员）/ unavailable（凑不齐人，没进或中途转管理员）/ manual（管理员接手）
+    panel_outcome: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
@@ -161,6 +170,8 @@ class JuryVote(Base):
     is_quality_check: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
     # 主动回避的时间。回避不算投票（voted_at 保持为空），这一行留着是为了不再把同一个案件分给他
     recused_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 这一票是哪一轮的：jury（原审）/ panel（资深合议）。原审的计票只数 jury 轮
+    stage: Mapped[str] = mapped_column(String(8), default="jury", server_default="jury")
 
 
 class JuryOpinion(Base):
@@ -302,3 +313,61 @@ class JuryNotification(Base):
     title: Mapped[str] = mapped_column(String(120))
     body: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class JuryReview(Base):
+    """资深复审：申诉复审（appeal）和举报人复议（reconsider）共用。三位资深委员各投一票，两票相同即出结果。"""
+
+    __tablename__ = "jury_reviews"
+    __table_args__ = (Index("ix_jury_reviews_status_stage_expires", "status", "stage", "expires_at"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    # appeal（被处罚的人申诉）/ reconsider（举报人对「不违规」的结论申请复议）
+    kind: Mapped[str] = mapped_column(String(12))
+    # appeal：被申诉的那条处罚；它来自案件时 case_id 也有值。reconsider：只有 case_id
+    violation_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    case_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    # reconsider：是哪一条举报申请的
+    report_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # 申诉人 / 申请复议的举报人
+    requester_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    # 复议理由。申诉理由在处罚记录上（user_violations.appeal_text），这里不重复存
+    text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # senior（等资深委员投票）/ admin（凑不齐人或超时，已转给管理员）
+    stage: Mapped[str] = mapped_column(String(8), default="senior", server_default="senior")
+    # open / closed
+    status: Mapped[str] = mapped_column(String(8), default="open", server_default="open")
+    # appeal：uphold / reduce / revoke；reconsider：uphold / overturn。没有结果就关闭的（处罚被直接撤销等）为空
+    outcome: Mapped[str | None] = mapped_column(String(12), nullable=True)
+    # 结果是谁给的：senior / admin
+    decided_by: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    # 转给管理员的原因：timeout / unavailable
+    escalation: Mapped[str | None] = mapped_column(String(12), nullable=True)
+    escalated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 「减轻」之前这条处罚的样子（JSON：kind / ends_at / permanent），管理员推翻复审结果时用来恢复
+    penalty_before: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class JuryReviewVote(Base):
+    """一行 = 一次分配。vote 为空表示已分配但还没投。"""
+
+    __tablename__ = "jury_review_votes"
+    __table_args__ = (
+        UniqueConstraint("review_id", "juror_id", name="uq_jury_review_votes_review_juror"),
+        Index("ix_jury_review_votes_juror_voted", "juror_id", "voted_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    review_id: Mapped[int] = mapped_column(ForeignKey("jury_reviews.id", ondelete="CASCADE"), index=True)
+    juror_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    # appeal：uphold / reduce / revoke；reconsider：uphold / overturn
+    vote: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    # 复议投 overturn 时可以带的等级和类别
+    level: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    category: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    assigned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    voted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

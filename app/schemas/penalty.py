@@ -33,6 +33,12 @@ class ViolationRead(BaseModel):
     under_review: bool = False
     appeal_status: Literal["none", "pending", "accepted", "rejected"]
     can_appeal: bool = False
+    # senior 资深复审中 / admin 等管理员；没有待处理的申诉为 null
+    appeal_stage: Literal["senior", "admin"] | None = None
+    # upheld 维持 / reduced 减轻（appeal_status 为 accepted，记录保留）/ revoked 撤销；还没有结果为 null
+    appeal_result: Literal["upheld", "reduced", "revoked"] | None = None
+    # 结果是谁给的：senior / admin
+    appeal_decided_by: Literal["senior", "admin"] | None = None
     created_at: datetime
     expires_at: datetime
 

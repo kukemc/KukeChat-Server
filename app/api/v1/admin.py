@@ -66,6 +66,7 @@ from app.schemas.case import (
     JuryMemberReview,
     JuryVoteSummary,
 )
+from app.schemas.jury_senior import AdminReviewPage, AdminReviewRead
 from app.schemas.jury import (
     AdminExamPage,
     AdminExamRead,
@@ -78,6 +79,7 @@ from app.schemas.jury import (
 )
 from app.services import cases as case_service
 from app.services import jury as jury_service
+from app.services import jury_reviews as review_service
 from app.services import jury_bank as bank_service
 from app.services import jury_points as points_service
 from app.services import jury_opinions as opinion_service
@@ -406,6 +408,15 @@ async def admin_delete_post(
     return MessageResponse(detail="Post deleted")
 
 
+async def _broadcast_message_recalled(db: AsyncSession, message) -> None:
+    """告诉群里「这条消息被撤回了」。和用户自己撤回消息走同一条路（cases._broadcast_removed 也是）：
+    负载只有撤回信息、只序列化一次，只发给此刻在线的成员；不再给每个成员各组装一遍完整消息（几千人的群要二十多秒）。"""
+    from app.api.v1.conversations import online_conversation_member_ids, send_message_updates
+
+    member_ids = await online_conversation_member_ids(db, message.conversation_id)
+    await send_message_updates(db, "message.recalled", message, member_ids)
+
+
 @router.post("/messages/{message_id}/recall", response_model=MessageRead)
 async def admin_recall_message(
     message_id: int,
@@ -424,10 +435,7 @@ async def admin_recall_message(
     )
     await db.commit()
     await admin_manager.broadcast("admin.message.changed", {"message_id": message.id, "conversation_id": message.conversation_id, "action": "recalled"})
-    member_ids = await report_service.conversation_member_ids(db, message.conversation_id)
-    for user_id in member_ids:
-        item = await message_service.build_message_read(db, message, user_id)
-        await manager.send_to_user(user_id, "message.recalled", item)
+    await _broadcast_message_recalled(db, message)
     return await message_service.build_message_read(db, message, admin.id)
 
 
@@ -489,12 +497,9 @@ async def admin_review_report(
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> ReportRead:
     original = await report_service.get_report(db, report_id)
-    message_recipients: list[int] = []
     post_recipients: set[int] = set()
     if payload.status == ReportStatus.REVIEWED and (payload.delete_content or payload.action in {"recall_message", "delete_post"}):
-        if original.target_type == ReportTargetType.MESSAGE and original.conversation_id is not None:
-            message_recipients = await report_service.conversation_member_ids(db, original.conversation_id)
-        elif original.target_type == ReportTargetType.POST:
+        if original.target_type == ReportTargetType.POST:
             post = await db.get(Post, original.target_id)
             if post is not None and post.deleted_at is None:
                 post_recipients = await post_service.post_recipient_ids(db, post)
@@ -507,9 +512,7 @@ async def admin_review_report(
     await admin_manager.broadcast("admin.report.changed", {"report_id": report.id, "action": "reviewed"})
     if "recall_message" in (report.action or "") and report.message_id is not None:
         message = await message_service.get_message(db, report.message_id)
-        for user_id in message_recipients:
-            item = await message_service.build_message_read(db, message, user_id)
-            await manager.send_to_user(user_id, "message.recalled", item)
+        await _broadcast_message_recalled(db, message)
         await admin_manager.broadcast("admin.message.changed", {"message_id": message.id, "conversation_id": message.conversation_id, "action": "recalled"})
     if "delete_post" in (report.action or ""):
         await manager.send_to_users(post_recipients, "post.deleted", {"post_id": report.target_id, "actor_id": admin.id, "admin": True})
@@ -755,6 +758,11 @@ async def admin_review_appeal(
 ) -> AdminViolationRead:
     violation = await penalty_service.review_appeal(db, violation_id, reviewer_id=admin.id, accept=payload.accept, note=payload.note)
     await penalty_service.notify_violation_updated(db, violation, "appeal_accepted" if payload.accept else "appeal_rejected")
+    if not payload.accept and violation.status == "active" and violation.penalty_kind == "ban":
+        # 驳回的是资深复审「减轻」过的申诉时，原来的封禁会恢复：把人踢下线。平时这里什么都不会发生（本来就封着）。
+        user = await db.get(User, violation.user_id)
+        if user is not None and user.status.value == "disabled":
+            await manager.disconnect_user(user.id, "account.suspended", _account_suspension_data(user))
     return await _admin_violation_read(db, violation)
 
 
@@ -801,7 +809,15 @@ async def _case_detail(db: AsyncSession, case: ReportCase, admin_id: int, *, con
         reports=await report_service.build_report_reads(db, full_reports, admin_id),
         votes=[
             JuryVoteSummary(
-                review_id=vote.id, vote=vote.vote, note=vote.note, voted_at=penalty_service.aware(vote.voted_at), juror=juror, alias=vote.alias, tier=tier
+                review_id=vote.id,
+                vote=vote.vote,
+                note=vote.note,
+                voted_at=penalty_service.aware(vote.voted_at),
+                juror=juror,
+                alias=vote.alias,
+                tier=tier,
+                category=vote.category,
+                stage=vote.stage or "jury",
             )
             for vote, juror, tier in votes
         ],
@@ -815,7 +831,7 @@ async def admin_list_cases(
     _admin: Annotated[User, Depends(get_current_admin)],
     db: Annotated[AsyncSession, Depends(get_db)],
     status_filter: Literal["open", "resolved", "dismissed"] | None = Query(default="open", alias="status"),
-    queue: Literal["triage", "jury", "admin"] | None = None,
+    queue: Literal["triage", "jury", "panel", "admin"] | None = None,
     q: str | None = Query(default=None, max_length=80),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
@@ -953,6 +969,21 @@ async def admin_update_jury_settings(
     await jury_settings.update_switches(db, admin.id, payload.model_dump(exclude_none=True))
     await admin_manager.broadcast("admin.jury.settings.changed", {})
     return await _jury_settings_read(db)
+
+
+@router.get("/jury/reviews", response_model=AdminReviewPage)
+async def admin_list_jury_reviews(
+    _admin: Annotated[User, Depends(get_current_admin)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    # 留空不筛选
+    kind: Literal["appeal", "reconsider", ""] | None = None,
+    status_filter: Literal["open", "closed", ""] | None = Query(default=None, alias="status"),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> AdminReviewPage:
+    """资深复审（申诉复审、举报人复议）的监控：每件带复审委员的票（实名）和结果。"""
+    items, total = await review_service.admin_list(db, kind=kind or None, status_filter=status_filter or None, limit=limit, offset=offset)
+    return AdminReviewPage(items=[AdminReviewRead(**item) for item in items], total=total)
 
 
 @router.get("/jury/questions", response_model=AdminQuestionPage)

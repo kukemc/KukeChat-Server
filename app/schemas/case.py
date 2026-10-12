@@ -50,7 +50,8 @@ class CaseRead(BaseModel):
     reported_user_id: int | None = None
     reported_user: UserPublic | None = None
     status: Literal["open", "resolved", "dismissed"]
-    queue: Literal["triage", "jury", "admin"]
+    # panel：资深合议中（三期）
+    queue: Literal["triage", "jury", "panel", "admin"]
     jury_eligible: bool
     report_count: int
     primary_reason: str | None = None
@@ -79,12 +80,21 @@ class CaseRead(BaseModel):
     published_at: datetime | None = None
     overturned_at: datetime | None = None
     overturn_note: str | None = None
+    # —— 三期 ——
+    # report 有人举报 / machine 机器拿不准的内容（没有举报人；之后有人举报同一条内容时并进来，仍是 machine）
+    case_origin: Literal["report", "machine"] = "report"
+    # 进入资深合议的时间；没进过为 null
+    panel_at: datetime | None = None
+    # 合议的去向：consensus 合议定案 / timeout 超时转管理员 / unavailable 凑不齐人 / manual 管理员接手；合议中或没进过为 null
+    panel_outcome: str | None = None
+    # 举报人复议：none / pending / upheld / overturned
+    reconsider_status: str = "none"
 
 
 class CasePage(BaseModel):
     items: list[CaseRead] = Field(default_factory=list)
     total: int = 0
-    # 各队列里未结案件的数量：triage / jury / admin
+    # 各队列里未结案件的数量：triage / jury / panel / admin
     open_counts: dict[str, int] = Field(default_factory=dict)
 
 
@@ -97,6 +107,10 @@ class JuryVoteSummary(BaseModel):
     juror: UserPublic | None = None
     alias: str | None = None
     tier: str | None = None
+    # 违规票带的类别；没带为 null
+    category: str | None = None
+    # 这一票是哪一轮投的：jury 原审 / panel 资深合议
+    stage: str = "jury"
 
 
 class AdminJuryOpinionReport(BaseModel):
@@ -259,6 +273,11 @@ class JuryWarning(BaseModel):
     sample: int | None = None
 
 
+class JurySeniorCounts(BaseModel):
+    panel: int = 0
+    appeals: int = 0
+
+
 class JuryStatus(BaseModel):
     # none / applied / active / expired / rejected / suspended / retired
     status: str
@@ -294,6 +313,9 @@ class JuryStatus(BaseModel):
     recuse_left_today: int | None = None
     # 回避上限的下一个名额什么时候释放；最近 24 小时没回避过为 null
     recuse_resets_at: datetime | None = None
+    # —— 三期 ——
+    # 资深委员：现在能分给我的合议 / 复审件数（复审里含举报人复议）；其他人为 null
+    senior: JurySeniorCounts | None = None
 
 
 class JuryMeSettings(BaseModel):
@@ -337,6 +359,8 @@ class JuryCaseContent(BaseModel):
     # 快照里的全部上下文（前后最多各 10 条）
     messages: list[JuryCaseMessage] = Field(default_factory=list)
     post: JuryCasePost | None = None
+    # report 有人举报 / machine 机器拿不准的内容：没有举报人，report_count 为 0，reasons 是一项「机器筛查 · 类别」
+    case_origin: Literal["report", "machine"] = "report"
 
 
 class JuryCaseView(JuryCaseContent):
@@ -400,8 +424,8 @@ class JuryCaseDetail(JuryCaseContent):
     stage: Literal["jury", "panel", "admin", "closed"]
     # 已有几张有效票（不含弃权）
     votes_cast: int = 0
-    # 定案后才给：{ none, l1, l2, l3, abstain, need_context }
-    tally: dict[str, int] | None = None
+    # 定案后才给：{ none, l1, l2, l3, abstain, need_context }；进过资深合议的多一项 panel: { none, l1, l2, l3 }
+    tally: dict[str, Any] | None = None
     verdict: JuryVerdict | None = None
     is_quality_check: bool = False
     opinions_enabled: bool = True

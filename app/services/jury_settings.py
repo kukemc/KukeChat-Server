@@ -153,4 +153,15 @@ def thresholds() -> dict[str, int | float]:
         "practice_every": settings.jury_practice_every,
         "golden_consensus_votes": settings.jury_golden_consensus_votes,
         "golden_delay_hours": settings.jury_golden_delay_hours,
+        # 三期：资深合议、申诉复审、机器案源、复议
+        "panel_timeout_hours": settings.jury_panel_timeout_hours,
+        "appeal_timeout_hours": settings.jury_appeal_timeout_hours,
+        "points_panel_agreed": settings.jury_points_panel_agreed,
+        "points_panel_disagreed": settings.jury_points_panel_disagreed,
+        "points_review_vote": settings.jury_points_review_vote,
+        "machine_daily_per_juror": settings.jury_machine_daily_per_juror,
+        "machine_daily_min": settings.jury_machine_daily_min,
+        "cleared_block_days": settings.jury_cleared_block_days,
+        "reconsider_window_days": settings.jury_reconsider_window_days,
+        "reconsider_text_min": settings.jury_reconsider_text_min,
     }

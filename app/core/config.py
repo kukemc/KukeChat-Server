@@ -157,6 +157,21 @@ class Settings(BaseSettings):
     jury_practice_daily_limit: int = Field(default=20, ge=1, le=10000)
     # 已核对的题里，案件编号能被它整除的那一份只给练习场，其余的给考试和评审质控（练习场会公布答案，两边不能是同一批题）
     jury_practice_every: int = Field(default=3, ge=2, le=1000)
+    # —— 三期：资深合议、申诉复审、机器案源、复议（docs/jury-v2.md 3.1–3.3、3.7）——
+    # 合议 / 复审都是 3 个席位、两票一致即出结果（写在代码里）；这里只配多久没结果转管理员
+    jury_panel_timeout_hours: int = Field(default=48, ge=1, le=24 * 60)
+    jury_appeal_timeout_hours: int = Field(default=72, ge=1, le=24 * 60)
+    jury_points_panel_agreed: int = Field(default=15, ge=-1000, le=1000)
+    jury_points_panel_disagreed: int = Field(default=5, ge=-1000, le=1000)
+    jury_points_review_vote: int = Field(default=8, ge=-1000, le=1000)
+    # 机器拿不准的内容每天（最近 24 小时）最多进多少件 = max(下限, 在任委员数 × 系数)
+    jury_machine_daily_per_juror: float = Field(default=2, ge=0, le=1000)
+    jury_machine_daily_min: int = Field(default=5, ge=0, le=100000)
+    # 一条消息 / 动态被认定不违规后多少天内不能再举报
+    jury_cleared_block_days: int = Field(default=30, ge=0, le=3650)
+    # 举报人复议：定案后多少天内可以申请、理由至少多少个字
+    jury_reconsider_window_days: int = Field(default=7, ge=1, le=365)
+    jury_reconsider_text_min: int = Field(default=10, ge=1, le=2000)
     # 自动入库：委员全票一致且有效票不少于这么多、定案满这么久
     jury_golden_consensus_votes: int = Field(default=3, ge=3, le=15)
     jury_golden_delay_hours: int = Field(default=72, ge=0, le=24 * 365)

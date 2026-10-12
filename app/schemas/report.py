@@ -163,6 +163,15 @@ class ReportRead(BaseModel):
     reported_user: UserPublic | None = None
     target: ReportTargetContext | None = None
     snapshot: dict[str, Any] | None = None
+    # 举报人复议（docs/jury-v2.md 3.7）：现在能不能申请（我的举报、委员 / 合议认定不违规、定案后期限内、这个案件还没人申请过）
+    can_reconsider: bool = False
+    # none / pending / upheld（维持原结论）/ overturned（改判为违规）
+    reconsider_status: str = "none"
+
+
+class ReportReconsider(BaseModel):
+    # 长度在服务层校验：太短要返回 text_required，而不是通用的 422
+    text: str = Field(default="", max_length=2000)
 
 
 class ReportReview(BaseModel):

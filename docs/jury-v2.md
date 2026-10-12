@@ -73,8 +73,8 @@
   ],
   "rules": {
     "seats_per_case": 5,          // 每个案件最多 5 张有效票
-    "quick_consensus_votes": 3,   // 3 票一致即定案
-    "full_consensus_votes": 4,    // 否则 5 票里 4 票一致
+    "quick_consensus_votes": 3,   // 有效票全部一致、且不少于 3 张时定案
+    "full_consensus_votes": 4,    // 出现分歧后要收满 5 张，其中至少 4 张一致
     "timeout_hours": 72,
     "assignment_ttl_hours": 24,   // 分到手的案件 24 小时内不投会让给别人
     "daily_votes": 30,
@@ -97,9 +97,16 @@
 }
 ```
 
+**表决规则的准确说法**（界面文案请照这个写，数字从 `rules` 里取）：
+
+- 有效票（不含「拿不准」等不计入表决的票）**全部一致**，且已有 `quick_consensus_votes` 张或更多：定案。
+- 一旦出现分歧，就要收满 `seats_per_case` 张有效票：其中至少 `full_consensus_votes` 张一致则定案，否则转出（资深合议或管理员）。
+
+所以「3 比 1」不会定案，要等第 5 张票：变成 4 比 1 定案，变成 3 比 2 转出。看的是「违规 / 不违规」是否一致，等级取违规票的较低中位数；二期起，按现有票会定为严重违规（l3）时至少要 `severe_min_votes` 张有效票。
+
 ### 1.2 `GET /jury/me` 新增字段
 
-原有字段不变，新增：
+原有字段不变（其中 `stats`：只要有过成员记录就是对象，包括申请中还没当上委员的人，此时全 0；从没申请过的人为 null）。新增：
 
 | 字段 | 说明 |
 | --- | --- |
@@ -360,6 +367,8 @@
 | `jury.opinion.created` | `{ case_id, opinion_id, parent_id }` | 该案件投过票的委员（发表者除外） | |
 | `jury.opinion.changed` | `{ case_id, opinion_id, state }` | 该案件投过票的委员 | 观点被删除 / 折叠 / 恢复 |
 | `jury.status.changed` | `{}` | 本人 | 已有。资格、层级变化 |
+
+发给委员的事件里的 `case_id` 都是**接收者本人的评审编号**（同一个案件，每个委员收到的数字不同），可以直接用来失效本地缓存或跳到「我的评审」。二期的 `jury.points.changed` 同理；它的 `case_id` 在每日首票这类不对应具体案件的加分上为 null。
 
 ### 1.10 后台接口（`/admin`）
 
@@ -813,7 +822,7 @@
 | `JuryCaseDetail`（1.5） | `precedent`：`{ id, title, mine }` 或 null；`can_mark_precedent`：我现在能不能把它标为判例（资深、已定案、未改判、类别允许、还不是判例） |
 | 公示栏的案件（1.8） | `precedent_id`：数字或 null |
 
-`POST /jury/precedents`，body `{ case_id, title: "≤60 字", summary: "≤1000 字" }` → `Precedent`。资深委员可以把**自己投过票的已定案件**标为判例；管理员在后台可以标任何已定案件。`PUT /jury/precedents/{id}`、`DELETE /jury/precedents/{id}`：作者本人。
+`POST /jury/precedents`，body `{ case_id, title: "≤60 字", summary: "≤1000 字" }` → `Precedent`。这里的 `case_id` 是**评审编号**（委员侧案件详情里的那个）；返回的 `Precedent.case_id` 是公开编号。资深委员可以把**自己投过票的已定案件**标为判例；管理员在后台可以标任何已定案件。`PUT /jury/precedents/{id}`、`DELETE /jury/precedents/{id}`：作者本人。
 
 不能成为判例的：未定案、被改判、色情 / 涉未成年类、质控题本身。判例会自动进练习场的题库。
 
@@ -871,6 +880,26 @@
 错误码：403 `not_juror` / `tier_required`（见习不能发帖）/ `juror_restricted`；409 `vote_closed`；422 `invalid_post`。
 
 实时事件：`jury.hall.changed`：`{ post_id, kind, action }`（`action` ∈ `created` / `updated` / `closed`），发给在任委员。
+
+### 3.5.1 判例与议事厅实现上的细节
+
+判例：
+
+- 不能成为判例的类别是色情、涉未成年和隐私类（和公示栏不带内容的类别是同一套）。
+- `content_hidden_reason` 多一个取值 `unpublished`：案件此刻不在公示栏里（定案不足 72 小时、有待处理的申诉等）。要旨照常可读。
+- `DELETE /jury/precedents/{id}` 返回 `{ id, status }`；`PUT` 只改传进来的字段。改和撤只认作者本人。
+- 一个案件只有一条判例，撤下后重新标会复用同一个 id。案件被改判时判例自动撤下。
+
+议事厅：
+
+- `HallPost` 新增 `state`（`visible` / `hidden`）和 `content_truncated`（列表里内容被截断时为 true）。被多人举报折叠的帖子 `state: "hidden"`、`content` 为 null、`title` 是占位文字。公告不会被自动折叠。
+- 自动折叠只看**在任委员**的举报：同一目标被 `config.hall.auto_hide_reports`（3）名在任委员举报后折叠。其他用户的举报照常记录，由管理员处理。
+- `DELETE /jury/hall/posts/{id}`、`DELETE /jury/hall/comments/{id}` 返回 `{ id, state }`；`POST /jury/hall/reports` 返回 `{ target_type, target_id, state }`。`PUT` 帖子只改传进来的字段。
+- 提案还在表决时作者可以撤回（删除），出结果后不能删也不能改；被折叠的帖子不能改。
+- `author_tier` 是作者此刻的层级，不在任时为 null。排序用的「最后活动时间」只在有新评论时更新，表决和编辑不算。
+- 每天的发帖 / 评论上限按最近 24 小时滚动，429 `hall_rate_limited` 的 `detail` 里有 `resets_at`。
+- 实时事件 `jury.hall.changed` 的 `action`：发帖 `created`；评论、表决、编辑、置顶、采纳 / 不采纳、折叠 / 恢复都是 `updated`；关闭和删除是 `closed`（删除后重拉会得到 404）。
+- 其它错误码：404 `precedent_not_found` / `post_not_found` / `comment_not_found`；403 `not_precedent_author` / `not_post_author` / `not_comment_author`；409 `post_locked`（提案有人表决后修改、出结果后修改或删除、被折叠后修改）、`post_closed`（帖子已关闭或被折叠时评论）、`vote_closed`（已截止，或对非提案表决）；422 `invalid_precedent` / `invalid_comment` / `invalid_vote` / `invalid_target` / `invalid_reason`（举报理由不在列表里，或选「其他」时说明不足 5 个字）。
 
 ### 3.6 待审期间折叠：不做
 

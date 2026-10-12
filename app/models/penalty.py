@@ -82,6 +82,12 @@ class UserViolation(Base):
     appeal_reviewer_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     appeal_note: Mapped[str | None] = mapped_column(Text, nullable=True)
     appeal_reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 申诉现在在谁手里：senior（资深复审中）/ admin（等管理员）；没有待处理的申诉为空
+    appeal_stage: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    # 申诉的结果：upheld（维持）/ reduced（减轻：记录和记分保留，禁言 / 封禁解除）/ revoked（撤销）
+    appeal_result: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    # 结果是谁给的：senior / admin
+    appeal_decided_by: Mapped[str | None] = mapped_column(String(8), nullable=True)
 
     user: Mapped["User"] = relationship(foreign_keys=[user_id])
     actor: Mapped["User | None"] = relationship(foreign_keys=[actor_id])

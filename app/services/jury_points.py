@@ -36,6 +36,10 @@ POINTS: dict[str, int] = {
     "opinion_liked": settings.jury_points_opinion_liked,
     "exam_passed": settings.jury_points_exam_passed,
     "overturn_adjust": settings.jury_points_overturn_adjust,
+    # 三期：合议票与结论一致 / 不一致；每张申诉复审、复议票
+    "panel_agreed": settings.jury_points_panel_agreed,
+    "panel_disagreed": settings.jury_points_panel_disagreed,
+    "review_vote": settings.jury_points_review_vote,
 }
 POINT_LABELS: dict[str, str] = {
     "vote_agreed": "与结论一致",
@@ -48,6 +52,9 @@ POINT_LABELS: dict[str, str] = {
     "exam_passed": "通过入门考试",
     "overturn_adjust": "改判补差",
     "admin_adjust": "管理员调整",
+    "panel_agreed": "合议与结论一致",
+    "panel_disagreed": "参与合议",
+    "review_vote": "参与复审",
 }
 STREAK_REWARD_DAYS = 7
 LIKE_REWARD_THRESHOLD = settings.jury_opinion_like_reward_threshold

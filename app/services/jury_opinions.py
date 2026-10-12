@@ -112,8 +112,10 @@ async def _opinion(db: AsyncSession, user: User, opinion_id: int, *, write: bool
 # ---------------------------------------------------------------- 展示
 
 
-async def _views(db: AsyncSession, case: ReportCase, opinions: list[JuryOpinion], viewer_id: int) -> dict[int, dict[str, Any]]:
-    """把观点转成给委员看的结构（不含 replies），按 id 索引。"""
+async def _views(
+    db: AsyncSession, case: ReportCase, opinions: list[JuryOpinion], viewer_id: int, *, reveal_votes: bool = False
+) -> dict[int, dict[str, Any]]:
+    """把观点转成给委员看的结构（不含 replies），按 id 索引。reveal_votes：定案前也带上作者投的票（给资深合议 / 复审看原审用）。"""
     if not opinions:
         return {}
     opinion_ids = [item.id for item in opinions]
@@ -144,7 +146,7 @@ async def _views(db: AsyncSession, case: ReportCase, opinions: list[JuryOpinion]
         if extra:
             more = await db.execute(select(JuryVote.juror_id, JuryVote.alias, JuryVote.vote).where(JuryVote.case_id == case.id, JuryVote.juror_id.in_(extra)))
             voters.update({juror_id: (alias, vote) for juror_id, alias, vote in more.all()})
-    closed = case.status != "open"
+    closed = case.status != "open" or reveal_votes
     views: dict[int, dict[str, Any]] = {}
     for item in opinions:
         alias, vote = voters.get(item.author_id, (None, None))
@@ -189,12 +191,26 @@ async def list_public_opinions(db: AsyncSession, user: User, case: ReportCase) -
     return await _page(db, case, user.id)
 
 
-async def _page(db: AsyncSession, case: ReportCase, viewer_id: int) -> dict[str, Any]:
-    """一次返回全部，按时间正序；回复挂在所属的根观点下面，只有一层。"""
+async def origin_page(db: AsyncSession, case: ReportCase, viewer_id: int) -> dict[str, Any]:
+    """原审的观点区，给资深合议 / 复审的委员在投票前看：只读，每条都带作者投的票。
+
+    案件还在合议中时只给原审委员的发言：合议委员自己在案件下面说的话不在里面，否则先投的人的立场会被后投的人看到。
+    已经定案的案件（申诉复审、复议看的都是）没有这个问题，给全部。
+    """
+    if case.status != "open":
+        return await _page(db, case, viewer_id, reveal_votes=True)
+    authors = set((await db.execute(select(JuryVote.juror_id).where(JuryVote.case_id == case.id, JuryVote.stage == "jury"))).scalars().all())
+    return await _page(db, case, viewer_id, reveal_votes=True, authors=authors)
+
+
+async def _page(db: AsyncSession, case: ReportCase, viewer_id: int, *, reveal_votes: bool = False, authors: set[int] | None = None) -> dict[str, Any]:
+    """一次返回全部，按时间正序；回复挂在所属的根观点下面，只有一层。authors 给了就只留这些人的发言。"""
     opinions = list(
         (await db.execute(select(JuryOpinion).where(JuryOpinion.case_id == case.id).order_by(JuryOpinion.created_at.asc(), JuryOpinion.id.asc()))).scalars()
     )
-    views = await _views(db, case, opinions, viewer_id)
+    if authors is not None:
+        opinions = [item for item in opinions if item.author_id in authors]
+    views = await _views(db, case, opinions, viewer_id, reveal_votes=reveal_votes)
     roots: list[dict[str, Any]] = []
     for item in opinions:
         # 已删除的回复直接不出现

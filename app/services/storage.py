@@ -434,7 +434,11 @@ def _verified_image(content: bytes) -> tuple[str, str]:
             _check_image_pixels(image)
             image.verify()
             image_format = image.format or ""
-    except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as exc:
+    except HTTPException:
+        raise
+    except Exception as exc:
+        # Pillow 对损坏的文件会抛各种异常（OSError、SyntaxError、IndexError、struct.error……），
+        # 对用户来说都是「这不是一张能用的图片」，不能漏成 500。
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Uploaded file is not a valid image") from exc
 
     content_type = IMAGE_FORMAT_CONTENT_TYPES.get(image_format.upper())
@@ -468,7 +472,9 @@ def _process_verified_image(content: bytes, folder: str, object_id: str) -> Proc
                 content_type = JPEG_CONTENT_TYPE
         with Image.open(BytesIO(content)) as image:
             thumbnail_data = _encode_jpeg(image, settings.image_thumbnail_max_dimension, quality=min(settings.image_quality, 65))
-    except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError) as exc:
+    except HTTPException:
+        raise
+    except Exception as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Image could not be decoded") from exc
 
     thumbnail_key = thumbnail_key_for_key(key)

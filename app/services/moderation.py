@@ -22,7 +22,7 @@ from sqlalchemy.orm import joinedload
 
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
-from app.models.conversation import Conversation, ConversationMember
+from app.models.conversation import Conversation
 from app.models.enums import MessageType, ModerationAction, ModerationSource, ModerationStatus, UserStatus
 from app.models.message import Message
 from app.models.post import Post, PostComment, PostTopic
@@ -326,6 +326,7 @@ async def _moderate_message_task(
         await session.commit()
         await penalty_service.flush_notifications(session)
         await _broadcast_moderation_action(session, message, action)
+        await _offer_machine_case(session, message, records, action, source)
     except Exception as exc:
         await session.rollback()
         penalty_service.discard_notifications(session)
@@ -333,6 +334,32 @@ async def _moderate_message_task(
     finally:
         if owns_session:
             await session.close()
+
+
+async def _offer_machine_case(
+    db: AsyncSession,
+    target: Message | Post,
+    records: list[ContentModerationRecord],
+    action: ModerationAction,
+    source: ModerationSource = ModerationSource.MESSAGE_AUTO,
+) -> None:
+    """机器拿不准、又没有被处理的内容交给风纪委员评审（docs/jury-v2.md 3.3，开关 machine_review，默认关）。
+
+    这一步在审核做完之后，和审核本身无关：出任何问题只记日志，不能影响消息发送和上面已经完成的审核流程。
+    """
+    try:
+        from app.services import jury_machine
+
+        if isinstance(target, Message):
+            await jury_machine.offer_message(db, target, records, action, source)
+        else:
+            await jury_machine.offer_post(db, target, records, action)
+    except Exception:
+        logger.exception("Failed to open a machine-sourced jury case", extra={"target": type(target).__name__, "target_id": getattr(target, "id", None)})
+        try:
+            await db.rollback()
+        except Exception:
+            logger.exception("Rollback failed after machine-sourced case error")
 
 
 async def _moderate_post_task(post_id: int) -> None:
@@ -362,6 +389,7 @@ async def _moderate_post_task(post_id: int) -> None:
             await db.commit()
             await penalty_service.flush_notifications(db)
             await _broadcast_post_moderation_action(db, post, action)
+            await _offer_machine_case(db, post, records, action)
         except Exception as exc:
             await db.rollback()
             await _record_moderation_error(db, None, ModerationSource.MESSAGE_AUTO, None, exc, post_id=post_id)
@@ -1348,13 +1376,13 @@ def _violation_source(record: ContentModerationRecord) -> str:
 async def _broadcast_moderation_action(db: AsyncSession, message: Message, action: ModerationAction) -> None:
     if action == ModerationAction.NONE:
         return
-    from app.services import messages as message_service
+    # 和用户自己撤回消息走同一条路（conversations.recall_message，cases._broadcast_removed 也是）：负载只有撤回信息、
+    # 只序列化一次，只发给此刻在线的群成员，机器人和游戏模式的观众一并同步。
+    # 原来是给群里每个成员各查一遍、各序列化一遍完整消息，耗时随群人数线性增长，几千人的群要二十多秒。
+    from app.api.v1.conversations import online_conversation_member_ids, send_message_updates
 
-    members_result = await db.execute(select(ConversationMember.user_id).where(ConversationMember.conversation_id == message.conversation_id))
-    member_ids = set(members_result.scalars().all())
-    for user_id in member_ids:
-        data = await message_service.build_message_read(db, message, user_id)
-        await manager.send_to_user(user_id, "message.recalled", data)
+    member_ids = await online_conversation_member_ids(db, message.conversation_id)
+    await send_message_updates(db, "message.recalled", message, member_ids)
     await admin_manager.broadcast("admin.message.changed", {"message_id": message.id, "conversation_id": message.conversation_id, "action": action.value})
     await admin_manager.broadcast("admin.moderation.changed", {"message_id": message.id, "conversation_id": message.conversation_id, "action": action.value})
     if action in {ModerationAction.USER_BANNED, ModerationAction.PERMANENT_BAN}:

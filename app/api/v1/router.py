@@ -21,6 +21,10 @@ api_router.include_router(reports.router, prefix="/reports", tags=["reports"])
 api_router.include_router(moderation.router, prefix="/moderation", tags=["moderation"])
 api_router.include_router(jury.router, prefix="/jury", tags=["jury"])
 api_router.include_router(admin.router, prefix="/admin", tags=["admin"])
+# 风纪三期里资深委员的接口（资深合议 /jury/panel/...、申诉复审 /jury/appeals/...），和 jury.router 挂在同一个前缀下
+from app.api.v1 import jury_senior  # noqa: E402
+
+api_router.include_router(jury_senior.router, prefix="/jury", tags=["jury"])
 api_router.include_router(ccw.router, prefix="/ccw", tags=["ccw"])
 api_router.include_router(teamup.router, prefix="/teamup", tags=["teamup"])
 api_router.include_router(task.router, prefix="/tasks", tags=["tasks"])
