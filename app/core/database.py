@@ -244,6 +244,20 @@ async def init_db() -> None:
                 if column_name not in existing_columns:
                     await conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_sql}"))
 
+            # 账号等级（docs/account-level.md）。新表 account_level_days / account_level_notifications 由上面的 create_all 建；
+            # 老用户的折算不在这里做，见 services/account_levels.py 的 backfill_legacy（后台循环启动时跑一次）。
+            for table_name, column_name, column_sql in (
+                ("users", "account_level", "account_level INTEGER NOT NULL DEFAULT 0"),
+                ("users", "account_active_tenths", "account_active_tenths INTEGER NOT NULL DEFAULT 0"),
+                ("users", "account_streak_days", "account_streak_days INTEGER NOT NULL DEFAULT 0"),
+                ("users", "account_streak_day", "account_streak_day DATE"),
+            ):
+                if table_name not in table_names:
+                    continue
+                columns = await conn.execute(text(f"PRAGMA table_info({table_name})"))
+                if column_name not in {row[1] for row in columns}:
+                    await conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_sql}"))
+
             # 风纪二期的存量回填，可重复执行：上线前就在题库里的题算 legacy（未核对）；
             # 在任委员的「本次任职开始时间」用审批时间补上。
             if "report_cases" in table_names:

@@ -21,6 +21,7 @@ from app.core.database import AsyncSessionLocal, get_db, init_db
 from app.core.request_guard import ClientProofMiddleware
 from app.core.transport_metrics import TransportMetrics, TransportMetricsMiddleware
 from app.services.legacy_uploads import migrate_legacy_upload_response
+from app.services.account_levels import start_account_level_worker, stop_account_level_worker
 from app.services.cases import start_jury_sweep_worker, stop_jury_sweep_worker
 from app.services.ccw import start_ccw_binding_worker, stop_ccw_binding_worker
 from app.services.moderation import start_moderation_retry_worker, stop_moderation_retry_worker
@@ -84,11 +85,14 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
     start_moderation_retry_worker()
     start_task_reminder_worker()
     start_jury_sweep_worker()
+    # 账号等级：记在线时长、结算活跃天；老用户的折算也在这个循环启动时做一次
+    start_account_level_worker()
     if transport_metrics is not None:
         await transport_metrics.start()
     try:
         yield
     finally:
+        await stop_account_level_worker()
         await stop_jury_sweep_worker()
         await stop_task_reminder_worker()
         await stop_ccw_binding_worker()

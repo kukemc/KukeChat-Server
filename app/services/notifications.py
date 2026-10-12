@@ -386,6 +386,10 @@ async def list_unified_notifications(db: AsyncSession, user_id: int, limit: int 
     report_results = await _report_result_notifications(db, user_id)
     jury = await _jury_notifications(db, user_id)
     items = [*friends, *groups, *posts, *interactions, *systems, *penalties, *report_results, *jury]
+    # 账号等级的升级通知（docs/account-level.md 第 4 节）
+    from app.services import account_levels as account_level_service
+
+    items.extend(await account_level_service.notification_items(db, user_id))
     items.sort(key=lambda item: item.time, reverse=True)
     items = items[:limit]
     counts = {"all": len(items), "friend": 0, "group": 0, "post": 0, "interact": 0, "system": 0}

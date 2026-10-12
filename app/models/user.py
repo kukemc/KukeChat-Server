@@ -10,6 +10,10 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.core.database import Base
 from app.models.enums import ModerationStatus, PlatformRole, PresenceStatus, UserStatus
 
+# 账号等级的 account_streak_day 用到。单独成行，不去改上面那两行 import
+from datetime import date  # noqa: E402
+from sqlalchemy import Date  # noqa: E402
+
 
 def utc_now() -> datetime:
     return datetime.now(UTC)
@@ -70,6 +74,12 @@ class User(Base):
     # 别人戳我时用的动作（预设里的一个字）和接在我名字后面的文案
     poke_action: Mapped[str] = mapped_column(String(4), default="戳", server_default="戳")
     poke_suffix: Mapped[str] = mapped_column(String(32), default="", server_default="")
+    # 账号等级（docs/account-level.md）。等级和累计活跃天冗余在这里：用户对象出现在消息发送等热路径上，序列化时不能去查别的表。
+    # 累计活跃天用整数存十分之一天；连续活跃天数只在 account_streak_day 是今天或昨天时有效。由 services/account_levels.py 维护
+    account_level: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    account_active_tenths: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    account_streak_days: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    account_streak_day: Mapped[date | None] = mapped_column(Date, nullable=True)
     # 对外展示的风纪委员层级（trainee / regular / senior）。冗余自 jury_members：只有在任且本人选择公开时有值，
     # 由 jury_points.sync_badge 维护。用户对象出现在消息发送等热路径上，序列化时不能再去查 jury_members
     jury_badge: Mapped[str | None] = mapped_column(String(12), nullable=True)

@@ -50,6 +50,8 @@ class UserPublic(BaseModel):
     # 别人戳这个用户时的动作和后缀文案，见 docs/chat-features.md
     poke_action: str = "戳"
     poke_suffix: str = ""
+    # 账号等级 0–256，见 docs/account-level.md。直接读 users.account_level 这一列
+    account_level: int = 0
     # 公开展示的风纪委员层级：trainee / regular / senior；不是在任委员或本人没选择公开时为 null
     jury_badge: str | None = None
     created_at: datetime

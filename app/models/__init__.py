@@ -1,3 +1,4 @@
+from app.models.account_level import AccountLevelDay, AccountLevelNotification
 from app.models.announcement import Announcement, AnnouncementReaction
 from app.models.case import (
     JuryAchievement,
@@ -32,6 +33,8 @@ from app.models.teamup import TeamupComment, TeamupCommentLike, TeamupEvent, Tea
 from app.models.user import AuthSession, CcwBindingChallenge, User
 
 __all__ = [
+    "AccountLevelDay",
+    "AccountLevelNotification",
     "Announcement",
     "AnnouncementReaction",
     "Conversation",

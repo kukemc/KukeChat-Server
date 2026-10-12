@@ -204,6 +204,32 @@ class Settings(BaseSettings):
     jury_hall_auto_hide_reports: int = Field(default=3, ge=1, le=1000)
     # 每人最近 24 小时最多举报多少次（帖子和评论合计）
     jury_hall_reports_per_day: int = Field(default=20, ge=1, le=100000)
+    # —— 账号等级（docs/account-level.md）。客户端通过 GET /levels/rules 读这些值，不要在别处写死 ——
+    # 活跃天的数值都精确到 0.1 天（库里存的是十分之一天的整数）
+    account_level_max: int = Field(default=256, ge=1, le=256)
+    # 每天（UTC+8 自然日）最多能攒多少活跃天
+    account_level_daily_cap: float = Field(default=2.0, ge=0, le=100)
+    # 基础：当天在线满多少分钟拿多少活跃天（两档）
+    account_level_online_full_minutes: int = Field(default=120, ge=1, le=1440)
+    account_level_online_full_days: float = Field(default=1.0, ge=0, le=100)
+    account_level_online_half_minutes: int = Field(default=30, ge=1, le=1440)
+    account_level_online_half_days: float = Field(default=0.5, ge=0, le=100)
+    # 加成，都要先拿到基础才生效
+    account_level_bonus_messages_target: int = Field(default=20, ge=1, le=100000)
+    account_level_bonus_messages_days: float = Field(default=0.3, ge=0, le=100)
+    account_level_bonus_checkin_days: float = Field(default=0.1, ge=0, le=100)
+    account_level_bonus_ccw_bound_days: float = Field(default=0.1, ge=0, le=100)
+    account_level_bonus_jury_days: float = Field(default=0.2, ge=0, le=100)
+    # 连续活跃（连续拿到基础活跃天）满多少天给多少；长的那档替代短的那档。对外的 key 固定是 streak_7 / streak_30
+    account_level_streak_short_target: int = Field(default=7, ge=1, le=3650)
+    account_level_streak_short_days: float = Field(default=0.1, ge=0, le=100)
+    account_level_streak_long_target: int = Field(default=30, ge=1, le=3650)
+    account_level_streak_long_days: float = Field(default=0.3, ge=0, le=100)
+    # 在线时长多久记一次、每次记多少（时间片长度）。多个 worker 都跑这个循环，靠时间片编号去重
+    account_level_tick_seconds: int = Field(default=300, ge=60, le=3600)
+    account_level_leaderboard_cache_seconds: int = Field(default=60, ge=0, le=3600)
+    # 每升一级都发实时事件；通知中心只在升到这个数的倍数时写一条（4 = 多一个月亮）
+    account_level_notify_every: int = Field(default=4, ge=1, le=256)
     # 公告回应（docs/chat-features.md 第 5 节）。客户端通过 GET /announcements/reaction-options 读这些值，不要在别处写死。
     # 快捷回应列表在环境变量里写成 JSON 数组
     announcement_reaction_quick: list[str] = ["👍", "❤️", "😂", "😮", "😢", "🎉", "👀", "🔥"]

@@ -36,3 +36,10 @@ from app.api.v1 import admin_jury_hall, jury_hall  # noqa: E402
 
 api_router.include_router(jury_hall.router, prefix="/jury", tags=["jury"])
 api_router.include_router(admin_jury_hall.router, prefix="/admin", tags=["admin"])
+
+# 账号等级（docs/account-level.md）。/users/{user_id}/level 那一条用单独的 router 再挂到 /users 下
+from app.api.v1 import admin_levels, levels  # noqa: E402
+
+api_router.include_router(levels.router, prefix="/levels", tags=["levels"])
+api_router.include_router(levels.users_router, prefix="/users", tags=["levels"])
+api_router.include_router(admin_levels.router, prefix="/admin", tags=["admin"])
