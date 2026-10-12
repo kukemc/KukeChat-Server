@@ -800,7 +800,9 @@ async def _case_detail(db: AsyncSession, case: ReportCase, admin_id: int, *, con
         snapshot=await case_service.case_snapshot(db, case) or None,
         reports=await report_service.build_report_reads(db, full_reports, admin_id),
         votes=[
-            JuryVoteSummary(vote=vote.vote, note=vote.note, voted_at=penalty_service.aware(vote.voted_at), juror=juror, alias=vote.alias, tier=tier)
+            JuryVoteSummary(
+                review_id=vote.id, vote=vote.vote, note=vote.note, voted_at=penalty_service.aware(vote.voted_at), juror=juror, alias=vote.alias, tier=tier
+            )
             for vote, juror, tier in votes
         ],
         opinions=[AdminJuryOpinionRead(**item) for item in await opinion_service.case_opinions(db, case.id)],
@@ -905,7 +907,8 @@ async def admin_move_case(
 async def admin_list_jury_members(
     _admin: Annotated[User, Depends(get_current_admin)],
     db: Annotated[AsyncSession, Depends(get_db)],
-    status_filter: Literal["applied", "active", "rejected", "suspended", "retired"] | None = Query(default=None, alias="status"),
+    # expired：任期届满没能续任的；这些人不算在 active 里
+    status_filter: Literal["applied", "active", "expired", "rejected", "suspended", "retired"] | None = Query(default=None, alias="status"),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
 ) -> JuryMemberPage:

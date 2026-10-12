@@ -155,6 +155,8 @@ class Settings(BaseSettings):
     jury_exam_retry_hours: int = Field(default=24, ge=0, le=24 * 365)
     jury_exam_valid_days: int = Field(default=90, ge=1, le=3650)
     jury_practice_daily_limit: int = Field(default=20, ge=1, le=10000)
+    # 已核对的题里，案件编号能被它整除的那一份只给练习场，其余的给考试和评审质控（练习场会公布答案，两边不能是同一批题）
+    jury_practice_every: int = Field(default=3, ge=2, le=1000)
     # 自动入库：委员全票一致且有效票不少于这么多、定案满这么久
     jury_golden_consensus_votes: int = Field(default=3, ge=3, le=15)
     jury_golden_delay_hours: int = Field(default=72, ge=0, le=24 * 365)

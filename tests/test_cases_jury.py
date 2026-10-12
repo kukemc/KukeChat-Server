@@ -128,6 +128,13 @@ class CaseAndJuryTests(unittest.IsolatedAsyncioTestCase):
         await db.commit()
         return case
 
+    async def _rid(self, db, user: User, case_id: int) -> int:
+        """这位委员在这个案件上的评审编号：委员侧接口用的是它，不是案件编号。"""
+        return (await db.execute(select(JuryVote.id).where(JuryVote.case_id == case_id, JuryVote.juror_id == user.id))).scalar_one()
+
+    async def _real(self, db, review_id: int) -> int:
+        return (await db.execute(select(JuryVote.case_id).where(JuryVote.id == review_id))).scalar_one()
+
     async def _vote(self, db, juror: str, vote: str) -> dict:
         user = await db.get(User, self.ids[juror])
         view = await jury_service.next_case(db, user)
@@ -234,7 +241,7 @@ class CaseAndJuryTests(unittest.IsolatedAsyncioTestCase):
             member = await jury_service.get_member(db, self.ids["juror1"])
             self.assertEqual((member.votes_total, member.votes_settled, member.votes_agreed), (1, 1, 1))
             with self.assertRaises(HTTPException):
-                await jury_service.cast_vote(db, juror, case.id, "none", None)
+                await jury_service.cast_vote(db, juror, await self._rid(db, juror, case.id), "none", None)
             self.assertEqual((await jury_service.history(db, self.ids["juror1"]))[0]["outcome"], "violation")
 
     async def test_jurors_with_conflicts_never_see_the_case(self) -> None:
@@ -292,10 +299,10 @@ class CaseAndJuryTests(unittest.IsolatedAsyncioTestCase):
 
             juror = await db.get(User, self.ids["juror1"])
             view = await jury_service.next_case(db, juror)
-            self.assertEqual(view["case_id"], case.id)
+            self.assertEqual(await self._real(db, view["case_id"]), case.id)
             # 质控题里被举报的消息已经撤回，但委员仍然要能看到原文
             self.assertEqual(view["messages"][1]["content"], "你们都是废物")
-            result = await jury_service.cast_vote(db, juror, case.id, "none", None)
+            result = await jury_service.cast_vote(db, juror, await self._rid(db, juror, case.id), "none", None)
             self.assertFalse(result["settled"])
             await db.refresh(member)
             self.assertEqual((member.golden_total, member.golden_correct), (5, 2))

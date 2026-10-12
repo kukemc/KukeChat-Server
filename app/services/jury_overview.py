@@ -340,7 +340,7 @@ def _public_content(case: ReportCase, snapshot: dict[str, Any]) -> dict[str, Any
     if case.target_type == "post":
         post = snapshot.get("post") if isinstance(snapshot.get("post"), dict) else {}
         images = post.get("image_urls") if isinstance(post.get("image_urls"), list) else []
-        return {"text": post.get("content") or None, "image_count": len(images), "created_at": post.get("created_at")}
+        return {"text": post.get("content") or None, "image_count": len(images), "created_at": jury_service.snapshot_time(post.get("created_at"))}
     message = snapshot.get("message") if isinstance(snapshot.get("message"), dict) else {}
     metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
     images = metadata.get("images") if isinstance(metadata.get("images"), list) else []
@@ -349,16 +349,22 @@ def _public_content(case: ReportCase, snapshot: dict[str, Any]) -> dict[str, Any
         # 图片消息的 content 是图片地址，不能当文字给出去
         "text": (message.get("content") or None) if is_text else None,
         "image_count": len(images) + (1 if message.get("type") == "image" else 0),
-        "created_at": message.get("created_at"),
+        "created_at": jury_service.snapshot_time(message.get("created_at")),
     }
 
 
-async def public_case(db: AsyncSession, case_id: int) -> dict[str, Any]:
+async def published_case(db: AsyncSession, case_id: int) -> ReportCase:
+    """按公开编号取一个此刻在公示栏里的案件。"""
     result = await db.execute(select(ReportCase).where(ReportCase.id == case_id, *case_service.published_clauses(datetime.now(UTC))))
     case = result.scalar_one_or_none()
     if case is None:
         # 没有公示的案件对外一律当不存在，不区分「没有这个案件」和「还没公示」。
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"code": "case_not_found", "message": "案件不存在或尚未公示"})
+    return case
+
+
+async def public_case(db: AsyncSession, case_id: int) -> dict[str, Any]:
+    case = await published_case(db, case_id)
     group_content = await jury_settings.is_enabled(db, "public_group_content")
     item = (await _public_items(db, [case], group_content))[0]
     hidden_reason = _content_hidden_reason(case, group_content)

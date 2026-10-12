@@ -1,6 +1,7 @@
 """入门考试和练习场（docs/jury-v2.md 2.3、2.4）。
 
-题目都来自题库（jury_bank）：考试只出已核对的题、不暴露案件编号；练习场出全部题库。
+题目都来自题库（jury_bank）：考试只出计分用的那一份（已核对）、不暴露案件编号；练习场只出练习用的那一份
+（未核对的题 + 已核对里固定切出来的一份）。练习场会公布标准答案，所以两份题不重叠，见 jury_bank.question_pool。
 内容用评审台同一个匿名视图生成。
 """
 
@@ -20,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.models.case import JuryExamAttempt, JuryMember, JuryPracticeAnswer, ReportCase
 from app.models.user import User
+from app.services import cases as case_service
 from app.services import jury as jury_service
 from app.services import jury_bank as bank_service
 from app.services import jury_points as points_service
@@ -65,22 +67,30 @@ def _answer_view(case: ReportCase) -> dict[str, Any]:
 async def _usable_questions(
     db: AsyncSession, user_id: int, case_ids: list[int], *, limit: int | None = None
 ) -> list[ReportCase]:
-    """按给定顺序挑出这个人可以做的题：符合入库规则、和他没有回避关系（不能考到自己被举报的那个案件）。"""
+    """按给定顺序挑出这个人可以做的题：符合入库规则、和他没有回避关系（不能考到自己被举报的那个案件）。
+
+    回避关系和敏感类别都是整批预取的，查询条数不随题目数逐个增加 —— 练习场每次取题都要把整份题过一遍来报进度。
+    """
+    if not case_ids:
+        return []
+    loaded: dict[int, ReportCase] = {}
+    for start in range(0, len(case_ids), case_service.LOOKUP_BATCH):
+        batch = case_ids[start : start + case_service.LOOKUP_BATCH]
+        loaded.update({case.id: case for case in (await db.execute(select(ReportCase).where(ReportCase.id.in_(batch)))).scalars().all()})
+    cases = [loaded[case_id] for case_id in case_ids if case_id in loaded]
     context = await jury_service._conflict_context(db, user_id)
+    await jury_service._prefetch_conflicts(db, context, cases)
+    sensitive = await case_service.sensitive_case_ids(db, cases)
     group_content = await jury_settings.is_enabled(db, "public_group_content")
     found: list[ReportCase] = []
-    for start in range(0, len(case_ids), jury_service.PICK_BATCH):
-        batch = case_ids[start : start + jury_service.PICK_BATCH]
-        cases = {case.id: case for case in (await db.execute(select(ReportCase).where(ReportCase.id.in_(batch)))).scalars().all()}
-        for case_id in batch:
-            case = cases.get(case_id)
-            if case is None or await jury_service._has_conflict(db, user_id, case, context):
-                continue
-            if await bank_service.block_reason(db, case, group_content=group_content) is not None:
-                continue
-            found.append(case)
-            if limit is not None and len(found) >= limit:
-                return found
+    for case in cases:
+        if await jury_service._has_conflict(db, user_id, case, context):
+            continue
+        if await bank_service.block_reason(db, case, group_content=group_content, sensitive=case.id in sensitive) is not None:
+            continue
+        found.append(case)
+        if limit is not None and len(found) >= limit:
+            break
     return found
 
 
@@ -232,17 +242,19 @@ async def exam_state(db: AsyncSession, user: User) -> dict[str, Any]:
 
 
 async def _draw_questions(db: AsyncSession, user_id: int, attempts: list[JuryExamAttempt]) -> list[int]:
-    """随机抽 EXAM_TOTAL 道已核对的题，之前考到过的排在后面。不够返回空列表。"""
+    """从计分用的那一份题里随机抽 EXAM_TOTAL 道，之前考到过的排在后面，在练习场做过的排在最后。不够返回空列表。"""
     case_ids = list(
         (
-            await db.execute(select(ReportCase.id).where(*bank_service.bank_clauses(verified_only=True)).order_by(ReportCase.id.asc()).limit(QUESTION_SCAN_LIMIT))
+            await db.execute(select(ReportCase.id).where(*bank_service.bank_clauses(pool="scored")).order_by(ReportCase.id.asc()).limit(QUESTION_SCAN_LIMIT))
         ).scalars()
     )
     seen: set[int] = set()
     for attempt in attempts:
         seen.update(int(case_id) for case_id in json.loads(attempt.question_ids))
+    # 题目还没核对的时候可能在练习场出过，那时已经给他看过标准答案了。
+    practiced = set((await db.execute(select(JuryPracticeAnswer.case_id).where(JuryPracticeAnswer.user_id == user_id))).scalars().all())
     _shuffle(case_ids)
-    case_ids.sort(key=lambda case_id: case_id in seen)
+    case_ids.sort(key=lambda case_id: (case_id in practiced, case_id in seen))
     cases = await _usable_questions(db, user_id, case_ids, limit=EXAM_TOTAL)
     return [case.id for case in cases] if len(cases) >= EXAM_TOTAL else []
 
@@ -398,6 +410,11 @@ async def _practice_numbers(db: AsyncSession, user_id: int, now: datetime) -> tu
     return max(0, PRACTICE_DAILY_LIMIT - int(today.scalar_one() or 0)), {"answered": int(answered or 0), "correct": int(correct or 0)}
 
 
+async def _practice_resets_at(db: AsyncSession, user_id: int, now: datetime) -> datetime | None:
+    """练习上限的下一个名额什么时候释放；最近 24 小时没练过为 None。"""
+    return await jury_service.rolling_resets_at(db, JuryPracticeAnswer.created_at, JuryPracticeAnswer.user_id == user_id, now=now)
+
+
 async def practice_next(db: AsyncSession, user: User) -> dict[str, Any]:
     """GET /jury/practice/next。没做过的题优先；都做过后按「最久没做」的顺序重出。"""
     await _practice_gate(db, user)
@@ -405,7 +422,7 @@ async def practice_next(db: AsyncSession, user: User) -> dict[str, Any]:
     left, stats = await _practice_numbers(db, user.id, now)
     case_ids = list(
         (
-            await db.execute(select(ReportCase.id).where(*bank_service.bank_clauses(verified_only=False)).order_by(ReportCase.id.asc()).limit(QUESTION_SCAN_LIMIT))
+            await db.execute(select(ReportCase.id).where(*bank_service.bank_clauses(pool="practice")).order_by(ReportCase.id.asc()).limit(QUESTION_SCAN_LIMIT))
         ).scalars()
     )
     last_answered = dict(
@@ -439,6 +456,7 @@ async def practice_next(db: AsyncSession, user: User) -> dict[str, Any]:
         "daily_limit": PRACTICE_DAILY_LIMIT,
         "stats": stats,
         "round": {"total": len(cases), "done": sum(1 for case in cases if case.id in last_answered)},
+        "resets_at": await _practice_resets_at(db, user.id, now),
     }
 
 
@@ -449,16 +467,28 @@ async def practice_answer(db: AsyncSession, user: User, question_id: int, vote: 
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail={"code": "invalid_vote", "message": "选项只能是 none / l1 / l2 / l3"})
     now = datetime.now(UTC)
     case = await db.get(ReportCase, question_id)
-    if case is None or not case.is_golden or not await _usable_questions(db, user.id, [case.id], limit=1):
+    # 只认练习场那一份里的题：否则拿任意题号来「练习」就能问出考试题和质控题的标准答案。
+    if case is None or bank_service.question_pool(case) != "practice" or not await _usable_questions(db, user.id, [case.id], limit=1):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"code": "question_not_found", "message": "题目不存在"})
     left, _stats = await _practice_numbers(db, user.id, now)
     if left <= 0:
+        resets_at = await _practice_resets_at(db, user.id, now)
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail={"code": "practice_daily_limit", "message": f"今天的练习已达上限（{PRACTICE_DAILY_LIMIT} 道），明天再来"},
+            detail={
+                "code": "practice_daily_limit",
+                "message": f"今天的练习已达上限（{PRACTICE_DAILY_LIMIT} 道），明天再来",
+                "resets_at": jury_service._iso(resets_at) if resets_at is not None else None,
+            },
         )
     correct = bank_service.is_correct(case, vote)
     db.add(JuryPracticeAnswer(user_id=user.id, case_id=case.id, vote=vote, correct=correct, created_at=now))
     await db.commit()
     left, stats = await _practice_numbers(db, user.id, now)
-    return {"correct": correct, "answer": _answer_view(case), "left_today": left, "stats": stats}
+    return {
+        "correct": correct,
+        "answer": _answer_view(case),
+        "left_today": left,
+        "stats": stats,
+        "resets_at": await _practice_resets_at(db, user.id, now),
+    }

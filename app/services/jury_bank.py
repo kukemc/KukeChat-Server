@@ -2,6 +2,7 @@
 
 一道题 = 一个已经有结论的案件，report_cases.is_golden 表示「在题库里」。题有「已核对」标记：
 已核对的用于入门考试和评审中的质控计分，未核对的只用于练习。
+练习场会公布标准答案，所以练习的题和计分的题不能是同一批：已核对的题按编号固定切出一份只给练习场，见 question_pool。
 这个模块不依赖 jury.py（评审分案时要用这里的规则），需要委员视图的地方在函数里再导入。
 """
 
@@ -33,6 +34,9 @@ SOURCES = ("admin", "consensus", "legacy")
 CONSENSUS_VOTES = settings.jury_golden_consensus_votes
 AUTO_INCLUDE_DELAY_HOURS = settings.jury_golden_delay_hours
 AUTO_INCLUDE_BATCH = 200
+# 已核对的题里，编号能被它整除的那一份只给练习场，其余的给考试和评审质控。按编号切是为了固定：一道题不会今天练、明天考。
+PRACTICE_EVERY = settings.jury_practice_every
+POOLS = ("practice", "scored")
 DECIDED_VOTES = ("none", "l1", "l2", "l3")
 BLOCK_MESSAGES = {
     "open": "案件还没有结论，不能进题库",
@@ -89,15 +93,20 @@ def shows_public_content(case: ReportCase, group_content: bool) -> bool:
     return bool(group_content and case.publishable and case.target_type == "message")
 
 
-async def block_reason(db: AsyncSession, case: ReportCase, *, group_content: bool | None = None) -> str | None:
-    """这个案件为什么不能当题目；None 表示可以。入库和出题时都按这一套判断。"""
+async def block_reason(db: AsyncSession, case: ReportCase, *, group_content: bool | None = None, sensitive: bool | None = None) -> str | None:
+    """这个案件为什么不能当题目；None 表示可以。入库和出题时都按这一套判断。
+
+    sensitive：调用方已经用 cases.sensitive_case_ids 批量查过时把结果传进来，这里就不再逐个案件查库。
+    """
     if case.status == "open":
         return "open"
     if not case.jury_eligible:
         return "private"
     # 和公示栏用同一套敏感类别判断，再加上分案时那套（举报理由 / 机器类别）
     categories = {case.verdict_category, case.golden_category}
-    if case.jury_block_reason == "sensitive" or categories & case_service.HIDDEN_CONTENT_CATEGORIES or await case_service.is_sensitive(db, case):
+    if case.jury_block_reason == "sensitive" or categories & case_service.HIDDEN_CONTENT_CATEGORIES:
+        return "sensitive"
+    if sensitive if sensitive is not None else await case_service.is_sensitive(db, case):
         return "sensitive"
     if group_content is None:
         group_content = await jury_settings.is_enabled(db, "public_group_content")
@@ -176,22 +185,35 @@ async def auto_include(db: AsyncSession) -> int:
 # ---------------------------------------------------------------- 出题
 
 
-def bank_clauses(*, verified_only: bool) -> list[Any]:
-    """题库里能出的题在 SQL 里能判断的那部分条件；类别和公示栏的检查见 block_reason。"""
+def question_pool(case: ReportCase) -> str | None:
+    """这道题给谁用：practice 只给练习场 / scored 给入门考试和评审质控；不在题库里为 None。
+
+    未核对的题全部只给练习场。已核对的题里编号能被 PRACTICE_EVERY 整除的也只给练习场，其余的练习场不出。
+    """
+    if not case.is_golden:
+        return None
+    return "scored" if case.golden_verified and case.id % PRACTICE_EVERY != 0 else "practice"
+
+
+def bank_clauses(*, pool: str) -> list[Any]:
+    """某一份题在 SQL 里能判断的那部分条件（口径同 question_pool）；类别和公示栏的检查见 block_reason。"""
     clauses: list[Any] = [
         ReportCase.is_golden.is_(True),
         ReportCase.status != "open",
         ReportCase.jury_eligible.is_(True),
         ReportCase.jury_block_reason.is_(None),
     ]
-    if verified_only:
-        clauses.append(ReportCase.golden_verified.is_(True))
+    practice_share = ReportCase.id % PRACTICE_EVERY == 0
+    if pool == "scored":
+        clauses.extend([ReportCase.golden_verified.is_(True), ~practice_share])
+    else:
+        clauses.append(or_(ReportCase.golden_verified.is_(False), practice_share))
     return clauses
 
 
 async def verified_count(db: AsyncSession) -> int:
-    """已核对的题有多少道。只是个便宜的估计，用来告诉客户端「现在能不能考」；真正抽题时还会逐题检查。"""
-    result = await db.execute(select(func.count(ReportCase.id)).where(*bank_clauses(verified_only=True)))
+    """能用于考试的题（已核对、且不在练习那一份里）有多少道。只是个便宜的估计，用来告诉客户端「现在能不能考」；真正抽题时还会逐题检查。"""
+    result = await db.execute(select(func.count(ReportCase.id)).where(*bank_clauses(pool="scored")))
     return int(result.scalar_one() or 0)
 
 
@@ -236,6 +258,8 @@ async def question_reads(db: AsyncSession, cases: list[ReportCase]) -> list[dict
                 "verdict_source": case.verdict_source,
                 "in_bank": bool(case.is_golden),
                 "verified": bool(case.is_golden and case.golden_verified),
+                # practice 只给练习场 / scored 给考试和质控；不在题库里为 null
+                "pool": question_pool(case),
                 "source": question_source(case) if case.is_golden else None,
                 "outcome": answer["outcome"],
                 "level": answer["level"],

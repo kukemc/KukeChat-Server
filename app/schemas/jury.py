@@ -237,6 +237,8 @@ class JuryVoteItem(BaseModel):
     opinion_count: int = 0
     # 回避的记录为 false：点不进详情
     can_view: bool = True
+    # 案件此刻在公示栏里时是它的公开编号，否则为 null；质控题和回避的记录恒为 null
+    public_case_id: int | None = None
 
 
 class JuryVotePage(BaseModel):
@@ -299,6 +301,7 @@ class PublicCasePage(BaseModel):
 class PublicCaseContent(BaseModel):
     text: str | None = None
     image_count: int = 0
+    # 带 Z 的 ISO 字符串（UTC）
     created_at: str | None = None
 
 
@@ -440,7 +443,8 @@ class PracticeStats(BaseModel):
 
 
 class PracticeRound(BaseModel):
-    # 题库里我能练的题数 / 其中我做过的（不重复计）。done == total 说明这一轮做完了，之后出的都是重做的题
+    # 练习场里我能练的题数 / 其中我做过的（不重复计）。done == total 说明这一轮做完了，之后出的都是重做的题。
+    # 练习场只出未核对的题和已核对题里固定切出来的一份；用于考试和质控的题不在这里
     total: int = 0
     done: int = 0
 
@@ -452,6 +456,8 @@ class PracticeNext(BaseModel):
     daily_limit: int
     stats: PracticeStats
     round: PracticeRound
+    # 练习上限按最近 24 小时滚动：下一个名额什么时候释放；最近 24 小时没练过为 null
+    resets_at: datetime | None = None
 
 
 class PracticeAnswerCreate(BaseModel):
@@ -463,6 +469,7 @@ class PracticeAnswerResult(BaseModel):
     answer: QuestionAnswer
     left_today: int
     stats: PracticeStats
+    resets_at: datetime | None = None
 
 
 # ---------------------------------------------------------------- 风纪值、成就、排行榜
@@ -527,6 +534,8 @@ class AdminQuestionRead(BaseModel):
     verdict_source: str | None = None
     in_bank: bool = True
     verified: bool = False
+    # 这道题给谁用：practice 只给练习场 / scored 给入门考试和评审质控；不在题库里为 null
+    pool: Literal["practice", "scored"] | None = None
     # admin / consensus / legacy；不在题库里为 null
     source: str | None = None
     # 标准答案

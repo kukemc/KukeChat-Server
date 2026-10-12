@@ -2,7 +2,7 @@
 
 在 `moderation-v2.md` 第 2、3 节之上的增量。没提到的保持原样；**现有 `/jury/*` 接口的路径和字段只加不改**，已发布的客户端不受影响。
 
-所有路径前缀 `/api/v1`，都要求登录（照常带客户端证明头）。出错时 `detail` 是 `{ code, message }`，`message` 可以直接展示。
+所有路径前缀 `/api/v1`，都要求登录（照常带客户端证明头）。本文档里新增的错误 `detail` 都是 `{ code, message }`，`message` 可以直接展示；但老接口原有的错误仍是字符串，参数校验失败（422）是框架默认的数组，客户端读错误信息时三种都要兜住。
 
 | 状态 | 范围 |
 | --- | --- |
@@ -34,8 +34,18 @@
 16. **机器来源的案件按委员人数限量**（每天 = 在任委员数 × 2，至少 5）。旧管线每天约 170 条「拿不准」，全收远超委员容量。
 17. **待审期间折叠不做**，理由见 3.6。
 18. **判例由资深委员直接生效**，不设二次确认；管理员可以改、可以撤。资深委员只能把自己投过票的案件标为判例（他们本来也只看得到这些案件）。
+19. **委员看到的案件编号是「评审编号」，不是案件的真实编号**（1.0）。否则质控题能从编号大小和公示栏里认出来。
 
 ## 1. 一期
+
+### 1.0 两种案件编号
+
+- **评审编号**：委员侧所有接口里的 `case_id`（评审台、投票、案件详情、观点区、我的评审、资深合议、标判例时提交的、以及发给委员的实时事件和风纪值明细里的）。它对每个委员、每个案件各不相同，是不透明的数字，只对本人有效；路径参数 `{case_id}` 传的也是它。拿别人的评审编号或案件的公开编号来请求一律 404。
+- **公开编号**：公示栏、判例、后台里的 `case_id`，是案件本身的编号。
+
+两者不能互相代入。`JuryCaseDetail` 和 `/jury/votes` 的每一项带 `public_case_id`：案件已经进公示栏时是它的公开编号，否则为 null（质控题恒为 null）。
+
+为什么要分开：质控题是早就结案的旧案件，如果委员看到的是真实编号，光看数字大小、或者去公示栏查一下，就能认出哪道是质控题并查到答案。
 
 ### 1.1 配置：`GET /jury/config`
 
@@ -145,7 +155,7 @@
 
 ### 1.5 案件详情（投后）：`GET /jury/cases/{case_id}`
 
-只有对这个案件**已经投过票**的人能读，否则 403 `not_voted`。被停职 / 卸任的前委员仍可回看自己投过的案件。
+只有对这个案件**已经投过票**的人能读。评审编号不是我的（包括拿公开编号来请求）返回 404 `case_not_found`；分到手还没投、或者我回避了的返回 403 `not_voted`。被停职 / 卸任的前委员仍可回看自己投过的案件。
 
 ```jsonc
 {
@@ -173,7 +183,8 @@
   "verdict": null,            // 定案后才给，见下
   "is_quality_check": false,
   "opinions_enabled": true,   // 质控题为 false
-  "opinion_count": 4
+  "opinion_count": 4,
+  "public_case_id": null      // 已进公示栏时是公开编号，见 1.0
 }
 ```
 
@@ -195,7 +206,7 @@
 
 - 定案前 `tally`、`verdict` 都是 null，只有 `votes_cast`。
 - **质控题**：`is_quality_check: true`，投完立刻 `stage: "closed"`、`verdict` 是标准结论、`tally` 为 null、`votes_cast` 为 0、`opinions_enabled: false`。客户端应当明确告诉委员「这是一道质控题」并展示标准结论和 `my_vote.agreed`。
-- `my_vote.agreed` 在改判后会跟着变。
+- `my_vote.agreed` 在改判后会跟着变。改判后 `verdict.outcome` / `category` / `level` 是新结论，`overturned: true`；`verdict.source` 和 `tally` 保持原审的样子（它们描述的是原来那次表决）。公示栏同理。
 - 质控题不分配代号，`my_vote.alias` 为 null。
 - 内容保留期从「定案时间」和「我投票的时间」里较晚的那个算起（质控题是早就定案的案件）。
 
@@ -241,10 +252,12 @@
 
 | HTTP | `detail.code` | 含义 |
 | --- | --- | --- |
-| 403 | `not_voted` | 没有对这个案件投过票 |
+| 403 | `not_voted` | 这个案件分给我了但还没投，或者我回避了 |
+| 404 | `case_not_found` | 评审编号不是我的 |
 | 403 | `not_juror` / `juror_restricted` | 不是在任委员 / 受处罚期间（只读不受影响） |
 | 403 | `opinions_closed` | 这个案件没有观点区（质控题） |
 | 404 | — | 案件或观点不存在，或观点不属于我能看的案件 |
+| 403 | `not_opinion_author` | 删除别人的观点 |
 | 400 | `cannot_like_own` / `cannot_report_own` | |
 | 409 | `already_reported` | |
 | 422 | `invalid_opinion` | 内容为空或超长 |
@@ -271,7 +284,8 @@
   "outcome": "violation", "verdict_source": "jury", "verdict_level": 2,
   "closed_at": "…", "agreed": true, "overturned": false,
   "is_quality_check": false,
-  "opinion_count": 4
+  "opinion_count": 4,
+  "public_case_id": null
 }
 ```
 
@@ -333,6 +347,8 @@
 
 进公示栏的条件：经过委员评审（至少有一张委员票）并已定案的案件；定案满 `publish_delay_hours`；相关处罚没有待处理的申诉。质控题、机器自动结案的不进。没有公示的案件访问详情返回 404。
 
+`GET /jury/public/cases/{case_id}/opinions` → `{ items: Opinion[], total }`（`case_id` 是公开编号）：只在后台开关 `opinions_open_to_jurors` 打开时可用，供在任委员只读地看已公示案件的观点区。404 `case_not_found` 不在公示栏里；403 `not_juror` 不是在任委员；403 `opinions_closed` 开关没开，或我和这个案件有回避关系。只读：不能在这里发表、点赞、举报。开关默认关，客户端在收到 403 时不显示这块即可。
+
 内容只在同时满足这些条件时给：公开动态、认定违规、类别不是隐私 / 色情类、没有被改判。只给被举报的那一篇的文字，图片只给数量。
 
 ### 1.9 实时事件（用户通道 `/ws`）
@@ -350,12 +366,12 @@
 | 接口 | 说明 |
 | --- | --- |
 | `GET /admin/jury/settings` | 三个开关的当前值、全部阈值的当前值（只读展示） |
-| `PUT /admin/jury/settings` | `{ auto_appoint?, appeals?, machine_review?, public_group_content?, opinions_open_to_jurors? }`，写审计日志，立即生效 |
+| `PUT /admin/jury/settings` | `{ auto_appoint?, appeals?, machine_review?, public_group_content?, opinions_open_to_jurors?, exam_required? }`（最后一个二期起），写审计日志，几秒内对所有进程生效 |
 | `POST /admin/jury/members/{user_id}/review` | 原有。`approve` / `reinstate` 新增可选的 `tier`（创始任命：直接任命为任意层级）；新增 `action: "set_tier"` |
 | `GET /admin/jury/opinions?state=&reported=&case_id=&limit&offset` | 观点列表，带真实作者和举报记录 |
 | `POST /admin/jury/opinions/{id}/moderate` | `{ action: "delete" \| "restore" \| "dismiss_reports", note? }` |
 | `POST /admin/cases/{id}/overturn` | `{ outcome: "violation" \| "dismiss", category?, level?, note }`，改判已结案件：撤销或补记处罚、同步举报结论和委员的一致率、能恢复的内容恢复 |
-| `GET /admin/cases` / `GET /admin/cases/{id}` | `CaseRead` 新增 `jury_outcome`（`consensus` / `no_consensus` / `timeout` / `manual`）、`queued_at`、`escalated_at`、`published_at`、`overturned_at`、`overturn_note`、`jury_block_reason`；详情的 `votes[]` 新增 `alias`、`tier`，另加 `opinions[]` |
+| `GET /admin/cases` / `GET /admin/cases/{id}` | `CaseRead` 新增 `jury_outcome`（`consensus` / `no_consensus` / `timeout` / `need_context` / `manual`）、`queued_at`、`escalated_at`、`published_at`、`overturned_at`、`overturn_note`、`jury_block_reason`；详情的 `votes[]` 新增 `alias`、`tier`、`category`、`review_id`（委员看到的评审编号），另加 `opinions[]` |
 
 `JuryMemberRead` 新增 `tier`。申诉通过（撤销处罚）时，如果这条处罚来自案件，案件自动按改判处理。
 
@@ -426,6 +442,8 @@
 | `warnings` | `[{ code, message, current, threshold, sample }]`，后三个可能为 null。`code` ∈ `high_abstain`（弃权偏多）/ `demote_risk`（最近的一致率接近或低于降级线）/ `suspend_risk`（一致率或质控正确率接近或低于暂停线）。`current` 是服务端实际用来判断的那个数（比如最近 30 张已结票的一致率），`sample` 是它的样本数。客户端直接展示，不要自己估算 |
 | `cooldown_until` | 弃权过多被暂停发案到什么时候；没有则为 null |
 | `recuse_left_today` | 今天还能主动回避几次 |
+| `daily_resets_at` | 评审上限的下一个名额什么时候释放（最近 24 小时里最早那一票的时间 + 24 小时）；最近 24 小时没投过票时为 null |
+| `recuse_resets_at` | 回避上限的下一个名额什么时候释放；最近 24 小时没回避过时为 null |
 
 `POST /jury/apply` 的行为：
 
@@ -486,9 +504,9 @@
 
 满足四项资格的用户、以及当过委员的人都可以练习。不计入一致率，不给风纪值。
 
-`GET /jury/practice/next` → `{ "question": PracticeQuestion | null, "left_today": 17, "daily_limit": 20, "stats": { "answered": 34, "correct": 29 }, "round": { "total": 42, "done": 30 } }`
+`GET /jury/practice/next` → `{ "question": PracticeQuestion | null, "left_today": 17, "daily_limit": 20, "stats": { "answered": 34, "correct": 29 }, "round": { "total": 42, "done": 30 }, "resets_at": "…" }`
 
-`round.total` 是题库里我能练的题数，`round.done` 是其中我做过的（不重复计）；`done == total` 说明这一轮做完了，之后出的都是重做的题。
+`resets_at` 是练习上限的下一个名额什么时候释放（最近 24 小时没练过时为 null），答题响应里也带。`round.total` 是题库里我能练的题数，`round.done` 是其中我做过的（不重复计）；`done == total` 说明这一轮做完了，之后出的都是重做的题。
 
 `PracticeQuestion` = `JuryCaseView` 的内容字段 + `question_id` + `verified`（是否已核对）+ `answered_before`（我以前做过这道题）。受处罚期间（`restriction` 有值）也可以练习，服务端不拦。没做过的题优先；都做过后按「最久没做」的顺序重出。题库为空时 `question: null`。
 
@@ -503,7 +521,7 @@
 }
 ```
 
-错误码：403 `jury_not_eligible`；404 题目不存在；429 `practice_daily_limit`。
+错误码：403 `jury_not_eligible`；404 题目不存在；429 `practice_daily_limit`（`detail.resets_at`）。
 
 ### 2.5 投票的变化
 
@@ -618,11 +636,22 @@
 | `jury.achievement.earned` | `{ key, label }` | 本人 |
 | `jury.status.changed` | `{}` | 本人。晋升、降级、暂停、续任、任期届满也会发 |
 
-### 2.11 后台接口
+### 2.11 实现上的细节
+
+- **「每天」有两种口径。** 评审上限、回避上限、练习上限按最近 24 小时滚动，不在零点恢复；恢复时间看 `daily_resets_at` / `recuse_resets_at` / 练习场的 `resets_at`，429 `jury_daily_limit`、`recuse_limit`、`practice_daily_limit` 的 `detail` 里也带 `resets_at`。每日首票、连续天数、排行榜的周 / 月按 UTC+8 自然日。
+- **练习题和计分的题不重叠。** 已核对的题固定分出约三分之一只给练习场，其余只用于质控和考试；未核对的题全部只给练习场。`round.total` 是练习场能出的题数。评审中的质控题也不会出我在考试或练习里见过的题。对计分题调 `POST /jury/practice/{question_id}/answer` 返回 404。
+- **自动任命的范围。** `auto_appoint` 只对没有成员记录、或正在审批队列里的人生效；被拒绝或卸任过的人通过考试后仍进审批队列。
+- **晋升保护。** 累计条件都满足、但最近的一致率低于新层级降级线的人不晋升，所以 `tier_progress` 里可能全部 `ok` 却还没升。
+- **弃权过多的暂停**只在刚投出「拿不准」或「上下文不足」的那一票上判断。
+- **加分明细。** `daily_first`、`streak_7` 的明细没有 `case_id`（为 null），不计入 `my_vote.points`。
+- **排行榜**连同 `me` 一起缓存 60 秒。
+- **另外的错误码**：投票带了不在 `config.categories` 里的类别，422 `invalid_category`；`PUT /jury/me/settings` 在从没当过委员时，403 `not_juror`；交卷时场次不存在或不是本人的，404（`detail.code` 为 `exam_not_found`）。
+
+### 2.12 后台接口
 
 | 接口 | 说明 |
 | --- | --- |
-| `GET /admin/jury/questions?verified=&source=&q=&limit&offset` | 题库。每项：案件摘要、标准答案（结论 / 等级 / 类别）、说明、`verified`、来源（`admin` / `consensus` / `legacy`）、被答次数和正确率 |
+| `GET /admin/jury/questions?verified=&source=&q=&limit&offset` | 题库。每项：案件摘要、标准答案（结论 / 等级 / 类别）、说明、`verified`、来源（`admin` / `consensus` / `legacy`）、`pool`（`practice` 只给练习场 / `scored` 用于考试和质控 / null 未核对）、被答次数和正确率 |
 | `GET /admin/jury/questions/{case_id}` | 题目内容（匿名视图）+ 以上字段 |
 | `PUT /admin/jury/questions/{case_id}` | `{ in_bank?, verified?, outcome?, level?, category?, explanation? }`。把任意已结且允许入库的案件加入 / 移出题库、核对、改标准答案和说明 |
 | `GET /admin/jury/exams?passed=&limit&offset` | 考试记录：用户、分数、是否通过、时间 |

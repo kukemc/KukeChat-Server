@@ -150,6 +150,7 @@ def thresholds() -> dict[str, int | float]:
         "exam_retry_hours": settings.jury_exam_retry_hours,
         "exam_valid_days": settings.jury_exam_valid_days,
         "practice_daily_limit": settings.jury_practice_daily_limit,
+        "practice_every": settings.jury_practice_every,
         "golden_consensus_votes": settings.jury_golden_consensus_votes,
         "golden_delay_hours": settings.jury_golden_delay_hours,
     }

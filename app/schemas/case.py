@@ -89,6 +89,8 @@ class CasePage(BaseModel):
 
 
 class JuryVoteSummary(BaseModel):
+    # 这位委员在这个案件上的评审编号：委员侧接口里他看到的 case_id 是它，不是案件编号
+    review_id: int | None = None
     vote: str | None = None
     note: str | None = None
     voted_at: datetime | None = None
@@ -267,6 +269,8 @@ class JuryStatus(BaseModel):
     stats: JuryStats | None = None
     daily_limit: int
     voted_today: int
+    # 评审上限按最近 24 小时滚动：下一个名额什么时候释放（最早那一票的时间 + 24 小时）；最近 24 小时没投过票为 null
+    daily_resets_at: datetime | None = None
     # trainee / regular / senior；不是在任委员时为 null
     tier: str | None = None
     # 现在能分给我的未结案件数（上限 50）；不是在任委员时为 null
@@ -288,6 +292,8 @@ class JuryStatus(BaseModel):
     cooldown_until: datetime | None = None
     # 今天还能主动回避几次；不是在任委员为 null
     recuse_left_today: int | None = None
+    # 回避上限的下一个名额什么时候释放；最近 24 小时没回避过为 null
+    recuse_resets_at: datetime | None = None
 
 
 class JuryMeSettings(BaseModel):
@@ -304,6 +310,7 @@ class JuryCaseMessage(BaseModel):
     type: str
     content: str | None = None
     images: list[str] = Field(default_factory=list)
+    # 带 Z 的 ISO 字符串（UTC）
     created_at: str | None = None
     # 相对被举报消息的位置：目标是 0，之前为负，之后为正
     offset: int = 0
@@ -312,6 +319,7 @@ class JuryCaseMessage(BaseModel):
 class JuryCasePost(BaseModel):
     content: str | None = None
     image_urls: list[str] = Field(default_factory=list)
+    # 带 Z 的 ISO 字符串（UTC）
     created_at: str | None = None
 
 
@@ -321,6 +329,7 @@ class JuryReasonCount(BaseModel):
 
 
 class JuryCaseContent(BaseModel):
+    # 评审编号：对每个委员、每个案件各不相同，只对本人有效；不是案件的公开编号（docs/jury-v2.md 1.0）
     case_id: int
     kind: Literal["message", "post"]
     reasons: list[JuryReasonCount]
@@ -397,6 +406,8 @@ class JuryCaseDetail(JuryCaseContent):
     is_quality_check: bool = False
     opinions_enabled: bool = True
     opinion_count: int = 0
+    # 案件此刻在公示栏里时是它的公开编号，否则为 null；质控题恒为 null
+    public_case_id: int | None = None
 
 
 class JuryRewardItem(BaseModel):
@@ -414,6 +425,7 @@ class JuryReward(BaseModel):
 
 
 class JuryVoteResult(BaseModel):
+    # 评审编号，和请求路径里的一样
     case_id: int
     settled: bool
     # 回避之后看不了这个案件，为 null
@@ -422,6 +434,7 @@ class JuryVoteResult(BaseModel):
 
 
 class JuryHistoryItem(BaseModel):
+    # 评审编号
     case_id: int
     kind: str
     vote: str | None = None
@@ -433,6 +446,7 @@ class JuryHistoryItem(BaseModel):
 class JuryMemberRead(JuryStats):
     user_id: int
     user: UserPublic | None = None
+    # applied / active / expired（任期届满未续任）/ rejected / suspended / retired，和本人在 /jury/me 看到的一致
     status: str
     statement: str | None = None
     applied_at: datetime | None = None

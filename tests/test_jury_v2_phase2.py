@@ -9,7 +9,7 @@ from typing import Annotated
 from unittest.mock import patch
 
 import httpx
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -69,6 +69,11 @@ class Phase2TestCase(JuryV2TestCase):
     async def asyncSetUp(self) -> None:
         await super().asyncSetUp()
         self._serial = 0
+        # 已核对的题按编号固定切出一份只给练习场。这里的测试大多直接按顺序造题，先把这一份关掉
+        # （已核对的全部用于考试和质控，练习场只出未核对的）；切分本身在 PoolTests 里单独测。
+        splitter = patch.object(bank_service, "PRACTICE_EVERY", 10**9)
+        splitter.start()
+        self.addCleanup(splitter.stop)
 
     # ------------------------------------------------------------ 工具
 
@@ -131,7 +136,7 @@ class Phase2TestCase(JuryV2TestCase):
         if existing is None:
             db.add(JuryVote(case_id=case_id, juror_id=user.id, assigned_at=datetime.now(UTC), is_quality_check=quality))
             await db.commit()
-        return await jury_service.cast_vote(db, user, case_id, vote, note, category)
+        return await jury_service.cast_vote(db, user, await self._rid(db, user, case_id), vote, note, category)
 
     async def _settle_case(self, db, votes: dict[str, str]) -> ReportCase:
         case = await self._open_case(db)
@@ -308,8 +313,8 @@ class BankTests(Phase2TestCase):
             AdminQuestionDetail(**detail)
             self.assertEqual((detail["verified"], detail["source"], detail["explanation"], detail["block_reason"]), (True, "admin", "连续三条都在骂人", None))
             view = await jury_service.next_case(db, juror)
-            self.assertEqual(view["case_id"], cases["message"].id)
-            result = await jury_service.cast_vote(db, juror, cases["message"].id, "l2", None)
+            self.assertEqual(await self._real(db, view["case_id"]), cases["message"].id)
+            result = await jury_service.cast_vote(db, juror, await self._rid(db, juror, cases["message"].id), "l2", None)
             # 质控题揭晓时带上题库里的讲解；普通案件的详情没有
             self.assertEqual((result["case"]["is_quality_check"], result["case"]["verdict"]["explanation"], result["case"]["my_vote"]["agreed"]), (True, "连续三条都在骂人", True))
 
@@ -357,8 +362,8 @@ class BankTests(Phase2TestCase):
             self.assertEqual((detail["outcome"], detail["level"], detail["category"], detail["answer_overridden"], detail["answered"], detail["correct_rate"]), ("clean", None, None, True, 1, 1.0))
             await db.refresh(member)
             self.assertEqual((member.golden_total, member.golden_correct), (1, 1))
-            self.assertTrue((await jury_service.case_detail(db, juror.id, question.id))["my_vote"]["agreed"])
-            self.assertEqual((await jury_service.case_detail(db, juror.id, question.id))["verdict"]["outcome"], "clean")
+            self.assertTrue((await jury_service.case_detail(db, juror.id, await self._rid(db, juror.id, question.id)))["my_vote"]["agreed"])
+            self.assertEqual((await jury_service.case_detail(db, juror.id, await self._rid(db, juror.id, question.id)))["verdict"]["outcome"], "clean")
             detail = await update(question, outcome="violation", level=3, category="fraud")
             self.assertEqual((detail["outcome"], detail["level"], detail["category"], detail["category_label"]), ("violation", 3, "fraud", "诈骗"))
             # 传 null 清空改动，退回案件自身的结论
@@ -633,11 +638,15 @@ class ExamTests(Phase2TestCase):
 
 class PracticeTests(Phase2TestCase):
     async def test_practice_serves_unseen_questions_first_then_the_oldest(self) -> None:
+        # 这里看的是出题顺序和进度：让已核对的题全部落在练习场那一份里。两份题怎么切见 PoolTests。
+        splitter = patch.object(bank_service, "PRACTICE_EVERY", 1)
+        splitter.start()
+        self.addCleanup(splitter.stop)
         async with self.sessions() as db:
             carol = await self._eligible_user(db, "carol")
             first = await self._question(db)
             second = await self._question(db, upheld=False, golden_explanation="只是口头禅")
-            # 练习场出全部题库，未核对的也出
+            # 未核对的题也出
             third = await self._question(db, verified=False, source="legacy")
             own = await self._question(db, reported_user_id=carol.id)
             outside = await self._question(db, is_golden=False, verified=False, source=None)
@@ -689,7 +698,7 @@ class PracticeTests(Phase2TestCase):
 
     async def test_practice_is_open_to_eligible_users_and_past_jurors(self) -> None:
         async with self.sessions() as db:
-            await self._question(db)
+            await self._question(db, verified=False)
             # 不满足四项资格、也没当过委员
             self.assertEqual(await self._code(exam_service.practice_next(db, await self._user(db, "offender"))), (403, "jury_not_eligible"))
             applied = await self._user(db, "alice")
@@ -715,6 +724,230 @@ class PracticeTests(Phase2TestCase):
             self.assertEqual((page["question"], page["round"]), (None, {"total": 0, "done": 0}))
 
 
+# ---------------------------------------------------------------- 练习题和计分题分开
+
+
+class PoolTests(Phase2TestCase):
+    async def _forced_quality_check(self, db, name: str) -> int | None:
+        """强制让这位委员的下一件出质控题并答掉，返回那道题的案件编号；出不了质控题返回 None。"""
+        member = await self._member(db, name)
+        member.votes_since_quality = jury_service.QUALITY_MAX_GAP + 1
+        await db.commit()
+        user = await self._user(db, name)
+        view = await jury_service.next_case(db, user)
+        if view is None:
+            return None
+        case_id = await self._real(db, view["case_id"])
+        # 答对：连着答错会被系统暂停资格
+        upheld = bank_service.question_upheld(await db.get(ReportCase, case_id))
+        result = await jury_service.cast_vote(db, user, view["case_id"], "l2" if upheld else "none", None)
+        self.assertTrue(result["case"]["is_quality_check"])
+        return case_id
+
+    async def test_practice_questions_never_show_up_in_exams_or_quality_checks(self) -> None:
+        with patch.object(bank_service, "PRACTICE_EVERY", 3):
+            async with self.sessions() as db:
+                verified = await self._questions(db, 12)
+                unverified = [await self._question(db, verified=False, source="legacy") for _ in range(3)]
+                # 已核对的题按编号固定切出一份只给练习场；未核对的全部只给练习场
+                practice = {case.id for case in verified if case.id % 3 == 0} | {case.id for case in unverified}
+                scored = {case.id for case in verified} - practice
+                self.assertEqual((len(practice), len(scored)), (7, 8))
+                self.assertEqual({case.id for case in [*verified, *unverified] if bank_service.question_pool(case) == "practice"}, practice)
+                self.assertEqual({case.id for case in verified if bank_service.question_pool(case) == "scored"}, scored)
+                outside = await self._question(db, is_golden=False, verified=False, source=None)
+                self.assertIsNone(bank_service.question_pool(outside))
+                self.assertEqual(await bank_service.verified_count(db), len(scored))
+
+                # 练习场：一轮下来出的正好是练习那一份，进度也按这一份算
+                carol = await self._eligible_user(db, "carol")
+                served: list[int] = []
+                for index in range(len(practice)):
+                    page = await exam_service.practice_next(db, carol)
+                    self.assertEqual(page["round"], {"total": len(practice), "done": index})
+                    served.append(page["question"]["question_id"])
+                    await exam_service.practice_answer(db, carol, served[-1], "l2")
+                self.assertEqual(set(served), practice)
+                self.assertEqual((await exam_service.practice_next(db, carol))["round"], {"total": len(practice), "done": len(practice)})
+                # 计分用的题拿题号来「练习」问不出答案
+                for case_id in sorted(scored)[:3]:
+                    self.assertEqual(await self._code(exam_service.practice_answer(db, carol, case_id, "l2")), (404, "question_not_found"))
+
+                # 入门考试：只从计分那一份里抽；这一份不够一场时不能考
+                self.assertFalse((await exam_service.exam_state(db, carol))["available"])
+                self.assertEqual(await self._code(exam_service.start_exam(db, carol)), (409, "exam_unavailable"))
+                with patch.object(exam_service, "EXAM_TOTAL", len(scored)), patch.object(exam_service, "EXAM_PASS_SCORE", 1):
+                    self.assertTrue((await exam_service.exam_state(db, carol))["available"])
+                    started = await exam_service.start_exam(db, carol)
+                attempt = await db.get(JuryExamAttempt, started["attempt_id"])
+                self.assertEqual(set(json.loads(attempt.question_ids)), scored)
+
+                # 评审中的质控题：同样只出计分那一份
+                asked = set()
+                for _ in range(len(scored)):
+                    asked.add(await self._forced_quality_check(db, "juror1"))
+                self.assertEqual(asked, scored)
+                self.assertIsNone(await self._forced_quality_check(db, "juror1"))
+
+                # 切分的份数是配置项：换一个数，同一道题落在哪一份跟着变
+                sample = next(case for case in verified if case.id % 3 == 0 and case.id % 4 != 0)
+                self.assertEqual(bank_service.question_pool(sample), "practice")
+                with patch.object(bank_service, "PRACTICE_EVERY", 4):
+                    self.assertEqual(bank_service.question_pool(sample), "scored")
+
+    async def test_quality_checks_skip_questions_already_seen_in_the_exam_or_in_practice(self) -> None:
+        async with self.sessions() as db:
+            examined, practiced, fresh = await self._questions(db, 3)
+            juror = await self._user(db, "juror1")
+            now = datetime.now(UTC)
+            # juror1 入门考试里考到过第一道（考完会公布答案）；第二道还没核对的时候他在练习场做过
+            db.add(
+                JuryExamAttempt(
+                    user_id=juror.id, started_at=now - timedelta(days=5), expires_at=now - timedelta(days=5), submitted_at=now - timedelta(days=5),
+                    question_ids=json.dumps([examined.id]), total=1, score=1, passed=True,
+                )
+            )
+            db.add(JuryPracticeAnswer(user_id=juror.id, case_id=practiced.id, vote="l2", correct=True, created_at=now - timedelta(days=3)))
+            await db.commit()
+            self.assertEqual(await jury_service._exam_question_ids(db, juror.id), {examined.id})
+
+            self.assertEqual(await self._forced_quality_check(db, "juror1"), fresh.id)
+            # 剩下两道他都见过答案：该出质控题也出不了
+            self.assertIsNone(await self._forced_quality_check(db, "juror1"))
+            # 别的委员不受影响，三道都会出
+            self.assertEqual({await self._forced_quality_check(db, "juror2") for _ in range(3)}, {examined.id, practiced.id, fresh.id})
+
+            # 考试抽题也把练习场做过的排到最后：题够的时候不会抽到
+            carol = await self._eligible_user(db, "carol")
+            db.add(JuryPracticeAnswer(user_id=carol.id, case_id=practiced.id, vote="l2", correct=True, created_at=now))
+            await db.commit()
+            with patch.object(exam_service, "EXAM_TOTAL", 2), patch.object(exam_service, "EXAM_PASS_SCORE", 1):
+                for _ in range(5):
+                    drawn = await exam_service._draw_questions(db, carol.id, [])
+                    self.assertEqual(set(drawn), {examined.id, fresh.id})
+
+    async def test_practice_next_runs_a_fixed_number_of_queries(self) -> None:
+        async with self.sessions() as db:
+            carol = await self._eligible_user(db, "carol")
+
+            async def add_questions(count: int) -> None:
+                for index in range(count):
+                    # 一部分题出自大型公开群：这种案件判断回避要看快照里的发言人
+                    await self._question(db, verified=False, source="legacy", conversation_id=self.plaza_id if index % 2 else None)
+
+            async def measure() -> tuple[int, dict]:
+                jury_settings.reset_cache()
+                with self._queries() as statements:
+                    page = await exam_service.practice_next(db, carol)
+                return len(statements), page
+
+            with patch.object(jury_service, "LARGE_GROUP_MEMBERS", 5):
+                await add_questions(4)
+                few, page = await measure()
+                self.assertEqual(page["round"], {"total": 4, "done": 0})
+                await add_questions(60)
+                many, page = await measure()
+                self.assertEqual(page["round"], {"total": 64, "done": 0})
+                self.assertIsNotNone(page["question"])
+            # 原来每道题要查三四次（回避关系、敏感类别），64 道题是两百多条
+            self.assertEqual(many, few)
+            self.assertLessEqual(many, 25)
+
+    async def test_sensitive_and_conflicting_questions_are_still_filtered_in_batch(self) -> None:
+        async with self.sessions() as db:
+            carol = await self._eligible_user(db, "carol")
+            plain = await self._question(db, verified=False)
+            own = await self._question(db, verified=False, reported_user_id=carol.id)
+            machine = await self._question(db, verified=False, machine_category="sexual")
+            # 举报理由是色情低俗的：靠批量查出来的举报理由判断
+            report = await self._report(db, "alice", "spam", "色情低俗")
+            reported = await db.get(ReportCase, report.case_id)
+            reported.status, reported.is_golden, reported.jury_block_reason, reported.closed_at = "resolved", True, None, datetime.now(UTC)
+            await db.commit()
+            self.assertEqual(await case_service.sensitive_case_ids(db, [plain, own, machine, reported]), {machine.id, reported.id})
+            self.assertTrue(await case_service.is_sensitive(db, reported))
+            self.assertFalse(await case_service.is_sensitive(db, plain))
+            page = await exam_service.practice_next(db, carol)
+            self.assertEqual((page["question"]["question_id"], page["round"]), (plain.id, {"total": 1, "done": 0}))
+
+
+# ---------------------------------------------------------------- 滚动上限的恢复时间
+
+
+class RollingLimitTests(Phase2TestCase):
+    async def _detail(self, awaitable) -> dict:
+        with self.assertRaises(HTTPException) as caught:
+            await awaitable
+        self.assertEqual(caught.exception.status_code, 429)
+        return caught.exception.detail
+
+    async def test_review_and_recusal_limits_say_when_the_next_slot_frees_up(self) -> None:
+        async with self.sessions() as db:
+            juror = await self._user(db, "juror1")
+            status = await jury_service.my_status(db, juror)
+            # 最近 24 小时没投过票、没回避过：没有恢复时间
+            self.assertEqual((status["voted_today"], status["daily_resets_at"], status["recuse_left_today"], status["recuse_resets_at"]), (0, None, 5, None))
+            # 不是委员的人两个都是 null
+            outsider = await jury_service.my_status(db, await self._user(db, "alice"))
+            self.assertEqual((outsider["daily_resets_at"], outsider["recuse_resets_at"]), (None, None))
+
+            now = datetime.now(UTC)
+            ages = {"stale": timedelta(hours=25), "oldest": timedelta(hours=23), "newest": timedelta(hours=1)}
+            for age in ages.values():
+                case = await self._question(db, is_golden=False, verified=False, source=None)
+                db.add(JuryVote(case_id=case.id, juror_id=juror.id, vote="l2", assigned_at=now - age, voted_at=now - age))
+            recused_case = await self._question(db, is_golden=False, verified=False, source=None)
+            db.add(JuryVote(case_id=recused_case.id, juror_id=juror.id, vote="recuse", assigned_at=now - timedelta(hours=20), recused_at=now - timedelta(hours=20)))
+            await db.commit()
+
+            status = await jury_service.my_status(db, juror)
+            # 下一个名额 = 窗口里最早那一票的时间 + 24 小时；25 小时前的那张已经不占名额
+            self.assertEqual((status["voted_today"], status["recuse_left_today"]), (2, 4))
+            self.assertEqual(status["daily_resets_at"], now - ages["oldest"] + timedelta(hours=24))
+            self.assertEqual(status["recuse_resets_at"], now + timedelta(hours=4))
+            read = JuryStatus(**status)
+            self.assertEqual((read.daily_resets_at, read.recuse_resets_at), (status["daily_resets_at"], status["recuse_resets_at"]))
+
+            await self._open_case(db)
+            with patch.object(jury_service, "DAILY_VOTE_LIMIT", 2):
+                detail = await self._detail(jury_service.next_case(db, juror))
+            self.assertEqual((detail["code"], detail["resets_at"]), ("jury_daily_limit", jury_service._iso(status["daily_resets_at"])))
+            self.assertTrue(detail["resets_at"].endswith("Z"))
+
+            view = await jury_service.next_case(db, juror)
+            with patch.object(jury_service, "RECUSE_DAILY_LIMIT", 1):
+                detail = await self._detail(jury_service.cast_vote(db, juror, view["case_id"], "recuse", None))
+            self.assertEqual((detail["code"], detail["resets_at"]), ("recuse_limit", jury_service._iso(status["recuse_resets_at"])))
+            # 没超限时照常回避；恢复时间仍然看窗口里最早的那一次
+            self.assertIsNone((await jury_service.cast_vote(db, juror, view["case_id"], "recuse", None))["case"])
+            self.assertEqual((await jury_service.my_status(db, juror))["recuse_resets_at"], status["recuse_resets_at"])
+
+    async def test_practice_limit_says_when_the_next_slot_frees_up(self) -> None:
+        async with self.sessions() as db:
+            carol = await self._eligible_user(db, "carol")
+            first, second = [await self._question(db, verified=False) for _ in range(2)]
+            page = await exam_service.practice_next(db, carol)
+            self.assertEqual((page["left_today"], page["resets_at"]), (20, None))
+            PracticeNext(**page)
+
+            now = datetime.now(UTC)
+            db.add(JuryPracticeAnswer(user_id=carol.id, case_id=first.id, vote="l2", correct=True, created_at=now - timedelta(hours=30)))
+            db.add(JuryPracticeAnswer(user_id=carol.id, case_id=first.id, vote="l2", correct=True, created_at=now - timedelta(hours=10)))
+            await db.commit()
+            page = await exam_service.practice_next(db, carol)
+            resets_at = now + timedelta(hours=14)
+            self.assertEqual((page["left_today"], page["resets_at"]), (19, resets_at))
+
+            result = await exam_service.practice_answer(db, carol, second.id, "l2")
+            self.assertEqual((result["left_today"], result["resets_at"]), (18, resets_at))
+            self.assertEqual(PracticeAnswerResult(**result).resets_at, resets_at)
+            with patch.object(exam_service, "PRACTICE_DAILY_LIMIT", 2):
+                page = await exam_service.practice_next(db, carol)
+                self.assertEqual((page["question"], page["left_today"], page["resets_at"]), (None, 0, resets_at))
+                detail = await self._detail(exam_service.practice_answer(db, carol, second.id, "l2"))
+            self.assertEqual((detail["code"], detail["resets_at"]), ("practice_daily_limit", jury_service._iso(resets_at)))
+
+
 # ---------------------------------------------------------------- 投票的变化
 
 
@@ -724,14 +957,17 @@ class VotingV2Tests(Phase2TestCase):
             case = await self._open_case(db)
             jurors = [await self._user(db, f"juror{index}") for index in range(1, 7)]
             for juror in jurors[:5]:
-                self.assertEqual((await jury_service.next_case(db, juror))["case_id"], case.id)
+                self.assertEqual(await self._real(db, (await jury_service.next_case(db, juror))["case_id"]), case.id)
             # 5 个席位都被占着
             self.assertIsNone(await jury_service.next_case(db, jurors[5]))
-            result = await jury_service.cast_vote(db, jurors[0], case.id, "recuse", "我认识这个人")
+            result = await jury_service.cast_vote(db, jurors[0], await self._rid(db, jurors[0], case.id), "recuse", "我认识这个人")
             JuryVoteResult(**result)
-            self.assertEqual((result["case_id"], result["settled"], result["case"], result["reward"]), (case.id, False, None, {"points": 0, "total": 0, "items": []}))
+            self.assertEqual(
+                (result["case_id"], result["settled"], result["case"], result["reward"]),
+                (await self._rid(db, jurors[0], case.id), False, None, {"points": 0, "total": 0, "items": []}),
+            )
             # 席位让出来了，案件改派给别人；回避的人不会再分到它
-            self.assertEqual((await jury_service.next_case(db, jurors[5]))["case_id"], case.id)
+            self.assertEqual(await self._real(db, (await jury_service.next_case(db, jurors[5]))["case_id"]), case.id)
             self.assertIsNone(await jury_service.next_case(db, jurors[0]))
             # 不计入总票数和当日评审数
             member = await self._member(db, "juror1")
@@ -739,16 +975,16 @@ class VotingV2Tests(Phase2TestCase):
             self.assertEqual((member.votes_total, status["voted_today"], status["recuse_left_today"], status["stats"]["votes_total"]), (0, 0, 4, 0))
             self.assertEqual((await jury_service.my_stats(db, jurors[0].id))["trend"][-1]["votes"], 0)
             # 回避之后不能看这个案件的详情和观点区，也不能反悔再投
-            self.assertEqual(await self._code(jury_service.case_detail(db, jurors[0].id, case.id)), (403, "not_voted"))
-            self.assertEqual(await self._code(opinion_service.list_opinions(db, jurors[0], case.id)), (403, "not_voted"))
-            self.assertEqual((await self._code(jury_service.cast_vote(db, jurors[0], case.id, "l2", None)))[0], 409)
-            self.assertEqual((await self._code(jury_service.cast_vote(db, jurors[0], case.id, "recuse", None)))[0], 409)
+            self.assertEqual(await self._code(jury_service.case_detail(db, jurors[0].id, await self._rid(db, jurors[0].id, case.id))), (403, "not_voted"))
+            self.assertEqual(await self._code(opinion_service.list_opinions(db, jurors[0], await self._rid(db, jurors[0], case.id))), (403, "not_voted"))
+            self.assertEqual((await self._code(jury_service.cast_vote(db, jurors[0], await self._rid(db, jurors[0], case.id), "l2", None)))[0], 409)
+            self.assertEqual((await self._code(jury_service.cast_vote(db, jurors[0], await self._rid(db, jurors[0], case.id), "recuse", None)))[0], 409)
 
             # 不计入表决、「到 7 票转出」和一致率：其余的人照常定案
             for juror in jurors[1:4]:
-                result = await jury_service.cast_vote(db, juror, case.id, "l2", None)
+                result = await jury_service.cast_vote(db, juror, await self._rid(db, juror, case.id), "l2", None)
             self.assertTrue(result["settled"])
-            detail = await jury_service.case_detail(db, jurors[1].id, case.id)
+            detail = await jury_service.case_detail(db, jurors[1].id, await self._rid(db, jurors[1].id, case.id))
             self.assertEqual((detail["tally"], detail["votes_cast"]), ({"none": 0, "l1": 0, "l2": 3, "l3": 0, "abstain": 0, "need_context": 0}, 3))
             await db.refresh(member)
             self.assertEqual((member.votes_settled, member.points), (0, 0))
@@ -756,14 +992,19 @@ class VotingV2Tests(Phase2TestCase):
             self.assertEqual((row.vote, row.voted_at, row.agreed, row.alias, row.note), ("recuse", None, None, None, "我认识这个人"))
             self.assertIsNotNone(row.recused_at)
 
-            # 即使打开了「已定案的观点区对所有在任委员只读」，回避过的人也进不去；没回避关系的别人可以
+            # 即使打开了「公示栏里的案件的观点区对在任委员只读」，回避过的人也进不去；没回避关系的别人可以
             await jury_settings.update_switches(db, self.ids["admin"], {"opinions_open_to_jurors": True})
-            self.assertEqual(await self._code(opinion_service.list_opinions(db, jurors[0], case.id)), (403, "not_voted"))
-            self.assertEqual((await opinion_service.list_opinions(db, await self._user(db, "lurker"), case.id))["total"], 0)
+            await self._age(db, case.id, case_service.PUBLISH_DELAY_HOURS + 1)
+            published = await overview_service.published_case(db, case.id)
+            self.assertEqual(await self._code(opinion_service.list_opinions(db, jurors[0], await self._rid(db, jurors[0], case.id))), (403, "not_voted"))
+            self.assertEqual(await self._code(opinion_service.list_public_opinions(db, jurors[0], published)), (403, "opinions_closed"))
+            self.assertEqual((await opinion_service.list_public_opinions(db, await self._user(db, "lurker"), published))["total"], 0)
             # 我的评审里列出回避的记录，但点不进去、不透露结论
             items, total = await jury_service.list_votes(db, jurors[0].id)
             item = JuryVoteItem(**items[0])
             self.assertEqual((total, item.vote, item.can_view, item.agreed, item.outcome, item.alias), (1, "recuse", False, None, None, None))
+            # 回避的记录不给公开编号（案件此刻在公示栏里），投了票的人有
+            self.assertEqual((item.public_case_id, (await jury_service.list_votes(db, jurors[1].id))[0][0]["public_case_id"]), (None, case.id))
             self.assertIsNotNone(item.voted_at)
             self.assertEqual((await jury_service.list_votes(db, jurors[0].id, votes=["recuse"]))[1], 1)
             self.assertEqual((await jury_service.list_votes(db, jurors[0].id, votes=["l2"]))[1], 0)
@@ -789,23 +1030,23 @@ class VotingV2Tests(Phase2TestCase):
             member = await self._member(db, "juror1")
             member.votes_since_quality = jury_service.QUALITY_MAX_GAP + 1
             await db.commit()
-            first = (await jury_service.next_case(db, juror))["case_id"]
+            first = await self._real(db, (await jury_service.next_case(db, juror))["case_id"])
             self.assertIn(first, questions)
-            self.assertIsNone((await jury_service.cast_vote(db, juror, first, "recuse", None))["case"])
+            self.assertIsNone((await jury_service.cast_vote(db, juror, await self._rid(db, juror, first), "recuse", None))["case"])
             await db.refresh(member)
             self.assertEqual((member.force_quality, member.golden_total, member.votes_total), (True, 0, 0))
             # 即使按随机位置这次不该出质控题，也要补一道
             member.votes_since_quality = 0
             await db.commit()
             with patch.object(jury_service, "_quality_roll", return_value=0.99):
-                second = (await jury_service.next_case(db, juror))["case_id"]
+                second = await self._real(db, (await jury_service.next_case(db, juror))["case_id"])
             self.assertEqual({first, second}, questions)
-            result = await jury_service.cast_vote(db, juror, second, "l2", None)
+            result = await jury_service.cast_vote(db, juror, await self._rid(db, juror, second), "l2", None)
             self.assertTrue(result["case"]["is_quality_check"])
             await db.refresh(member)
             self.assertEqual((member.force_quality, member.golden_total, member.votes_since_quality), (False, 1, 0))
             with patch.object(jury_service, "_quality_roll", return_value=0.99):
-                self.assertEqual((await jury_service.next_case(db, juror))["case_id"], normal.id)
+                self.assertEqual(await self._real(db, (await jury_service.next_case(db, juror))["case_id"]), normal.id)
 
     async def test_need_context_votes_escalate_the_case(self) -> None:
         async with self.sessions() as db:
@@ -836,7 +1077,7 @@ class VotingV2Tests(Phase2TestCase):
             await case_service.resolve_case(db, case.id, source="admin", actor_id=self.ids["admin"], upheld=True, category="harassment")
             await db.refresh(member)
             self.assertEqual((member.votes_settled, member.points), (0, 0))
-            detail = await jury_service.case_detail(db, juror2.id, case.id)
+            detail = await jury_service.case_detail(db, juror2.id, await self._rid(db, juror2.id, case.id))
             self.assertEqual((detail["my_vote"]["agreed"], detail["tally"]["need_context"], detail["votes_cast"]), (None, 2, 1))
             self.assertEqual((await self._member(db, "juror1")).votes_settled, 1)
             # 一张「上下文不足」不够转出
@@ -850,7 +1091,7 @@ class VotingV2Tests(Phase2TestCase):
         async with self.sessions() as db:
             majority = await self._open_case(db)
             view = await jury_service.next_case(db, await self._user(db, "juror1"))
-            self.assertEqual((view["case_id"], view["suggested_category"]), (majority.id, "harassment"))
+            self.assertEqual((await self._real(db, view["case_id"]), view["suggested_category"]), (majority.id, "harassment"))
             JuryCaseView(**view)
             for bad in ("sexual", "vulgar", "admin_action", "nonsense"):
                 self.assertEqual(await self._code(self._cast(db, "juror1", majority.id, "l2", category=bad)), (422, "invalid_category"))
@@ -888,7 +1129,7 @@ class VotingV2Tests(Phase2TestCase):
                 # 3 票、4 票一致都还不定案
                 self.assertEqual((result["settled"], result["case"]["stage"], result["case"]["verdict"]), (False, "jury", None))
             # 席位规则没变（5 个）：第 5 个人还能分到
-            self.assertEqual((await jury_service.next_case(db, await self._user(db, "juror5")))["case_id"], case.id)
+            self.assertEqual(await self._real(db, (await jury_service.next_case(db, await self._user(db, "juror5")))["case_id"]), case.id)
             self.assertTrue((await self._cast(db, "juror5", case.id, "l3"))["settled"])
             await db.refresh(case)
             self.assertEqual((case.status, case.verdict_level, case.jury_outcome), ("resolved", 3, "consensus"))
@@ -917,7 +1158,7 @@ class VotingV2Tests(Phase2TestCase):
                 with patch.object(jury_service, "_quality_roll", return_value=roll):
                     view = await jury_service.next_case(db, juror)
                 await jury_service.cast_vote(db, juror, view["case_id"], "l2", None)
-                return view["case_id"] in questions
+                return await self._real(db, view["case_id"]) in questions
 
             # 距上一道不到 2 张票：随机数再小也不出
             self.assertEqual([await take(0.0), await take(0.0)], [False, False])
@@ -1017,16 +1258,21 @@ class PointsTests(Phase2TestCase):
             self.assertEqual((last["settled"], last["reward"]["points"], last["reward"]["total"]), (True, 2, 12))
             changed = [(users, data) for event, users, data in events if event == "jury.points.changed"]
             self.assertEqual(sorted(users.copy().pop() for users, _data in changed), sorted(self.ids[name] for name in ("juror1", "juror2", "juror3")))
-            self.assertEqual({json.dumps(data, sort_keys=True, ensure_ascii=False) for _users, data in changed}, {
-                json.dumps({"delta": 10, "total": 12, "kind": "vote_agreed", "label": "与结论一致", "case_id": case.id}, sort_keys=True, ensure_ascii=False)
-            })
+            # 事件里的 case_id 是接收者自己的评审编号
+            self.assertEqual(
+                self._per_user(events, "jury.points.changed"),
+                {
+                    self.ids[name]: {"delta": 10, "total": 12, "kind": "vote_agreed", "label": "与结论一致", "case_id": await self._rid(db, name, case.id)}
+                    for name in ("juror1", "juror2", "juror3")
+                },
+            )
             juror = await self._user(db, "juror1")
             member = await self._member(db, "juror1")
             self.assertEqual((member.points, (await jury_service.my_status(db, juror))["points"]), (12, 12))
-            self.assertEqual((await jury_service.case_detail(db, juror.id, case.id))["my_vote"]["points"], 10)
+            self.assertEqual((await jury_service.case_detail(db, juror.id, await self._rid(db, juror.id, case.id)))["my_vote"]["points"], 10)
             page = JuryPointPage(**await points_service.list_points(db, juror.id))
             self.assertEqual((page.total, page.count, [(item.kind, item.label, item.points, item.case_id) for item in page.items]), (
-                12, 2, [("vote_agreed", "与结论一致", 10, case.id), ("daily_first", "今日首票", 2, None)],
+                12, 2, [("vote_agreed", "与结论一致", 10, await self._rid(db, juror, case.id)), ("daily_first", "今日首票", 2, None)],
             ))
             self.assertEqual(len((await points_service.list_points(db, juror.id, limit=1, offset=1))["items"]), 1)
             # 同一 (用户, kind, 案件) 不重复给：再结算一次没有变化
@@ -1055,9 +1301,11 @@ class PointsTests(Phase2TestCase):
             await db.refresh(member)
             self.assertEqual((member.points, (await self._member(db, "juror4")).points, (await self._member(db, "juror6")).points), (22, 5, 0))
             adjusts = {users.copy().pop(): data for event, users, data in events if event == "jury.points.changed"}
-            self.assertEqual(adjusts[juror.id], {"delta": 7, "total": 22, "kind": "overturn_adjust", "label": "改判补差", "case_id": split.id})
+            self.assertEqual(
+                adjusts[juror.id], {"delta": 7, "total": 22, "kind": "overturn_adjust", "label": "改判补差", "case_id": await self._rid(db, juror, split.id)}
+            )
             self.assertEqual(adjusts[self.ids["juror4"]]["delta"], -7)
-            self.assertEqual((await jury_service.case_detail(db, juror.id, split.id))["my_vote"]["points"], 10)
+            self.assertEqual((await jury_service.case_detail(db, juror.id, await self._rid(db, juror.id, split.id)))["my_vote"]["points"], 10)
             # 同一个案件可以被改判不止一次，每次都补
             await case_service.overturn_case(db, split.id, actor_id=self.ids["admin"], upheld=True, category="harassment", level=2, note="复核后维持原判")
             await db.refresh(member)
@@ -1081,7 +1329,7 @@ class PointsTests(Phase2TestCase):
             self.assertEqual(member.points, 0)
             # 随响应返回的部分不再重复发事件
             self.assertEqual([event for event, _users, _data in events if event == "jury.points.changed"], [])
-            self.assertEqual((await jury_service.case_detail(db, self.ids["juror1"], question.id))["my_vote"]["points"], -3)
+            self.assertEqual((await jury_service.case_detail(db, self.ids["juror1"], await self._rid(db, self.ids["juror1"], question.id)))["my_vote"]["points"], -3)
             again = await self._cast(db, "juror1", right.id, "l2", quality=True)
             self.assertEqual(again["reward"], {"points": 5, "total": 5, "items": [{"kind": "quality_correct", "points": 5, "label": "质控题答对"}]})
             member.points = 2
@@ -1150,7 +1398,7 @@ class PointsTests(Phase2TestCase):
                 await self._cast(db, name, case.id, "abstain")
             author = await self._member(db, "juror1")
             before = author.points
-            note_id = (await opinion_service.list_opinions(db, await self._user(db, "juror2"), case.id))["items"][0]["id"]
+            note_id = (await opinion_service.list_opinions(db, await self._user(db, "juror2"), await self._rid(db, await self._user(db, "juror2"), case.id)))["items"][0]["id"]
             likers = [await self._user(db, name) for name in ("juror2", "juror3", "juror4", "juror5")]
             with self._events() as events:
                 await opinion_service.set_like(db, likers[0], note_id, True)
@@ -1162,7 +1410,7 @@ class PointsTests(Phase2TestCase):
             await db.refresh(author)
             self.assertEqual(author.points, before + 5)
             self.assertEqual([data for event, users, data in events if event == "jury.points.changed" and users == {author.user_id}], [
-                {"delta": 5, "total": before + 5, "kind": "opinion_liked", "label": "观点获赞", "case_id": case.id}
+                {"delta": 5, "total": before + 5, "kind": "opinion_liked", "label": "观点获赞", "case_id": await self._rid(db, "juror1", case.id)}
             ])
             # 之后取消赞不扣，再点回来、更多人点也不再给
             await opinion_service.set_like(db, likers[2], note_id, False)
@@ -1404,7 +1652,7 @@ class TermTests(Phase2TestCase):
             self.assertGreater(status["term_ends_at"], now + timedelta(days=29))
             self.assertEqual([(event, users) for event, users, _data in events], [("jury.status.changed", {self.ids["juror1"]})])
             # 取案件时也一样
-            self.assertEqual((await jury_service.next_case(db, await self._user(db, "juror2")))["case_id"], case.id)
+            self.assertEqual(await self._real(db, (await jury_service.next_case(db, await self._user(db, "juror2")))["case_id"]), case.id)
             self.assertEqual(jury_service.member_state(await self._member(db, "juror2")), "active")
             self.assertEqual((await db.execute(select(func.count()).select_from(JuryNotification))).scalar_one(), 0)
 
@@ -1678,8 +1926,14 @@ class HttpPhase2Tests(Phase2TestCase):
         await super().asyncTearDown()
 
     async def test_phase_two_routes(self) -> None:
+        # 这里按线上默认的方式切题：已核对的题里编号能被 3 整除的只给练习场
+        splitter = patch.object(bank_service, "PRACTICE_EVERY", 3)
+        splitter.start()
+        self.addCleanup(splitter.stop)
         async with self.sessions() as db:
-            questions = await self._questions(db, 11)
+            questions = await self._questions(db, 16)
+            practice_ids = [case.id for case in questions if case.id % 3 == 0]
+            self.assertEqual(len(practice_ids), 5)
             private = await self._question(db, is_golden=False, verified=False, source=None, jury_eligible=False)
             first, second = await self._open_case(db), await self._open_case(db)
             await self._eligible_user(db, "carol")
@@ -1694,18 +1948,28 @@ class HttpPhase2Tests(Phase2TestCase):
         # 投票：回避、带类别、上下文不足
         with patch.object(jury_service, "_quality_roll", return_value=0.99):
             assigned = (await client.get("/jury/cases/next")).json()["case"]
-            self.assertEqual((assigned["case_id"], assigned["suggested_category"]), (first.id, "harassment"))
-            recused = (await client.post(f"/jury/cases/{first.id}/vote", json={"vote": "recuse"})).json()
-            self.assertEqual((recused["case"], recused["settled"], recused["reward"]["points"]), (None, False, 0))
-            self.assertEqual((await client.get(f"/jury/cases/{first.id}")).json()["detail"]["code"], "not_voted")
-            self.assertEqual((await client.get("/jury/cases/next")).json()["case"]["case_id"], second.id)
-            bad = await client.post(f"/jury/cases/{second.id}/vote", json={"vote": "l2", "category": "sexual"})
+            # 委员侧的编号是评审编号：先后两件的编号是连着的，和案件编号无关
+            first_id = assigned["case_id"]
+            self.assertEqual(assigned["suggested_category"], "harassment")
+            async with self.sessions() as db:
+                self.assertEqual(await self._real(db, first_id), first.id)
+            self.assertEqual((await client.post(f"/jury/cases/{first.id}/vote", json={"vote": "recuse"})).status_code, 404)
+            recused = (await client.post(f"/jury/cases/{first_id}/vote", json={"vote": "recuse"})).json()
+            self.assertEqual((recused["case_id"], recused["case"], recused["settled"], recused["reward"]["points"]), (first_id, None, False, 0))
+            self.assertEqual((await client.get(f"/jury/cases/{first_id}")).json()["detail"]["code"], "not_voted")
+            second_id = (await client.get("/jury/cases/next")).json()["case"]["case_id"]
+            self.assertEqual(second_id, first_id + 1)
+            bad = await client.post(f"/jury/cases/{second_id}/vote", json={"vote": "l2", "category": "sexual"})
             self.assertEqual((bad.status_code, bad.json()["detail"]["code"]), (422, "invalid_category"))
-            self.assertEqual((await client.post(f"/jury/cases/{second.id}/vote", json={"vote": "maybe"})).status_code, 422)
-            voted = (await client.post(f"/jury/cases/{second.id}/vote", json={"vote": "l2", "category": "advertising", "note": "是广告"})).json()
+            self.assertEqual((await client.post(f"/jury/cases/{second_id}/vote", json={"vote": "maybe"})).status_code, 422)
+            voted = (await client.post(f"/jury/cases/{second_id}/vote", json={"vote": "l2", "category": "advertising", "note": "是广告"})).json()
             self.assertEqual((voted["case"]["my_vote"]["category"], voted["case"]["my_vote"]["points"], voted["reward"]["items"][0]["kind"]), ("advertising", 0, "daily_first"))
         votes = (await client.get("/jury/votes?vote=recuse,need_context")).json()
-        self.assertEqual((votes["total"], votes["items"][0]["vote"], votes["items"][0]["can_view"]), (1, "recuse", False))
+        self.assertEqual((votes["total"], votes["items"][0]["vote"], votes["items"][0]["can_view"], votes["items"][0]["case_id"]), (1, "recuse", False, first_id))
+        # 按最近 24 小时滚动的上限：/jury/me 给出下一个名额什么时候释放
+        me = (await client.get("/jury/me")).json()
+        self.assertEqual((me["voted_today"], me["recuse_left_today"]), (1, 4))
+        self.assertTrue(me["daily_resets_at"].endswith("Z") and me["recuse_resets_at"].endswith("Z"))
         self.assertEqual((await client.get("/jury/votes")).json()["total"], 2)
         self.assertEqual((await client.get("/jury/votes?vote=bogus")).json()["detail"]["code"], "invalid_vote_filter")
 
@@ -1733,11 +1997,20 @@ class HttpPhase2Tests(Phase2TestCase):
 
         # 练习场：在任委员可以练
         practice = (await client.get("/jury/practice/next")).json()
-        self.assertEqual((practice["question"]["question_id"], practice["round"], practice["left_today"]), (questions[0].id, {"total": 11, "done": 0}, 20))
-        answered = await client.post(f"/jury/practice/{questions[0].id}/answer", json={"vote": "l2"})
+        self.assertEqual(
+            (practice["question"]["question_id"], practice["round"], practice["left_today"], practice["resets_at"]),
+            (practice_ids[0], {"total": 5, "done": 0}, 20, None),
+        )
+        self.assertTrue(practice["question"]["messages"] == [] or practice["question"]["messages"][0]["created_at"].endswith("Z"))
+        practiced = next(case for case in questions if case.id == practice_ids[0])
+        answered = await client.post(f"/jury/practice/{practiced.id}/answer", json={"vote": "l2" if practiced.status == "resolved" else "none"})
         self.assertEqual((answered.status_code, answered.json()["correct"], answered.json()["left_today"]), (200, True, 19))
-        self.assertEqual((await client.post(f"/jury/practice/{questions[0].id}/answer", json={"vote": "abstain"})).status_code, 422)
+        self.assertTrue(answered.json()["resets_at"].endswith("Z"))
+        self.assertEqual((await client.get("/jury/practice/next")).json()["resets_at"], answered.json()["resets_at"])
+        self.assertEqual((await client.post(f"/jury/practice/{practiced.id}/answer", json={"vote": "abstain"})).status_code, 422)
         self.assertEqual((await client.post("/jury/practice/999999/answer", json={"vote": "l2"})).status_code, 404)
+        # 用于考试和质控的题不在练习场里：拿它的题号来「练习」问不出答案
+        self.assertEqual((await client.post(f"/jury/practice/{questions[0].id}/answer", json={"vote": "l2"})).status_code, 404)
 
         # 入门考试：juror1 不满足四项资格；换一个满足的普通用户
         exam = (await client.get("/jury/exam")).json()
@@ -1748,6 +2021,9 @@ class HttpPhase2Tests(Phase2TestCase):
         self.assertEqual((started.status_code, len(started.json()["questions"])), (200, 10))
         self.assertNotIn("case_id", started.text)
         attempt_id = started.json()["attempt_id"]
+        async with self.sessions() as db:
+            drawn = set(json.loads((await db.get(JuryExamAttempt, attempt_id)).question_ids))
+        self.assertEqual(drawn & set(practice_ids), set())
         self.assertEqual((await client.get("/jury/exam")).json()["active"]["attempt_id"], attempt_id)
         invalid = await client.post(f"/jury/exam/{attempt_id}/submit", json={"answers": [{"question": 99, "vote": "l2"}]})
         self.assertEqual((invalid.status_code, invalid.json()["detail"]["code"]), (422, "invalid_answers"))
@@ -1765,12 +2041,18 @@ class HttpPhase2Tests(Phase2TestCase):
         # 后台
         self.acting = "admin"
         listed = (await client.get("/admin/jury/questions?verified=true&source=&q=&limit=50&offset=0")).json()
-        self.assertEqual((listed["total"], listed["items"][-1]["case_id"], listed["items"][-1]["answered"], listed["items"][-1]["correct_rate"]), (11, questions[0].id, 1, 1.0))
+        self.assertEqual((listed["total"], listed["items"][-1]["case_id"]), (16, questions[0].id))
+        by_id = {item["case_id"]: item for item in listed["items"]}
+        self.assertEqual((by_id[practiced.id]["answered"], by_id[practiced.id]["correct_rate"], by_id[practiced.id]["pool"]), (1, 1.0, "practice"))
+        self.assertEqual({item["case_id"] for item in listed["items"] if item["pool"] == "practice"}, set(practice_ids))
+        self.assertEqual(by_id[questions[0].id]["pool"], "scored")
         self.assertEqual((await client.get("/admin/jury/questions?source=consensus")).json()["total"], 0)
         detail = (await client.get(f"/admin/jury/questions/{questions[0].id}")).json()
         self.assertEqual((detail["case_id"], detail["verified"], detail["source"], detail["outcome"], detail["block_reason"]), (questions[0].id, True, "admin", "violation", None))
         updated = await client.put(f"/admin/jury/questions/{questions[0].id}", json={"explanation": "连续辱骂，不是玩笑", "verified": False})
         self.assertEqual((updated.status_code, updated.json()["explanation"], updated.json()["verified"], updated.json()["in_bank"]), (200, "连续辱骂，不是玩笑", False, True))
+        # 未核对的题只给练习场
+        self.assertEqual(updated.json()["pool"], "practice")
         rejected = await client.put(f"/admin/jury/questions/{private.id}", json={"in_bank": True})
         self.assertEqual((rejected.status_code, rejected.json()["detail"]["code"]), (422, "case_not_eligible"))
         self.assertEqual((await client.put(f"/admin/jury/questions/{questions[0].id}", json={"level": 9})).status_code, 422)

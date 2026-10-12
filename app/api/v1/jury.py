@@ -73,6 +73,8 @@ async def jury_overview(
 
 
 # 固定路径要声明在带参数的路径前面：/me/stats、/cases/next、/public/cases 都是。
+# /cases/... 路径里的 {case_id} 是评审编号（本人那条分配记录的 id），/public/cases/... 里的是案件的公开编号，
+# 两者不能互相代入，见 docs/jury-v2.md 1.0。
 @router.get("/me/stats", response_model=JuryMyStats)
 async def my_jury_stats(
     current_user: Annotated[User, Depends(get_current_user)],
@@ -205,6 +207,17 @@ async def public_jury_case(
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> PublicCaseDetail:
     return PublicCaseDetail(**await overview_service.public_case(db, case_id))
+
+
+@router.get("/public/cases/{case_id}/opinions", response_model=JuryOpinionPage)
+async def public_case_opinions(
+    case_id: int,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> JuryOpinionPage:
+    """公示栏里的案件的观点区，只读；case_id 是公开编号。只在 opinions_open_to_jurors 打开时对在任委员开放。"""
+    case = await overview_service.published_case(db, case_id)
+    return JuryOpinionPage(**await opinion_service.list_public_opinions(db, current_user, case))
 
 
 @router.get("/cases/next", response_model=JuryNextCase)

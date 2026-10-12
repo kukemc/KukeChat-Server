@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import random
 from collections import Counter
@@ -17,7 +18,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.models.case import JuryExamAttempt, JuryMember, JuryNotification, JuryOpinion, JuryVote, ReportCase
+from app.models.case import JuryExamAttempt, JuryMember, JuryNotification, JuryOpinion, JuryPracticeAnswer, JuryVote, ReportCase
 from app.models.conversation import Conversation, ConversationMember
 from app.models.enums import ConversationType, UserStatus
 from app.models.friend import Friendship
@@ -205,6 +206,20 @@ def _iso(moment: datetime) -> str:
     return moment.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
+def snapshot_time(value: Any) -> str | None:
+    """快照里的时间是当时直接 isoformat() 存下来的字符串，不带时区后缀，实际是 UTC。
+
+    输出时统一成带 Z 的 ISO 字符串；本来就带时区的换算到 UTC，认不出来的原样返回。
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        moment = datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith(("Z", "z")) else value)
+    except ValueError:
+        return value
+    return _iso(penalty_service.aware(moment))
+
+
 async def ensure_term(db: AsyncSession, member: JuryMember | None, user: User | None = None, now: datetime | None = None) -> bool:
     """任期届满时的处理：没有违规记录就自动续任，否则保持 expired 并通知一次。
 
@@ -279,6 +294,26 @@ async def _recuses_since(db: AsyncSession, juror_id: int, since: datetime) -> in
     return int(result.scalar_one() or 0)
 
 
+ROLLING_WINDOW = timedelta(hours=24)
+
+
+async def rolling_resets_at(db: AsyncSession, column: Any, *clauses: Any, now: datetime) -> datetime | None:
+    """按最近 24 小时滚动的上限，下一个名额什么时候释放：窗口里最早那一条的时间 + 24 小时；窗口里没有则为 None。
+
+    评审上限、回避上限、练习上限都是这个口径（不在零点恢复）。column 是计数用的那个时间列。
+    """
+    oldest = penalty_service.aware((await db.execute(select(func.min(column)).where(*clauses, column >= now - ROLLING_WINDOW))).scalar_one_or_none())
+    return oldest + ROLLING_WINDOW if oldest is not None else None
+
+
+async def _daily_resets_at(db: AsyncSession, juror_id: int, now: datetime) -> datetime | None:
+    return await rolling_resets_at(db, JuryVote.voted_at, JuryVote.juror_id == juror_id, now=now)
+
+
+async def _recuse_resets_at(db: AsyncSession, juror_id: int, now: datetime) -> datetime | None:
+    return await rolling_resets_at(db, JuryVote.recused_at, JuryVote.juror_id == juror_id, now=now)
+
+
 def _suspend_warning(member: JuryMember) -> dict[str, Any] | None:
     """一致率或质控正确率接近或低于自动暂停线时给一条提醒；两项都触发时给离线更近（或跌得更深）的那一项。"""
     candidates: list[tuple[float, int, str]] = []
@@ -350,6 +385,8 @@ async def my_status(db: AsyncSession, user: User) -> dict[str, Any]:
         "stats": member_stats(member) if member else None,
         "daily_limit": DAILY_VOTE_LIMIT,
         "voted_today": voted_today,
+        # 评审上限按最近 24 小时滚动：下一个名额什么时候释放；最近 24 小时没投过票为 null
+        "daily_resets_at": await _daily_resets_at(db, user.id, now) if member is not None else None,
         "tier": member.tier if member is not None and serving else None,
         "available_cases": await available_cases(db, user, voted_today=voted_today) if serving else None,
         # 有值时评审、发观点、点赞都会被拒绝（juror_restricted）；不是在任委员恒为 null
@@ -362,6 +399,8 @@ async def my_status(db: AsyncSession, user: User) -> dict[str, Any]:
         "warnings": await _warnings(db, member) if member is not None and serving else [],
         "cooldown_until": cooldown_until,
         "recuse_left_today": max(0, RECUSE_DAILY_LIMIT - await _recuses_since(db, user.id, now - timedelta(hours=24))) if serving else None,
+        # 回避上限同样按最近 24 小时滚动；最近 24 小时没回避过为 null
+        "recuse_resets_at": await _recuse_resets_at(db, user.id, now) if serving else None,
     }
 
 
@@ -536,20 +575,21 @@ async def _notify_member(user_id: int) -> None:
 
 
 async def notify_case_voters(db: AsyncSession, case_id: int, event_type: str, data: dict[str, Any], *, exclude: int | None = None) -> None:
-    """给这个案件投过票的委员发事件（质控题的作答者不算）。发不出去只记日志，不影响主流程。"""
+    """给这个案件投过票的委员发事件（质控题的作答者不算）。发不出去只记日志，不影响主流程。
+
+    case_id 是案件的真实编号；每个人收到的 data.case_id 是他自己的评审编号，所以逐个发（一个案件最多七个人）。
+    """
     from app.websocket.manager import manager
 
     try:
-        juror_ids = set(
-            (
-                await db.execute(
-                    select(JuryVote.juror_id).where(JuryVote.case_id == case_id, JuryVote.voted_at.is_not(None), JuryVote.is_quality_check.is_(False))
-                )
-            ).scalars().all()
+        rows = await db.execute(
+            select(JuryVote.juror_id, JuryVote.id).where(
+                JuryVote.case_id == case_id, JuryVote.voted_at.is_not(None), JuryVote.is_quality_check.is_(False)
+            )
         )
-        juror_ids.discard(exclude)
-        if juror_ids:
-            await manager.send_to_users(juror_ids, event_type, data)
+        for juror_id, review_id in rows.all():
+            if juror_id != exclude:
+                await manager.send_to_user(juror_id, event_type, {**data, "case_id": review_id})
     except Exception:
         logger.exception("Failed to notify case voters", extra={"case_id": case_id, "event": event_type})
 
@@ -591,7 +631,46 @@ async def _conflict_context(db: AsyncSession, juror_id: int) -> dict[str, Any]:
         "reported": set(reported.scalars().all()),
         # conversation_id -> 是不是大型公开群
         "large_groups": {},
+        # case_id -> 快照里的发言人；只有 _prefetch_conflicts 预取过的才在里面
+        "speakers": {},
     }
+
+
+def _speaker_ids(snapshot: dict[str, Any]) -> set[Any]:
+    return {item.get("sender_id") for item in snapshot.get("messages") or [] if isinstance(item, dict)}
+
+
+async def _prefetch_conflicts(db: AsyncSession, context: dict[str, Any], cases: list[ReportCase]) -> None:
+    """把一批案件判断回避要用到的东西一次查出来放进 context，之后 _has_conflict 不再逐个案件查库。
+
+    三类查询（哪些是公开群、它们的成员数、大型公开群里那些案件的快照，快照按批取），不随案件数逐个增加。
+    """
+    cache: dict[int, bool] = context["large_groups"]
+    conversation_ids = {case.conversation_id for case in cases if case.conversation_id is not None} - set(cache)
+    if conversation_ids:
+        open_groups = set(
+            (
+                await db.execute(
+                    select(Conversation.id).where(
+                        Conversation.id.in_(conversation_ids), Conversation.type == ConversationType.GROUP, Conversation.join_mode == "open"
+                    )
+                )
+            ).scalars().all()
+        )
+        counts: dict[int, int] = {}
+        if open_groups:
+            rows = await db.execute(
+                select(ConversationMember.conversation_id, func.count())
+                .where(ConversationMember.conversation_id.in_(open_groups))
+                .group_by(ConversationMember.conversation_id)
+            )
+            counts = {conversation_id: int(count) for conversation_id, count in rows.all()}
+        for conversation_id in conversation_ids:
+            cache[conversation_id] = conversation_id in open_groups and counts.get(conversation_id, 0) >= LARGE_GROUP_MEMBERS
+    in_large = [case for case in cases if case.conversation_id is not None and cache.get(case.conversation_id) and case.id not in context["speakers"]]
+    if in_large:
+        for case_id, snapshot in (await case_service.case_snapshots(db, in_large)).items():
+            context["speakers"][case_id] = _speaker_ids(snapshot)
 
 
 async def _is_large_open_group(db: AsyncSession, conversation_id: int, cache: dict[int, bool]) -> bool:
@@ -608,8 +687,7 @@ async def _is_large_open_group(db: AsyncSession, conversation_id: int, cache: di
 
 
 async def _snapshot_speakers(db: AsyncSession, case: ReportCase) -> set[Any]:
-    snapshot = await case_service.case_snapshot(db, case)
-    return {item.get("sender_id") for item in snapshot.get("messages") or [] if isinstance(item, dict)}
+    return _speaker_ids(await case_service.case_snapshot(db, case))
 
 
 async def _has_conflict(db: AsyncSession, juror_id: int, case: ReportCase, context: dict[str, Any] | None = None) -> bool:
@@ -626,7 +704,8 @@ async def _has_conflict(db: AsyncSession, juror_id: int, case: ReportCase, conte
     if case.conversation_id is None:
         return False
     if await _is_large_open_group(db, case.conversation_id, context["large_groups"]):
-        return juror_id in await _snapshot_speakers(db, case)
+        speakers = context["speakers"].get(case.id)
+        return juror_id in (speakers if speakers is not None else await _snapshot_speakers(db, case))
     return case.conversation_id in context["conversations"]
 
 
@@ -639,11 +718,16 @@ async def _assignable_cases(db: AsyncSession, juror_id: int, *, golden: bool, li
     seen = select(JuryVote.case_id).where(JuryVote.juror_id == juror_id)
     stmt = select(ReportCase.id).where(ReportCase.jury_eligible.is_(True), ReportCase.jury_block_reason.is_(None), ReportCase.id.not_in(seen))
     if golden:
-        # 评审中的质控题只出已核对的。
-        stmt = stmt.where(ReportCase.is_golden.is_(True), ReportCase.golden_verified.is_(True), ReportCase.status != "open").order_by(func.random())
+        # 评审中的质控题只出已核对、且不在练习场那一份里的题；这位委员在练习场做过的（当时还没核对）也不出 —— 他看过标准答案。
+        practiced = select(JuryPracticeAnswer.case_id).where(JuryPracticeAnswer.user_id == juror_id)
+        stmt = stmt.where(*bank_service.bank_clauses(pool="scored"), ReportCase.id.not_in(practiced)).order_by(func.random())
     else:
         stmt = stmt.where(ReportCase.status == "open", ReportCase.queue == "jury").order_by(ReportCase.priority.desc(), ReportCase.id.asc())
     case_ids = list((await db.execute(stmt.limit(PICK_SCAN_LIMIT))).scalars().all())
+    if golden and case_ids:
+        # 入门考试里见过的题也不出：考完会公布每道题的标准答案。
+        examined = await _exam_question_ids(db, juror_id)
+        case_ids = [case_id for case_id in case_ids if case_id not in examined]
     context = await _conflict_context(db, juror_id)
     fresh_after = now - timedelta(hours=ASSIGNMENT_TTL_HOURS)
     group_content = await jury_settings.is_enabled(db, "public_group_content") if golden else False
@@ -678,6 +762,18 @@ async def _assignable_cases(db: AsyncSession, juror_id: int, *, golden: bool, li
             if len(found) >= limit:
                 return found
     return found
+
+
+async def _exam_question_ids(db: AsyncSession, user_id: int) -> set[int]:
+    """这个人在入门考试里见过的题（案件 id）。场次里记了题目列表。"""
+    rows = await db.execute(select(JuryExamAttempt.question_ids).where(JuryExamAttempt.user_id == user_id))
+    seen: set[int] = set()
+    for text in rows.scalars().all():
+        try:
+            seen.update(int(case_id) for case_id in json.loads(text or "[]"))
+        except (TypeError, ValueError):
+            continue
+    return seen
 
 
 async def _pick_case(db: AsyncSession, juror_id: int, *, golden: bool) -> ReportCase | None:
@@ -756,9 +852,14 @@ async def next_case(db: AsyncSession, user: User) -> dict[str, Any] | None:
             },
         )
     if await _votes_since(db, user.id, now - timedelta(hours=24)) >= DAILY_VOTE_LIMIT:
+        resets_at = await _daily_resets_at(db, user.id, now)
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail={"code": "jury_daily_limit", "message": f"今天的评审数量已达上限（{DAILY_VOTE_LIMIT} 件），明天再来"},
+            detail={
+                "code": "jury_daily_limit",
+                "message": f"今天的评审数量已达上限（{DAILY_VOTE_LIMIT} 件），明天再来",
+                "resets_at": _iso(resets_at) if resets_at is not None else None,
+            },
         )
     pending = (
         await db.execute(
@@ -819,7 +920,7 @@ def _anonymize_messages(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
                 # 已撤回的上下文消息不展示内容；被举报的那条始终展示，否则没法评审。
                 "content": item.get("content") if (item.get("is_target") or not item.get("recalled_at")) else None,
                 "images": images,
-                "created_at": item.get("created_at"),
+                "created_at": snapshot_time(item.get("created_at")),
                 "offset": index - target_index,
             }
         )
@@ -829,11 +930,15 @@ def _anonymize_messages(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
 async def juror_case_view(
     db: AsyncSession, case: ReportCase, assignment: JuryVote | None = None, *, with_content: bool = True
 ) -> dict[str, Any]:
-    """委员看到的案件：匿名化的内容和举报理由分布，不含任何身份信息。"""
+    """委员看到的案件：匿名化的内容和举报理由分布，不含任何身份信息。
+
+    case_id 是这位委员的评审编号（分配记录的 id），不是案件的真实编号 —— 见 docs/jury-v2.md 1.0。
+    没有分配记录的调用方（考试、练习、后台题库）只用内容字段，case_id 为 None。
+    """
     reasons = await db.execute(select(UserReport.reason, func.count()).where(UserReport.case_id == case.id).group_by(UserReport.reason))
     suggested = case_service.reason_category(case.primary_reason)
     view: dict[str, Any] = {
-        "case_id": case.id,
+        "case_id": assignment.id if assignment is not None else None,
         "kind": case.target_type,
         "reasons": [{"reason": reason, "count": int(count)} for reason, count in reasons.all()],
         "report_count": case.report_count,
@@ -856,7 +961,7 @@ async def juror_case_view(
         view["post"] = {
             "content": post.get("content"),
             "image_urls": [url for url in post.get("image_urls") or [] if isinstance(url, str)],
-            "created_at": post.get("created_at"),
+            "created_at": snapshot_time(post.get("created_at")),
         }
     return view
 
@@ -989,7 +1094,7 @@ async def _next_alias(db: AsyncSession, case_id: int) -> str:
 async def _vote_result(
     db: AsyncSession,
     user: User,
-    case_id: int,
+    assignment: JuryVote,
     *,
     settled: bool,
     member: JuryMember,
@@ -998,13 +1103,12 @@ async def _vote_result(
 ) -> dict[str, Any]:
     await points_service.flush_events(db)
     if opinion is not None:
-        await notify_case_voters(
-            db, case_id, "jury.opinion.created", {"case_id": case_id, "opinion_id": opinion.id, "parent_id": None}, exclude=user.id
-        )
+        await notify_case_voters(db, assignment.case_id, "jury.opinion.created", {"opinion_id": opinion.id, "parent_id": None}, exclude=user.id)
     return {
-        "case_id": case_id,
+        # 评审编号，和请求里的一样
+        "case_id": assignment.id,
         "settled": settled,
-        "case": await case_detail(db, user.id, case_id),
+        "case": await case_detail(db, user.id, assignment.id),
         # 只含当场结算的部分；案件定案时的加分走 jury.points.changed 事件
         "reward": points_service.reward_view(member, rewards),
     }
@@ -1047,9 +1151,14 @@ async def _apply_abstain_cooldown(db: AsyncSession, member: JuryMember, now: dat
 async def _recuse(db: AsyncSession, user: User, member: JuryMember, assignment: JuryVote, note: str | None, now: datetime) -> dict[str, Any]:
     """主动回避：这次分配作废，案件改派给别人。不算投票，之后也看不了这个案件。"""
     if await _recuses_since(db, user.id, now - timedelta(hours=24)) >= RECUSE_DAILY_LIMIT:
+        resets_at = await _recuse_resets_at(db, user.id, now)
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail={"code": "recuse_limit", "message": f"今天的回避次数已用完（每天 {RECUSE_DAILY_LIMIT} 次）"},
+            detail={
+                "code": "recuse_limit",
+                "message": f"今天的回避次数已用完（每天 {RECUSE_DAILY_LIMIT} 次）",
+                "resets_at": _iso(resets_at) if resets_at is not None else None,
+            },
         )
     assignment.vote = "recuse"
     assignment.note = note
@@ -1058,26 +1167,22 @@ async def _recuse(db: AsyncSession, user: User, member: JuryMember, assignment: 
         # 质控题不能靠回避躲掉：下一件补一道。
         member.force_quality = True
     await db.commit()
-    return {"case_id": assignment.case_id, "settled": False, "case": None, "reward": points_service.reward_view(member, [])}
+    return {"case_id": assignment.id, "settled": False, "case": None, "reward": points_service.reward_view(member, [])}
 
 
-async def cast_vote(db: AsyncSession, user: User, case_id: int, vote: str, note: str | None, category: str | None = None) -> dict[str, Any]:
+async def cast_vote(db: AsyncSession, user: User, review_id: int, vote: str, note: str | None, category: str | None = None) -> dict[str, Any]:
+    """投票。review_id 是评审编号（GET /jury/cases/next 给的 case_id），不是案件的真实编号。"""
     if vote not in VOTES:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Unknown vote")
     category = _vote_category(vote, category)
     member = await _require_serving(db, user)
-    assignment = (
-        await db.execute(select(JuryVote).where(JuryVote.case_id == case_id, JuryVote.juror_id == user.id))
-    ).scalar_one_or_none()
-    if assignment is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="这个案件没有分配给你")
+    # 老接口的错误是字符串，保持原样
+    case, assignment = await resolve_review(db, user.id, review_id, detail="这个案件没有分配给你")
     if assignment.voted_at is not None:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="你已经投过票了")
     if assignment.recused_at is not None:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="你已经回避了这个案件")
-    case = await db.get(ReportCase, case_id)
-    if case is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Case not found")
+    case_id = case.id
     now = datetime.now(UTC)
     text = note.strip()[:500] if note else None
     if vote == "recuse":
@@ -1105,7 +1210,7 @@ async def cast_vote(db: AsyncSession, user: User, case_id: int, vote: str, note:
             await points_service.check_achievements(db, user.id, member)
         await db.commit()
         points_service.reset_leaderboard_cache()
-        return await _vote_result(db, user, case_id, settled=False, member=member, rewards=rewards)
+        return await _vote_result(db, user, assignment, settled=False, member=member, rewards=rewards)
 
     member.votes_since_quality = (member.votes_since_quality or 0) + 1
     assignment.alias = await _next_alias(db, case_id)
@@ -1126,7 +1231,7 @@ async def cast_vote(db: AsyncSession, user: User, case_id: int, vote: str, note:
         if case.status != "open":
             await _settle_votes(db, case, case.status == "resolved")
         await db.commit()
-        return await _vote_result(db, user, case_id, settled=False, member=member, rewards=rewards, opinion=opinion)
+        return await _vote_result(db, user, assignment, settled=False, member=member, rewards=rewards, opinion=opinion)
 
     rows = [
         (item_vote, item_category)
@@ -1145,13 +1250,13 @@ async def cast_vote(db: AsyncSession, user: User, case_id: int, vote: str, note:
     result = None if escalation else tally(votes)
     if escalation is None and result is None:
         await db.commit()
-        return await _vote_result(db, user, case_id, settled=False, member=member, rewards=rewards, opinion=opinion)
+        return await _vote_result(db, user, assignment, settled=False, member=member, rewards=rewards, opinion=opinion)
     if escalation is not None or result[0] == "escalate":
         await case_service.escalate_from_jury(db, case, now, escalation or "no_consensus")
         await db.commit()
         await case_service._broadcast_admin(case, "escalated")
         await case_service.notify_jury_queue_changed(db)
-        return await _vote_result(db, user, case_id, settled=False, member=member, rewards=rewards, opinion=opinion)
+        return await _vote_result(db, user, assignment, settled=False, member=member, rewards=rewards, opinion=opinion)
     outcome, level = result
     upheld = outcome == "violation"
     await _settle_votes(db, case, upheld)
@@ -1165,7 +1270,7 @@ async def cast_vote(db: AsyncSession, user: User, case_id: int, vote: str, note:
         level=level,
         note="风纪委员评审认定违规" if upheld else "风纪委员评审认定不违规",
     )
-    return await _vote_result(db, user, case_id, settled=True, member=member, rewards=rewards, opinion=opinion)
+    return await _vote_result(db, user, assignment, settled=True, member=member, rewards=rewards, opinion=opinion)
 
 
 async def settle_after_admin(db: AsyncSession, case: ReportCase) -> None:
@@ -1181,8 +1286,30 @@ def _not_voted() -> HTTPException:
     return HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail={"code": "not_voted", "message": "投票之后才能查看这个案件"})
 
 
+def _review_not_found(detail: Any = None) -> HTTPException:
+    return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=detail or {"code": "case_not_found", "message": "案件不存在"})
+
+
+async def resolve_review(db: AsyncSession, user_id: int, review_id: int, *, detail: Any = None) -> tuple[ReportCase, JuryVote]:
+    """评审编号 -> (案件, 本人的那条分配记录)。docs/jury-v2.md 1.0。
+
+    委员侧接口的路径参数都走这里：只认「这条 jury_votes 行存在、并且是本人的」，其余一律 404。
+    不回退去按案件的真实编号查 —— 那样质控题（早就结案的旧案件）就能从编号大小、或者去公示栏查一下认出来。
+    """
+    assignment = await db.get(JuryVote, review_id)
+    if assignment is None or assignment.juror_id != user_id:
+        raise _review_not_found(detail)
+    case = await db.get(ReportCase, assignment.case_id)
+    if case is None:
+        raise _review_not_found(detail)
+    return case, assignment
+
+
 async def my_vote(db: AsyncSession, user_id: int, case_id: int) -> JuryVote | None:
-    """这个人对这个案件投出的票；只分到手还没投的不算。"""
+    """这个人对这个案件投出的票；只分到手还没投的不算。
+
+    case_id 是案件的真实编号，只给服务端内部用（比如从一条观点找回它所在的案件）；用户传进来的编号走 resolve_review。
+    """
     result = await db.execute(select(JuryVote).where(JuryVote.case_id == case_id, JuryVote.juror_id == user_id, JuryVote.voted_at.is_not(None)))
     return result.scalar_one_or_none()
 
@@ -1195,12 +1322,10 @@ async def has_recused(db: AsyncSession, user_id: int, case_id: int) -> bool:
     return result.scalar_one_or_none() is not None
 
 
-async def require_voted(db: AsyncSession, user_id: int, case_id: int) -> tuple[ReportCase, JuryVote]:
-    case = await db.get(ReportCase, case_id)
-    if case is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"code": "case_not_found", "message": "案件不存在"})
-    vote = await my_vote(db, user_id, case_id)
-    if vote is None:
+async def require_voted(db: AsyncSession, user_id: int, review_id: int) -> tuple[ReportCase, JuryVote]:
+    """按评审编号取案件，并要求已经投过票：分到手还没投的、主动回避的都是 403 not_voted。"""
+    case, vote = await resolve_review(db, user_id, review_id)
+    if vote.voted_at is None:
         raise _not_voted()
     return case, vote
 
@@ -1282,9 +1407,9 @@ async def opinion_counts(db: AsyncSession, case_ids: list[int]) -> dict[int, int
     return {case_id: int(count) for case_id, count in rows.all()}
 
 
-async def case_detail(db: AsyncSession, user_id: int, case_id: int) -> dict[str, Any]:
-    """投票之后看到的案件：自己的票、进度，定案后才有票数分布和结论。"""
-    case, vote = await require_voted(db, user_id, case_id)
+async def case_detail(db: AsyncSession, user_id: int, review_id: int) -> dict[str, Any]:
+    """投票之后看到的案件：自己的票、进度，定案后才有票数分布和结论。review_id 是评审编号。"""
+    case, vote = await require_voted(db, user_id, review_id)
     closed = case.status != "open"
     quality_check = vote.is_quality_check
     available = True
@@ -1295,6 +1420,7 @@ async def case_detail(db: AsyncSession, user_id: int, case_id: int) -> dict[str,
     counts = (await vote_tallies(db, [case.id]))[case.id]
     return {
         **await juror_case_view(db, case, with_content=available),
+        "case_id": vote.id,
         "content_available": available,
         "my_vote": {
             "vote": vote.vote,
@@ -1315,6 +1441,8 @@ async def case_detail(db: AsyncSession, user_id: int, case_id: int) -> dict[str,
         "is_quality_check": quality_check,
         "opinions_enabled": not quality_check,
         "opinion_count": 0 if quality_check else (await opinion_counts(db, [case.id])).get(case.id, 0),
+        # 案件此刻在公示栏里时是它的公开编号；质控题恒为 null，否则等于把真实编号还了回去
+        "public_case_id": case.id if not quality_check and await case_service.published_case_ids(db, [case.id]) else None,
     }
 
 
@@ -1330,7 +1458,8 @@ async def history(db: AsyncSession, juror_id: int, limit: int = 50) -> list[dict
     for vote, case in rows.all():
         items.append(
             {
-                "case_id": case.id,
+                # 评审编号
+                "case_id": vote.id,
                 "kind": case.target_type,
                 "vote": vote.vote,
                 "voted_at": penalty_service.aware(vote.voted_at),
@@ -1383,7 +1512,9 @@ async def list_votes(
             .limit(limit)
         )
     ).all()
-    opinions = await opinion_counts(db, [case.id for vote, case in rows if not vote.is_quality_check and vote.recused_at is None])
+    viewable = [case.id for vote, case in rows if not vote.is_quality_check and vote.recused_at is None]
+    opinions = await opinion_counts(db, viewable)
+    published = await case_service.published_case_ids(db, [case.id for vote, case in rows if case.publishable and case.id in viewable])
     items: list[dict[str, Any]] = []
     for vote, case in rows:
         recused = vote.recused_at is not None
@@ -1391,7 +1522,8 @@ async def list_votes(
         closed = case.status != "open" and not recused
         items.append(
             {
-                "case_id": case.id,
+                # 评审编号
+                "case_id": vote.id,
                 "kind": case.target_type,
                 "primary_reason": case.primary_reason,
                 "vote": vote.vote,
@@ -1408,6 +1540,8 @@ async def list_votes(
                 "opinion_count": 0 if vote.is_quality_check or recused else opinions.get(case.id, 0),
                 # 回避的记录点不进详情
                 "can_view": not recused,
+                # 此刻在公示栏里的案件才有；质控题和回避的记录恒为 null
+                "public_case_id": case.id if case.id in published and not vote.is_quality_check and not recused else None,
             }
         )
     return items, total
@@ -1470,7 +1604,18 @@ async def my_stats(db: AsyncSession, user_id: int) -> dict[str, Any]:
 async def list_members(
     db: AsyncSession, status_filter: str | None, limit: int, offset: int, user_id: int | None = None
 ) -> tuple[list[dict[str, Any]], int]:
-    clauses = [JuryMember.status == status_filter] if status_filter else []
+    """后台的成员列表。status 和本人在 /jury/me 看到的一致：任期届满没能续任的是 expired，不是 active。"""
+    # 先把届满的处理掉（条件满足的自动续任），和本人打开 /jury/me 时做的是同一件事。
+    await renew_expired_terms(db)
+    now = datetime.now(UTC)
+    expired = (JuryMember.status == "active") & JuryMember.term_ends_at.is_not(None) & (JuryMember.term_ends_at <= now)
+    clauses: list[Any] = []
+    if status_filter == "expired":
+        clauses.append(expired)
+    elif status_filter == "active":
+        clauses.extend([JuryMember.status == "active", ~expired])
+    elif status_filter:
+        clauses.append(JuryMember.status == status_filter)
     if user_id is not None:
         clauses.append(JuryMember.user_id == user_id)
     total = int((await db.execute(select(func.count(JuryMember.id)).where(*clauses))).scalar_one() or 0)
@@ -1515,7 +1660,6 @@ async def list_members(
             exam["score"] = attempt.score or 0
             if attempt.passed:
                 exam["passed_at"] = penalty_service.aware(attempt.submitted_at)
-    now = datetime.now(UTC)
     items: list[dict[str, Any]] = []
     for member, user in members:
         votes_total = member.votes_total or 0
@@ -1525,7 +1669,7 @@ async def list_members(
             {
                 "user_id": member.user_id,
                 "user": user,
-                "status": member.status,
+                "status": member_state(member, now),
                 "statement": member.statement,
                 "applied_at": penalty_service.aware(member.applied_at),
                 "reviewed_at": penalty_service.aware(member.reviewed_at),

@@ -22,7 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
 from app.models.case import JuryMember, JuryVote, ReportCase
-from app.models.conversation import Conversation, ConversationMember
+from app.models.conversation import Conversation
 from app.models.enums import ConversationType, ModerationSource, ModerationStatus, PostVisibility, ReportStatus, ReportTargetType
 from app.models.message import Message
 from app.models.penalty import UserViolation
@@ -56,6 +56,8 @@ HIDDEN_CONTENT_CATEGORIES = {"privacy", "sexual", "minor_sexual", "vulgar", "sug
 # 结论来自这些来源、且有委员真实投过票的案件才可能进公示栏（机器自动结案的不进）。
 PUBLISHABLE_SOURCES = {"jury", "panel", "admin"}
 QUEUE_EVENT_INTERVAL_SECONDS = 30.0
+# 按案件批量查东西时一批多少个：一条查询里的绑定参数要留在老版本 SQLite 的 999 个以内
+LOOKUP_BATCH = 200
 
 _last_queue_event_at: float | None = None
 _jury_sweep_task: asyncio.Task[None] | None = None
@@ -181,29 +183,53 @@ async def _jury_eligible(db: AsyncSession, report: UserReport) -> bool:
 
 async def is_sensitive(db: AsyncSession, case: ReportCase) -> bool:
     """色情低俗 / 涉未成年类：任意一条举报选了这个理由，或机器把内容判到了这两类。"""
-    reported = await db.execute(select(UserReport.id).where(UserReport.case_id == case.id, UserReport.reason.in_(SENSITIVE_REASONS)).limit(1))
-    if reported.scalar_one_or_none() is not None or case.machine_category in SENSITIVE_MACHINE_CATEGORIES:
-        return True
+    return case.id in await sensitive_case_ids(db, [case])
+
+
+async def sensitive_case_ids(db: AsyncSession, cases: list[ReportCase]) -> set[int]:
+    """is_sensitive 的批量版：一批案件里属于敏感类别的那些。
+
+    每 LOOKUP_BATCH 个案件两条查询，不随案件数逐个增加（出题时要把整个题库过一遍）。
+    """
     from app.services import moderation as moderation_service
 
-    clauses = [ContentModerationRecord.report_id.in_(select(UserReport.id).where(UserReport.case_id == case.id))]
-    if case.target_type == "message" and case.message_id is not None:
-        clauses.append(ContentModerationRecord.message_id == case.message_id)
-    elif case.target_type == "post":
-        clauses.append(ContentModerationRecord.post_id == case.target_id)
-    records = await db.execute(
-        select(ContentModerationRecord)
-        .where(or_(*clauses), ContentModerationRecord.decision.in_(("review", "block")))
-        .order_by(ContentModerationRecord.id.desc())
-        .limit(50)
-    )
-    for record in records.scalars().all():
-        # 图片管线不给 categories，只在原始结果里带 category；block 的记录再按处罚口径换算一次。
-        verdict = moderation_service._verdict_for_record(record)
-        categories = [*moderation_service._json_list(record.categories), moderation_service._raw_result(record).get("category"), verdict[0] if verdict else None]
-        if any(isinstance(item, str) and item in SENSITIVE_MACHINE_CATEGORIES for item in categories):
-            return True
-    return False
+    found = {case.id for case in cases if case.machine_category in SENSITIVE_MACHINE_CATEGORIES}
+    for start in range(0, len(cases), LOOKUP_BATCH):
+        batch = cases[start : start + LOOKUP_BATCH]
+        case_ids = [case.id for case in batch]
+        report_case: dict[int, int] = {}
+        reports = await db.execute(select(UserReport.id, UserReport.case_id, UserReport.reason).where(UserReport.case_id.in_(case_ids)))
+        for report_id, case_id, reason in reports.all():
+            report_case[report_id] = case_id
+            if reason in SENSITIVE_REASONS:
+                found.add(case_id)
+        by_message: dict[int, list[int]] = {}
+        by_post: dict[int, list[int]] = {}
+        for case in batch:
+            if case.target_type == "message" and case.message_id is not None:
+                by_message.setdefault(case.message_id, []).append(case.id)
+            elif case.target_type == "post":
+                by_post.setdefault(case.target_id, []).append(case.id)
+        clauses = [ContentModerationRecord.report_id.in_(select(UserReport.id).where(UserReport.case_id.in_(case_ids)))]
+        if by_message:
+            clauses.append(ContentModerationRecord.message_id.in_(list(by_message)))
+        if by_post:
+            clauses.append(ContentModerationRecord.post_id.in_(list(by_post)))
+        records = await db.execute(
+            select(ContentModerationRecord)
+            .where(or_(*clauses), ContentModerationRecord.decision.in_(("review", "block")))
+            .order_by(ContentModerationRecord.id.desc())
+        )
+        for record in records.scalars().all():
+            owners = {report_case.get(record.report_id), *by_message.get(record.message_id, ()), *by_post.get(record.post_id, ())} - {None} - found
+            if not owners:
+                continue
+            # 图片管线不给 categories，只在原始结果里带 category；block 的记录再按处罚口径换算一次。
+            verdict = moderation_service._verdict_for_record(record)
+            categories = [*moderation_service._json_list(record.categories), moderation_service._raw_result(record).get("category"), verdict[0] if verdict else None]
+            if any(isinstance(item, str) and item in SENSITIVE_MACHINE_CATEGORIES for item in categories):
+                found.update(owners)
+    return found
 
 
 def _enter_jury_queue(case: ReportCase, now: datetime) -> None:
@@ -475,17 +501,35 @@ def _case_summary(snapshot: dict[str, Any]) -> str | None:
     return None
 
 
+def _parse_snapshot(text: str | None) -> dict[str, Any]:
+    if not text:
+        return {}
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
 async def case_snapshot(db: AsyncSession, case: ReportCase) -> dict[str, Any]:
     if case.first_report_id is None:
         return {}
     report = await db.get(UserReport, case.first_report_id)
-    if report is None or not report.target_snapshot:
-        return {}
-    try:
-        value = json.loads(report.target_snapshot)
-    except json.JSONDecodeError:
-        return {}
-    return value if isinstance(value, dict) else {}
+    return _parse_snapshot(report.target_snapshot) if report is not None else {}
+
+
+async def case_snapshots(db: AsyncSession, cases: list[ReportCase]) -> dict[int, dict[str, Any]]:
+    """case_snapshot 的批量版：案件 id -> 快照，没有快照的给空字典。"""
+    by_report = {case.first_report_id: case.id for case in cases if case.first_report_id is not None}
+    snapshots: dict[int, dict[str, Any]] = {case.id: {} for case in cases}
+    report_ids = list(by_report)
+    for start in range(0, len(report_ids), LOOKUP_BATCH):
+        rows = await db.execute(
+            select(UserReport.id, UserReport.target_snapshot).where(UserReport.id.in_(report_ids[start : start + LOOKUP_BATCH]))
+        )
+        for report_id, text in rows.all():
+            snapshots[by_report[report_id]] = _parse_snapshot(text)
+    return snapshots
 
 
 async def _punish(
@@ -954,14 +998,15 @@ async def _broadcast_removed(db: AsyncSession, info: dict[str, Any]) -> None:
 
     try:
         if info["kind"] == "message":
+            # 和用户自己撤回消息走同一条路（conversations.recall_message）：负载只有撤回信息、只序列化一次，
+            # 只发给此刻在线的群成员，机器人和游戏模式的观众也一并同步。
+            # 原来是给群里每个成员各查一遍、各序列化一遍完整消息，耗时随群人数线性增长，几千人的群要几十秒。
+            from app.api.v1.conversations import online_conversation_member_ids, send_message_updates
             from app.services import messages as message_service
 
             message = await message_service.get_message(db, info["message_id"])
-            member_ids = (
-                await db.execute(select(ConversationMember.user_id).where(ConversationMember.conversation_id == info["conversation_id"]))
-            ).scalars().all()
-            for user_id in set(member_ids):
-                await manager.send_to_user(user_id, "message.recalled", await message_service.build_message_read(db, message, user_id))
+            member_ids = await online_conversation_member_ids(db, info["conversation_id"])
+            await send_message_updates(db, "message.recalled", message, member_ids)
             await admin_manager.broadcast(
                 "admin.message.changed", {"message_id": message.id, "conversation_id": message.conversation_id, "action": "recalled"}
             )
@@ -1009,20 +1054,16 @@ async def notify_case_closed(db: AsyncSession, case: ReportCase) -> None:
 
 
 async def notify_jurors_settled(db: AsyncSession, case: ReportCase) -> None:
-    """案件定案 / 被改判：让投过票的委员刷新详情和历史。发不出去只记日志。"""
-    from app.websocket.manager import manager
+    """案件定案 / 被改判：让投过票的委员刷新详情和历史。发不出去只记日志。
 
-    try:
-        juror_ids = (
-            await db.execute(
-                select(JuryVote.juror_id).where(JuryVote.case_id == case.id, JuryVote.voted_at.is_not(None), JuryVote.is_quality_check.is_(False))
-            )
-        ).scalars().all()
-        if juror_ids and case.status != "open":
-            outcome = "violation" if case.status == "resolved" else "clean"
-            await manager.send_to_users(set(juror_ids), "jury.case.settled", {"case_id": case.id, "outcome": outcome})
-    except Exception:
-        logger.exception("Failed to notify jurors", extra={"case_id": case.id})
+    每个人收到的 case_id 是他自己的评审编号（docs/jury-v2.md 1.0），所以是逐个发的。
+    """
+    from app.services import jury as jury_service
+
+    if case.status == "open":
+        return
+    outcome = "violation" if case.status == "resolved" else "clean"
+    await jury_service.notify_case_voters(db, case.id, "jury.case.settled", {"outcome": outcome})
 
 
 async def notify_jury_queue_changed(db: AsyncSession) -> None:
@@ -1059,6 +1100,15 @@ def published_clauses(now: datetime) -> list[Any]:
         ReportCase.closed_at <= now - timedelta(hours=PUBLISH_DELAY_HOURS),
         ~pending_appeal,
     ]
+
+
+async def published_case_ids(db: AsyncSession, case_ids: list[int] | set[int], now: datetime | None = None) -> set[int]:
+    """这些案件里此刻正在公示栏里的。和公示栏用同一套条件。"""
+    wanted = list(set(case_ids))
+    if not wanted:
+        return set()
+    rows = await db.execute(select(ReportCase.id).where(ReportCase.id.in_(wanted), *published_clauses(now or datetime.now(UTC))))
+    return set(rows.scalars().all())
 
 
 # ---------------------------------------------------------------- 查询
@@ -1103,11 +1153,7 @@ async def build_case_reads(db: AsyncSession, cases: list[ReportCase]) -> list[di
     users: dict[int, User] = {}
     if user_ids:
         users = {user.id: user for user in (await db.execute(select(User).where(User.id.in_(user_ids)))).scalars().all()}
-    published: set[int] = set()
-    candidate_ids = [case.id for case in cases if case.publishable]
-    if candidate_ids:
-        rows = await db.execute(select(ReportCase.id).where(ReportCase.id.in_(candidate_ids), *published_clauses(datetime.now(UTC))))
-        published = set(rows.scalars().all())
+    published = await published_case_ids(db, [case.id for case in cases if case.publishable])
     items: list[dict[str, Any]] = []
     for case in cases:
         snapshot = await case_snapshot(db, case)

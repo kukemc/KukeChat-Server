@@ -20,6 +20,7 @@ from app.core.config import settings
 from app.models.case import JuryMember, JuryOpinion, JuryOpinionLike, JuryOpinionReport, JuryVote, ReportCase
 from app.models.report import AdminAuditLog
 from app.models.user import User
+from app.services import cases as case_service
 from app.services import jury as jury_service
 from app.services import jury_points as points_service
 from app.services import jury_settings
@@ -48,49 +49,63 @@ def _not_found() -> HTTPException:
 # ---------------------------------------------------------------- 权限
 
 
-async def _reader(db: AsyncSession, user: User, case_id: int) -> tuple[ReportCase, JuryVote | None]:
-    """读权限：对这个案件投过票（含弃权）。返回的票为 None 表示是靠开关进来的只读访客。"""
-    case = await db.get(ReportCase, case_id)
-    if case is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"code": "case_not_found", "message": "案件不存在"})
-    vote = await jury_service.my_vote(db, user.id, case_id)
-    if vote is None:
-        # 开关打开后，已定案案件的观点区对所有在任委员只读；和这个案件有回避关系的（包括自己主动回避过的）仍然不行。
-        if (
-            case.status != "open"
-            and case.jury_eligible
-            and not await jury_service.has_recused(db, user.id, case_id)
-            and await jury_settings.is_enabled(db, "opinions_open_to_jurors")
-            and jury_service._is_serving(await jury_service.get_member(db, user.id))
-            and not await jury_service._has_conflict(db, user.id, case)
-        ):
-            return case, None
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail={"code": "not_voted", "message": "投票之后才能进入这个案件的观点区"})
+# 进观点区有两条路，编号也是两套（docs/jury-v2.md 1.0）：
+#   参与者 —— 对这个案件投过票的委员，用自己的评审编号进，可读可写；
+#   访客 —— opinions_open_to_jurors 打开后，在任委员可以用公开编号只读公示栏里的案件的观点区。
+# 把某个案件当质控题答过的人在这个案件上不是参与者（质控题没有观点区），但可以和别人一样当访客。
+
+
+def _closed(message: str) -> HTTPException:
+    return HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail={"code": "opinions_closed", "message": message})
+
+
+async def _participant(db: AsyncSession, user: User, review_id: int) -> tuple[ReportCase, JuryVote]:
+    """按评审编号进观点区：对这个案件投过票（含弃权）。编号不是本人的一律 404，没投票 403 not_voted。"""
+    case, vote = await jury_service.require_voted(db, user.id, review_id)
     if vote.is_quality_check:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail={"code": "opinions_closed", "message": "质控题没有观点区"})
+        raise _closed("质控题没有观点区")
     return case, vote
 
 
-async def _writer(db: AsyncSession, user: User, case_id: int) -> ReportCase:
+async def _writer(db: AsyncSession, user: User, review_id: int) -> ReportCase:
     """写权限：投过票，并且现在是在任委员、没有受处罚。"""
-    case, vote = await _reader(db, user, case_id)
-    if vote is None:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail={"code": "not_voted", "message": "只有对这个案件投过票的委员可以参与讨论"})
+    case, _vote = await _participant(db, user, review_id)
     await jury_service._require_serving(db, user)
     return case
 
 
+async def _open_to(db: AsyncSession, user: User, case: ReportCase) -> bool:
+    """开关打开后，这个（已在公示栏里的）案件的观点区对这个人是否只读开放。
+
+    要求是在任委员，并且和案件没有回避关系（当事人、举报人、好友、案发群成员，以及自己主动回避过的）。
+    只看人和案件的关系，不看他有没有把它当质控题答过。
+    """
+    if not await jury_settings.is_enabled(db, "opinions_open_to_jurors"):
+        return False
+    if not jury_service._is_serving(await jury_service.get_member(db, user.id)):
+        return False
+    if await jury_service.has_recused(db, user.id, case.id):
+        return False
+    return not await jury_service._has_conflict(db, user.id, case)
+
+
 async def _opinion(db: AsyncSession, user: User, opinion_id: int, *, write: bool) -> tuple[JuryOpinion, ReportCase]:
+    """按观点 id 操作时的权限。看不到的案件下面的观点，对外就当不存在。"""
     opinion = await db.get(JuryOpinion, opinion_id)
-    if opinion is None:
+    case = await db.get(ReportCase, opinion.case_id) if opinion is not None else None
+    if opinion is None or case is None:
         raise _not_found()
-    try:
-        case = await _writer(db, user, opinion.case_id) if write else (await _reader(db, user, opinion.case_id))[0]
-    except HTTPException as error:
-        # 看不到的案件下面的观点，对外就当不存在。
-        if isinstance(error.detail, dict) and error.detail.get("code") in {"not_voted", "opinions_closed", "case_not_found"}:
-            raise _not_found() from None
-        raise
+    vote = await jury_service.my_vote(db, user.id, case.id)
+    participant = vote is not None and not vote.is_quality_check
+    if write:
+        # 点赞、举报只有参与者能做；访客是只读的。
+        if not participant:
+            raise _not_found()
+        await jury_service._require_serving(db, user)
+    elif not participant:
+        published = case.id in await case_service.published_case_ids(db, [case.id])
+        if not published or not await _open_to(db, user, case):
+            raise _not_found()
     return opinion, case
 
 
@@ -155,13 +170,31 @@ async def _views(db: AsyncSession, case: ReportCase, opinions: list[JuryOpinion]
     return views
 
 
-async def list_opinions(db: AsyncSession, user: User, case_id: int) -> dict[str, Any]:
+async def list_opinions(db: AsyncSession, user: User, review_id: int) -> dict[str, Any]:
+    """GET /jury/cases/{case_id}/opinions，路径里是评审编号。"""
+    case, _vote = await _participant(db, user, review_id)
+    return await _page(db, case, user.id)
+
+
+async def list_public_opinions(db: AsyncSession, user: User, case: ReportCase) -> dict[str, Any]:
+    """GET /jury/public/cases/{case_id}/opinions：公示栏里的案件的观点区，只读。
+
+    case 由调用方按公开编号从公示栏里取出来（不在公示栏里的在那一步就是 404）。只在 opinions_open_to_jurors 打开时开放。
+    """
+    if not jury_service._is_serving(await jury_service.get_member(db, user.id)):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail={"code": "not_juror", "message": "你不是在任的风纪委员"})
+    if not await _open_to(db, user, case):
+        # 开关没开、或者和案件有回避关系：不区分，免得从错误信息里看出案件出自自己所在的群。
+        raise _closed("这个案件的观点区没有对你开放")
+    return await _page(db, case, user.id)
+
+
+async def _page(db: AsyncSession, case: ReportCase, viewer_id: int) -> dict[str, Any]:
     """一次返回全部，按时间正序；回复挂在所属的根观点下面，只有一层。"""
-    case, _vote = await _reader(db, user, case_id)
     opinions = list(
-        (await db.execute(select(JuryOpinion).where(JuryOpinion.case_id == case_id).order_by(JuryOpinion.created_at.asc(), JuryOpinion.id.asc()))).scalars()
+        (await db.execute(select(JuryOpinion).where(JuryOpinion.case_id == case.id).order_by(JuryOpinion.created_at.asc(), JuryOpinion.id.asc()))).scalars()
     )
-    views = await _views(db, case, opinions, user.id)
+    views = await _views(db, case, opinions, viewer_id)
     roots: list[dict[str, Any]] = []
     for item in opinions:
         # 已删除的回复直接不出现
@@ -201,8 +234,10 @@ async def _check_rate(db: AsyncSession, user_id: int, case_id: int) -> None:
         raise limited(f"今天的发言已达上限（{PER_DAY} 条），明天再来")
 
 
-async def create_opinion(db: AsyncSession, user: User, case_id: int, content: str | None, parent_id: int | None) -> dict[str, Any]:
-    case = await _writer(db, user, case_id)
+async def create_opinion(db: AsyncSession, user: User, review_id: int, content: str | None, parent_id: int | None) -> dict[str, Any]:
+    """POST /jury/cases/{case_id}/opinions，路径里是评审编号。"""
+    case = await _writer(db, user, review_id)
+    case_id = case.id
     text = (content or "").strip()
     if not text or len(text) > MAX_LENGTH:
         raise HTTPException(
@@ -222,16 +257,13 @@ async def create_opinion(db: AsyncSession, user: User, case_id: int, content: st
     opinion = JuryOpinion(case_id=case_id, author_id=user.id, parent_id=root_id, reply_to_id=reply_to_id, content=text, created_at=datetime.now(UTC))
     db.add(opinion)
     await db.commit()
-    await jury_service.notify_case_voters(
-        db, case_id, "jury.opinion.created", {"case_id": case_id, "opinion_id": opinion.id, "parent_id": root_id}, exclude=user.id
-    )
+    await jury_service.notify_case_voters(db, case_id, "jury.opinion.created", {"opinion_id": opinion.id, "parent_id": root_id}, exclude=user.id)
     return await _single_view(db, case, opinion, user.id)
 
 
 async def _notify_changed(db: AsyncSession, opinion: JuryOpinion) -> None:
-    await jury_service.notify_case_voters(
-        db, opinion.case_id, "jury.opinion.changed", {"case_id": opinion.case_id, "opinion_id": opinion.id, "state": opinion.state}
-    )
+    # 每个人收到的 case_id 是他自己的评审编号，由 notify_case_voters 填
+    await jury_service.notify_case_voters(db, opinion.case_id, "jury.opinion.changed", {"opinion_id": opinion.id, "state": opinion.state})
 
 
 async def delete_opinion(db: AsyncSession, user: User, opinion_id: int) -> dict[str, Any]:

@@ -179,6 +179,27 @@ async def sync_badge(db: AsyncSession, member: JuryMember, user: User | None = N
         user.jury_badge = badge
 
 
+# ---------------------------------------------------------------- 评审编号
+
+
+async def review_ids(db: AsyncSession, user_id: int, case_ids: list[int] | set[int]) -> dict[int, int]:
+    """这个人在这些案件上的评审编号：案件 id -> jury_votes.id。没分到过的案件不在结果里。
+
+    委员侧对外的 case_id 一律是评审编号，不是案件的真实编号（docs/jury-v2.md 1.0）；库里存的仍是真实编号，出去之前在这里换。
+    """
+    wanted = {case_id for case_id in case_ids if case_id is not None}
+    if not wanted:
+        return {}
+    rows = await db.execute(select(JuryVote.case_id, JuryVote.id).where(JuryVote.juror_id == user_id, JuryVote.case_id.in_(wanted)))
+    return {case_id: review_id for case_id, review_id in rows.all()}
+
+
+async def review_id(db: AsyncSession, user_id: int, case_id: int | None) -> int | None:
+    if case_id is None:
+        return None
+    return (await review_ids(db, user_id, [case_id])).get(case_id)
+
+
 # ---------------------------------------------------------------- 风纪值
 
 
@@ -225,8 +246,14 @@ async def award(
             db,
             member.user_id,
             "jury.points.changed",
-            # label 和 /jury/me/points 明细里的同源，客户端直接显示
-            {"delta": delta, "total": member.points, "kind": kind, "label": POINT_LABELS.get(kind, kind), "case_id": case_id},
+            # label 和 /jury/me/points 明细里的同源，客户端直接显示；case_id 是本人的评审编号
+            {
+                "delta": delta,
+                "total": member.points,
+                "kind": kind,
+                "label": POINT_LABELS.get(kind, kind),
+                "case_id": await review_id(db, member.user_id, case_id),
+            },
         )
     return log
 
@@ -256,6 +283,8 @@ async def list_points(db: AsyncSession, user_id: int, *, limit: int = 20, offset
         .offset(offset)
         .limit(limit)
     )
+    logs = rows.scalars().all()
+    reviews = await review_ids(db, user_id, [log.case_id for log in logs])
     return {
         "total": int(total or 0),
         "items": [
@@ -263,10 +292,11 @@ async def list_points(db: AsyncSession, user_id: int, *, limit: int = 20, offset
                 "kind": log.kind,
                 "label": POINT_LABELS.get(log.kind, log.kind),
                 "points": log.points,
-                "case_id": log.case_id,
+                # 评审编号；和案件无关的（每日首票、管理员调整……）为 null
+                "case_id": reviews.get(log.case_id) if log.case_id is not None else None,
                 "created_at": penalty_service.aware(log.created_at),
             }
-            for log in rows.scalars().all()
+            for log in logs
         ],
         "count": count,
     }
