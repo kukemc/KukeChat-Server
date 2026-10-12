@@ -542,7 +542,7 @@
 | `need_context` | `abstain` | 上下文不足，无法判断。不计入表决；同一案件累计 2 票后转出（三期起转给资深合议，之前转管理员） |
 
 - 回避之后不能看这个案件的详情和观点区（响应里 `case: null`）。
-- `/jury/votes`：回避和「上下文不足」的记录都会列出，`vote` 分别是 `recuse` / `need_context`，`vote` 筛选参数也接受这两个值。每项新增 `can_view`：回避的记录为 false（点不进详情），其余为 true。**回避的记录不透露案件的任何进展**：`stage`、`outcome`、`agreed`、`closed_at`、`verdict_*`、`public_case_id` 都是 null，`opinion_count` 为 0；带 `state` / `outcome` / `agreed` 筛选时不返回回避的记录。
+- `/jury/votes`：回避和「上下文不足」的记录都会列出，`vote` 分别是 `recuse` / `need_context`，`vote` 筛选参数也接受这两个值。每项新增 `can_view`：回避的记录为 false（点不进详情），其余为 true。**回避的记录不透露案件的任何进展**：`stage`、`outcome`、`agreed`、`closed_at`、`verdict_*`、`public_case_id` 都是 null，`opinion_count` 为 0，`is_quality_check` 恒为 false；带 `state` / `outcome` / `agreed` 筛选时不返回回避的记录。回避过的质控题过几天（默认 7 天）可能再次出现，评审编号和上次相同，再出之后它就不在回避记录里了。
 - 案件详情和公示栏的 `tally` 新增一个键 `need_context`；`recuse` 不出现在 `tally` 里。`votes_cast` 仍然只数有效票。
 - 质控题上也可以回避，但下一件仍会补一道质控题。
 - 案件详情也带 `suggested_category`，`my_vote` 里带我选的 `category`（没选为 null）。
@@ -665,7 +665,7 @@
 | `GET /admin/jury/questions/{case_id}` | 题目内容（匿名视图）+ 以上字段 |
 | `PUT /admin/jury/questions/{case_id}` | `{ in_bank?, verified?, outcome?, level?, category?, explanation? }`。把任意已结且允许入库的案件加入 / 移出题库、核对、改标准答案和说明 |
 | `GET /admin/jury/exams?passed=&limit&offset` | 考试记录：用户、分数、是否通过、时间 |
-| `GET /admin/jury/members` | `JuryMemberRead` 新增 `points`、`exam_score`、`exam_passed_at`、`abstain_rate`、`recuse_rate`、`badge_visible`、`days_served` |
+| `GET /admin/jury/members` | `JuryMemberRead` 新增 `points`、`exam_score`、`exam_passed_at`、`abstain_rate`、`recuse_rate`、`quality_recused`（在质控题上回避的次数，用来发现专门躲质控的人）、`badge_visible`、`days_served` |
 | `POST /admin/jury/members/{user_id}/review` | 新增 `action: "adjust_points"`（`{ points: ±n, note }`） |
 
 ## 3. 三期
@@ -894,7 +894,7 @@
 议事厅：
 
 - `HallPost` 新增 `state`（`visible` / `hidden`）和 `content_truncated`（列表里内容被截断时为 true）。被多人举报折叠的帖子 `state: "hidden"`、`content` 为 null、`title` 是占位文字。公告不会被自动折叠。
-- 自动折叠只看**在任委员**的举报：同一目标被 `config.hall.auto_hide_reports`（3）名在任委员举报后折叠。其他用户的举报照常记录，由管理员处理。
+- 自动折叠只看**在任委员**的举报：同一目标被 `config.hall.auto_hide_reports`（3）名在任委员举报后折叠。其他用户的举报照常记录，由管理员处理。每人每天最多举报 `config.hall.reports_per_day`（20）次，超了返回 429 `hall_rate_limited`（带 `resets_at`）。
 - `DELETE /jury/hall/posts/{id}`、`DELETE /jury/hall/comments/{id}` 返回 `{ id, state }`；`POST /jury/hall/reports` 返回 `{ target_type, target_id, state }`。`PUT` 帖子只改传进来的字段。
 - 提案还在表决时作者可以撤回（删除），出结果后不能删也不能改；被折叠的帖子不能改。
 - `author_tier` 是作者此刻的层级，不在任时为 null。排序用的「最后活动时间」只在有新评论时更新，表决和编辑不算。
@@ -959,8 +959,11 @@
 | `GET /admin/cases?queue=panel` | 合议中的案件；`CaseRead.queue` 多一个取值 `panel`，新增 `case_origin`（`report` / `machine`）、`panel_outcome`、`reconsider_status` |
 | `POST /admin/cases/{id}/resolve` | 对合议中的案件同样可用（管理员直接接手） |
 | `GET /admin/jury/reviews?kind=appeal\|reconsider&status=open\|closed&limit&offset` | 资深复审的监控：处罚 / 案件、申诉内容、每位复审委员的票（实名）、结果 |
-| `POST /admin/violations/{id}/appeal` | 原有。复审进行中或已出结果时也可以调，管理员的结论覆盖复审结果 |
+| `POST /admin/violations/{id}/appeal` | 原有。复审进行中或已出结果时也可以调，管理员的结论覆盖复审结果（复审已经撤销了处罚的，不能再驳回：409 `appeal_already_revoked`） |
+| `POST /admin/jury/reviews/{review_id}/decide` | `{ action: "uphold" \| "overturn", level?: 1-3, category?, note? }`。对举报人复议结案（转给管理员的和还在资深阶段的都可以）；对申诉复审返回 409 `appeal_review` |
 | `GET /admin/jury/precedents`、`POST`、`PUT /{id}`、`DELETE /{id}` | 判例管理（可操作任何人创建的） |
 | `POST /admin/jury/hall/posts` | 发公告：`{ title, content, pinned? }` |
+| `GET /admin/jury/hall/posts?kind=&status=&state=&limit&offset`、`GET /admin/jury/hall/posts/{id}` | 后台看帖子；详情带全部评论的原文（含已删除和被折叠的） |
 | `POST /admin/jury/hall/posts/{id}/decision` | `{ action: "adopt" \| "decline" \| "close" \| "delete" \| "pin" \| "unpin", note? }` |
+| `POST /admin/jury/hall/comments/{id}/moderate` | `{ action: "delete" \| "restore", note? }`；作者自己删的不能恢复（409 `comment_not_restorable`） |
 | `GET /admin/jury/hall/reports?status=`、`POST /admin/jury/hall/reports/{id}/handle` | `{ action: "delete" \| "dismiss", note? }` |
