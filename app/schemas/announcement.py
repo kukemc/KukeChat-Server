@@ -7,6 +7,12 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from app.schemas.user import UserPublic
 
 
+class AnnouncementReactionSummary(BaseModel):
+    emoji: str
+    count: int
+    reacted_by_me: bool = False
+
+
 class AnnouncementRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -19,6 +25,25 @@ class AnnouncementRead(BaseModel):
     author: UserPublic | None = None
     created_at: datetime
     updated_at: datetime
+    # 按数量从多到少，数量相同的先出现的在前；后台接口里 reacted_by_me 恒为 false
+    reactions: list[AnnouncementReactionSummary] = Field(default_factory=list)
+
+
+class AnnouncementReactionCreate(BaseModel):
+    # 是不是 emoji 由服务层用和消息回应同一套规则校验
+    emoji: str = Field(min_length=1, max_length=32)
+
+
+class AnnouncementReactionResult(BaseModel):
+    id: int
+    reactions: list[AnnouncementReactionSummary] = Field(default_factory=list)
+
+
+class AnnouncementReactionOptions(BaseModel):
+    quick: list[str]
+    per_user: int
+    per_announcement: int
+    per_minute: int
 
 
 class AnnouncementCreate(BaseModel):

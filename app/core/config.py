@@ -204,6 +204,13 @@ class Settings(BaseSettings):
     jury_hall_auto_hide_reports: int = Field(default=3, ge=1, le=1000)
     # 每人最近 24 小时最多举报多少次（帖子和评论合计）
     jury_hall_reports_per_day: int = Field(default=20, ge=1, le=100000)
+    # 公告回应（docs/chat-features.md 第 5 节）。客户端通过 GET /announcements/reaction-options 读这些值，不要在别处写死。
+    # 快捷回应列表在环境变量里写成 JSON 数组
+    announcement_reaction_quick: list[str] = ["👍", "❤️", "😂", "😮", "😢", "🎉", "👀", "🔥"]
+    # 每人每条公告最多用几种 emoji / 每条公告最多出现几种 emoji / 每人每分钟最多操作几次
+    announcement_reaction_per_user: int = Field(default=5, ge=1, le=100)
+    announcement_reaction_per_announcement: int = Field(default=30, ge=1, le=1000)
+    announcement_reaction_per_minute: int = Field(default=20, ge=1, le=10000)
     task_reminder_check_interval_seconds: int = Field(default=60, ge=10, le=3600)
     task_reminder_advance_hours: int = Field(default=24, ge=1, le=168)
     smtp_enabled: bool = False

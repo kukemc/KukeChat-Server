@@ -1,4 +1,4 @@
-from app.models.announcement import Announcement
+from app.models.announcement import Announcement, AnnouncementReaction
 from app.models.case import (
     JuryAchievement,
     JuryExamAttempt,
@@ -33,6 +33,7 @@ from app.models.user import AuthSession, CcwBindingChallenge, User
 
 __all__ = [
     "Announcement",
+    "AnnouncementReaction",
     "Conversation",
     "Bot",
     "BotInstallation",

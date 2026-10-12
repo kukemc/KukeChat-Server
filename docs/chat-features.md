@@ -1,4 +1,4 @@
-# 投票、正在输入、群表情、戳一戳
+# 投票、正在输入、群表情、戳一戳、公告回应
 
 路径前缀 `/api/v1`。带 `code` 的错误，`detail` 是 `{ code, message }`，`message` 是可直接展示的中文。
 
@@ -250,3 +250,64 @@
 ```
 
 新客户端：这个事件**只用来触发头像抖动**这类即时效果，聊天里的那行字以 `message.created` 为准，不要再用它弹临时提示（否则会显示两遍）。旧客户端不认识新字段，会照旧弹一下「A 戳了戳 B」，同时聊天里多出一行系统消息。
+
+## 5. 公告回应
+
+用户可以用 emoji 回应全站公告（后台发布的那种，不是群公告）。只统计数量，不展示是谁回应的。
+
+### 5.1 公告对象
+
+`GET /announcements`、`GET /announcements/latest` 返回的 `AnnouncementRead` 新增：
+
+```jsonc
+"reactions": [
+  { "emoji": "👀", "count": 37, "reacted_by_me": true },
+  { "emoji": "🔥", "count": 12, "reacted_by_me": false }
+]
+```
+
+按数量从多到少排，数量相同的先出现的在前。没有回应时是空数组。旧客户端不认识这个字段，不受影响。
+
+### 5.2 回应与取消
+
+`POST /announcements/{announcement_id}/reactions`，body `{ "emoji": "👀" }` → `{ "id": 8, "reactions": [...] }`
+
+- 同一个 emoji 再发一次就是取消（开关语义，和消息回应一致）。
+- emoji 的校验规则和消息回应相同（只接受 emoji，不接受文字）。
+
+`DELETE /announcements/{announcement_id}/reactions/{emoji}` → 同上的返回。没回应过也返回 200。
+
+限制（数值在 `GET /announcements/reaction-options` 里下发）：
+
+```jsonc
+{ "quick": ["👍", "❤️", "😂", "😮", "😢", "🎉", "👀", "🔥"],   // 建议放在公告下面的快捷回应
+  "per_user": 5,            // 每人每条公告最多用几种不同的 emoji
+  "per_announcement": 30,   // 每条公告最多出现几种不同的 emoji
+  "per_minute": 20 }        // 每人每分钟最多操作几次
+```
+
+错误码（`detail` 是 `{ code, message }`）：
+
+| HTTP | `detail.code` | 含义 |
+| --- | --- | --- |
+| 404 | `announcement_not_found` | 公告不存在或已下线 |
+| 403 | `account_muted` | 被平台禁言期间不能回应（取消自己的回应不受限） |
+| 409 | `reaction_limit` | 自己已经用满 `per_user` 种，或这条公告已经有 `per_announcement` 种而你要加一种新的 |
+| 422 | — | 不是合法的 emoji |
+| 429 | `reaction_rate_limited` | 操作太快 |
+
+实现上的细节：
+
+- emoji 不做归一化：`❤️`（带变体选择符）和 `❤` 是两个不同的回应。取消时要用服务端在 `reactions[].emoji` 里返回的原串。
+- 下线的公告既不能回应也不能取消（都是 404）。
+- `DELETE` 路径里的 emoji 由浏览器做百分号编码，客户端证明头按**未编码**的路径计算。带 `#` 的 keycap emoji（如 #️⃣）不能走 `DELETE`（`#` 会被当成 URL 片段的开头，证明头对不上），取消它请用 `POST` 开关。
+- 「先出现的在前」看的是现存回应里最早的那一条。
+- 频率限制只计真正改动了回应的操作。
+
+### 5.3 实时事件
+
+`announcement.reaction.updated`：`{ "id": 8, "reactions": [{ "emoji": "👀", "count": 38 }] }`，发给所有在线用户。事件里没有 `reacted_by_me`——客户端保留本地已知的「我回应过哪些」，只用事件更新数量和顺序；自己的操作以接口返回为准。同一条公告的事件在服务端会合并：变化发生后等一秒，推一次最新的汇总（每个服务进程各自合并，所以偶尔会一秒收到两次）。
+
+### 5.4 后台
+
+`GET /admin/announcements` 的每一项同样带 `reactions`（`reacted_by_me` 恒为 false）。
