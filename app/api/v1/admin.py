@@ -992,7 +992,7 @@ async def admin_list_jury_questions(
     db: Annotated[AsyncSession, Depends(get_db)],
     # 留空不筛选
     verified: Literal["true", "false", ""] | None = None,
-    source: Literal["admin", "consensus", "legacy", ""] | None = None,
+    source: Literal["admin", "consensus", "legacy", "precedent", ""] | None = None,
     q: str | None = Query(default=None, max_length=80),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),

@@ -67,10 +67,12 @@ def reset_overview_cache() -> None:
 
 async def config(db: AsyncSession) -> dict[str, Any]:
     """客户端要展示的规则数字都从这里读。"""
+    from app.services import jury_hall as hall_service
+
     switches = await jury_settings.get_switches(db)
     return {
         "version": 2,
-        "capabilities": [*CAPABILITIES, *SENIOR_CAPABILITIES],
+        "capabilities": [*CAPABILITIES, *SENIOR_CAPABILITIES, *hall_service.CAPABILITIES],
         "switches": {name: switches[name] for name in jury_settings.PUBLIC_SWITCHES},
         "tiers": [
             {
@@ -161,6 +163,8 @@ async def config(db: AsyncSession) -> dict[str, Any]:
             "cooldown_rate": jury_service.ABSTAIN_COOLDOWN_RATE,
             "cooldown_hours": jury_service.ABSTAIN_COOLDOWN_HOURS,
         },
+        # —— 三期：议事厅 ——
+        "hall": hall_service.config_view(),
     }
 
 
@@ -299,8 +303,11 @@ def _content_hidden_reason(case: ReportCase, group_content: bool) -> str | None:
 
 
 async def _public_items(db: AsyncSession, cases: list[ReportCase], group_content: bool) -> list[dict[str, Any]]:
+    from app.services import jury_precedents as precedent_service
+
     case_ids = [case.id for case in cases]
     tallies = await jury_service.vote_tallies(db, case_ids)
+    precedents = await precedent_service.case_precedent_ids(db, case_ids)
     reasons: dict[int, list[dict[str, Any]]] = {case_id: [] for case_id in case_ids}
     if case_ids:
         rows = await db.execute(
@@ -330,6 +337,7 @@ async def _public_items(db: AsyncSession, cases: list[ReportCase], group_content
                 "hours": verdict["hours"],
                 "overturned": verdict["overturned"],
                 "has_content": _content_hidden_reason(case, group_content) is None,
+                "precedent_id": precedents.get(case.id),
             }
         )
     return items

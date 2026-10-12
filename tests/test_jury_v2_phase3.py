@@ -1341,7 +1341,7 @@ class ConfigTests(Phase3TestCase):
             raw = await overview_service.config(db)
             config = JuryConfig(**raw)
             # 三期里这一半追加的能力；判例和议事厅不在这里
-            self.assertEqual(config.capabilities[13:], ["panel", "appeal_review", "machine_cases", "reconsider"])
+            self.assertEqual(config.capabilities[13:], ["panel", "appeal_review", "machine_cases", "reconsider", "precedents", "hall"])
             self.assertEqual(raw["panel"], {"seats": 3, "consensus_votes": 2, "timeout_hours": 48})
             self.assertEqual(raw["appeals"], {"seats": 3, "consensus_votes": 2, "timeout_hours": 72})
             self.assertEqual(raw["reconsider"], {"window_days": 7, "text_min": 10})

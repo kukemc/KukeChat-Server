@@ -19,6 +19,7 @@ from app.models.conversation import Conversation, ConversationMember, GroupAnnou
 from app.models.friend import FriendRequest, Friendship
 from app.models.group_activity import GroupCheckin, GroupMemberDailyActivity, GroupMemberExpLog
 from app.models.invite import InviteLink
+from app.models.jury_hall import JuryHallComment, JuryHallPost, JuryHallReport, JuryHallVote, JuryPrecedent
 from app.models.message import FeaturedMessage, MentionAllUsage, Message, MessageBookmark, MessageReaction, MessageVisibility
 from app.models.penalty import UserViolation
 from app.models.poll import GroupEmoji, Poll, PollVote
@@ -101,4 +102,9 @@ __all__ = [
     "AuthSession",
     "CcwBindingChallenge",
     "User",
+    "JuryPrecedent",
+    "JuryHallPost",
+    "JuryHallVote",
+    "JuryHallComment",
+    "JuryHallReport",
 ]
