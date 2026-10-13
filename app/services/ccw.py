@@ -1,18 +1,19 @@
+"""CCW 相关的业务逻辑：账号绑定、资料同步、作品链接卡片。
+
+这里只有 KukeChat 自己的规则 —— 绑定口令怎么生成和匹配、取到的资料怎么落到用户身上、作品卡片怎么拼。
+「怎么向 CCW 要到数据」不在本仓库里：所有取数都走 app/integrations 的 CcwGateway 接口，实现由部署方提供。
+没有接入（网关 available() 为 False）时：绑定显示为未开放，资料同步和作品卡片直接跳过。
+"""
+
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import hmac
-import json
 import logging
 import re
 import secrets
-import ssl
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlparse
-from urllib.request import Request, urlopen
 
 from fastapi import HTTPException, status
 from sqlalchemy import select
@@ -20,15 +21,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
+from app.integrations import CcwUnavailable, get_ccw_gateway
 from app.models.user import CcwBindingChallenge, User
 from app.services import response_cache
 
 
-DETAIL_URL = "https://community-web.ccw.site/creation/detail"
-CCW_BASE_URL = "https://community-web.ccw.site"
-COMMENT_PAGE_URL = f"{CCW_BASE_URL}/comment/page_by_topic?offset=0&page=1&perPage=20&sortField=createdAt&sortType=DESC"
-STUDENT_PROFILE_URL = f"{CCW_BASE_URL}/students/profile"
-STUDENT_DETAIL_URL = f"{CCW_BASE_URL}/creation/student/detail"
 OID_PATTERN = re.compile(r"^[0-9a-fA-F]{24}$")
 CCW_URL_PATTERN = re.compile(r"https?://(?:www\.)?ccw\.site/detail/[0-9a-fA-F]{24}[^\s<>'\"]*", re.IGNORECASE)
 TRAILING_URL_PUNCTUATION = "，。！？；：,.!?;:)]}）】》"
@@ -36,11 +33,9 @@ logger = logging.getLogger(__name__)
 UTC = timezone.utc
 CHALLENGE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 _ccw_binding_task: asyncio.Task | None = None
-CA_FILE_CANDIDATES = (
-    "/etc/ssl/certs/ca-certificates.crt",
-    "/etc/pki/tls/certs/ca-bundle.crt",
-    "/etc/ssl/ca-bundle.pem",
-)
+# 取数失败时要接住的异常：网关取不到（CcwUnavailable），或者取到的内容拼不出我们要的东西（ValueError）。
+# OSError 是兜底：万一某个网关实现把底层的网络异常漏了出来，也按取数失败处理。
+FETCH_ERRORS = (CcwUnavailable, ValueError, OSError)
 
 
 def _text(value: Any) -> str | None:
@@ -59,105 +54,37 @@ def _cache_key(oid: str, access_key: str = "") -> str:
     return f"{oid.lower()}:{access_key.strip()}"
 
 
-def _ssl_context() -> ssl.SSLContext | None:
-    for cafile in CA_FILE_CANDIDATES:
-        try:
-            return ssl.create_default_context(cafile=cafile)
-        except FileNotFoundError:
-            continue
-    return None
-
-
 def ccw_profile_url(student_oid: str) -> str:
     return f"https://www.ccw.site/student/{student_oid}"
 
 
-def ccw_binding_configured() -> bool:
-    """CCW 绑定是否已配置。
+def ccw_gateway_available() -> bool:
+    """本服务有没有接入 CCW（有没有网关实现）。"""
+    return get_ccw_gateway().available()
 
-    需要运营方自己的作品 oid 与访客标识，本项目不内置任何默认值，
-    未配置时该功能整体不可用（而不是拿别人的标识去请求 CCW）。
+
+def ccw_binding_configured() -> bool:
+    """CCW 绑定是否可用。
+
+    需要接入了 CCW（网关），以及运营方自己的作品 oid 与访客标识；本项目不内置任何默认值，
+    缺任何一样该功能整体不可用（而不是拿别人的标识去请求 CCW）。
     """
-    return bool((settings.ccw_bind_subject_oid or "").strip() and (settings.ccw_bind_guest_id or "").strip())
+    return bool((settings.ccw_bind_subject_oid or "").strip() and (settings.ccw_bind_guest_id or "").strip()) and ccw_gateway_available()
 
 
 def ccw_bind_creation_url() -> str:
     return f"https://www.ccw.site/detail/{settings.ccw_bind_subject_oid}"
 
 
-def _post_json_sync(url: str, payload: dict[str, Any] | None, headers: dict[str, str] | None = None) -> dict[str, Any]:
-    data = None if payload is None else json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    request = Request(
-        url,
-        data=data,
-        method="POST",
-        headers={
-            "Content-Type": "application/json;charset=UTF-8",
-            "Accept": "application/json, text/plain, */*",
-            "Guest-Id": settings.ccw_bind_guest_id,
-            "Origin": "https://www.ccw.site",
-            "Referer": ccw_bind_creation_url(),
-            "User-Agent": "Mozilla/5.0 KukeChat/1.0 ccw-binding",
-            **(headers or {}),
-        },
-    )
-    with urlopen(request, timeout=10, context=_ssl_context()) as response:
-        raw = response.read()
-    parsed = json.loads(raw.decode("utf-8"))
-    if not isinstance(parsed, dict):
-        raise ValueError("Invalid CCW response")
-    return parsed
-
-
-def _derive_token(health: dict[str, Any]) -> str:
-    body = health.get("body")
-    if not isinstance(body, list):
-        raise ValueError("Invalid CCW health response")
-    chars: list[str] = []
-    for item in body:
-        if not isinstance(item, dict) or not isinstance(item.get("traceId"), str):
-            continue
-        trace_id = item["traceId"]
-        if not trace_id:
-            continue
-        index = int(trace_id[0], 16) + 1
-        if index < len(trace_id):
-            chars.append(trace_id[index])
-    return "".join(reversed(chars))
-
-
-def _fetch_comment_page_sync() -> list[dict[str, Any]]:
-    body = {
-        "subjectOid": settings.ccw_bind_subject_oid,
-        "subjectType": settings.ccw_bind_subject_type,
-        "sectionType": "COMMENT",
-    }
-    health = _post_json_sync(f"{CCW_BASE_URL}/health/check", None)
-    token = _derive_token(health)
-    date_time = _post_json_sync(f"{CCW_BASE_URL}/base/dateTime", None)
-    b = str(date_time.get("body") or int(datetime.now(UTC).timestamp() * 1000))
-    raw_body = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
-    a = hmac.new(token.encode("utf-8"), f"ccw{raw_body}{b}".encode("utf-8"), hashlib.md5).hexdigest()
-    payload = _post_json_sync(COMMENT_PAGE_URL, body, {"a": a, "b": b})
-    data = payload.get("body", {}).get("data") if isinstance(payload.get("body"), dict) else None
-    return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
-
-
-def _fetch_student_payloads_sync(student_oid: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-    payload = {"studentOid": student_oid}
-    profile = _post_json_sync(STUDENT_PROFILE_URL, payload)
-    detail = _post_json_sync(STUDENT_DETAIL_URL, payload)
-    return profile, detail
-
-
 async def fetch_comment_page() -> list[dict[str, Any]]:
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _fetch_comment_page_sync)
+    """绑定用的那个评论区最新的一页评论。取不到抛 CcwUnavailable。"""
+    return await get_ccw_gateway().latest_comments(settings.ccw_bind_subject_oid, settings.ccw_bind_subject_type)
 
 
 async def fetch_student_payloads(student_oid: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _fetch_student_payloads_sync, student_oid)
+    """某个学生的（资料, 主页统计）。取不到抛 CcwUnavailable。"""
+    payloads = await get_ccw_gateway().student_payloads(student_oid)
+    return payloads.profile, payloads.detail
 
 
 def normalize_student_profile(profile_payload: dict[str, Any] | None, detail_payload: dict[str, Any] | None, fallback: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -220,10 +147,13 @@ def apply_student_profile(user: User, data: dict[str, Any], sync_profile: bool =
 async def sync_bound_student(db: AsyncSession, user: User, sync_profile: bool = False) -> User:
     if not user.ccw_student_oid:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="还没有绑定 CCW 账号")
+    if not ccw_gateway_available():
+        # 没有接入 CCW：没东西可同步，资料原样留着，不报错
+        return user
     try:
         profile_payload, detail_payload = await fetch_student_payloads(user.ccw_student_oid)
         data = normalize_student_profile(profile_payload, detail_payload, {"accountOid": user.ccw_student_oid, "name": user.ccw_name, "avatar": user.ccw_avatar_url})
-    except (HTTPError, URLError, TimeoutError, ValueError, json.JSONDecodeError, OSError) as exc:
+    except FETCH_ERRORS as exc:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="同步 CCW 账号信息失败") from exc
     apply_student_profile(user, data, sync_profile=sync_profile)
     await db.commit()
@@ -254,6 +184,8 @@ async def unbind_student(db: AsyncSession, user: User) -> User:
 
 
 async def create_binding_challenge(db: AsyncSession, user: User) -> CcwBindingChallenge:
+    if not ccw_gateway_available():
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="本服务未开放 CCW 账号绑定。")
     if not ccw_binding_configured():
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -310,6 +242,9 @@ async def check_binding_challenges_once(db: AsyncSession, user_id: int | None = 
     challenges = list(result.scalars().all())
     if not challenges:
         return 0
+    if not ccw_gateway_available():
+        # 没有接入 CCW：没有评论可查，待验证的口令留着等它自己过期
+        return 0
     comments = await fetch_comment_page()
     matched = 0
     for challenge in challenges:
@@ -353,7 +288,7 @@ async def _match_challenge(db: AsyncSession, challenge: CcwBindingChallenge, com
         try:
             profile_payload, detail_payload = await fetch_student_payloads(student_oid.lower())
             data = normalize_student_profile(profile_payload, detail_payload, commenter)
-        except (HTTPError, URLError, TimeoutError, ValueError, json.JSONDecodeError, OSError):
+        except FETCH_ERRORS:
             data = normalize_student_profile(None, None, commenter)
         apply_student_profile(user, data, sync_profile=False)
         challenge.status = "verified"
@@ -420,28 +355,6 @@ def extract_creation_refs(text: str, limit: int = 3) -> list[dict[str, str]]:
     return refs
 
 
-def _fetch_creation_detail_sync(oid: str, access_key: str = "") -> dict[str, Any]:
-    payload = json.dumps({"oid": oid, "accessKey": access_key}, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    request = Request(
-        DETAIL_URL,
-        data=payload,
-        method="POST",
-        headers={
-            "Content-Type": "application/json;charset=UTF-8",
-            "Accept": "application/json",
-            "User-Agent": "Mozilla/5.0 KukeChat/1.0 link-preview",
-            "Origin": "https://www.ccw.site",
-            "Referer": f"https://www.ccw.site/detail/{oid}",
-        },
-    )
-    with urlopen(request, timeout=8, context=_ssl_context()) as response:
-        raw = response.read()
-    parsed = json.loads(raw.decode("utf-8"))
-    if not isinstance(parsed, dict):
-        raise ValueError("Invalid CCW response")
-    return parsed
-
-
 def build_preview(oid: str, payload: dict[str, Any], access_key: str = "") -> dict[str, Any]:
     body = payload.get("body")
     if not isinstance(body, dict):
@@ -487,8 +400,7 @@ async def fetch_creation_preview(oid: str, access_key: str = "") -> dict[str, An
     cached = response_cache.get_ccw_creation(_cache_key(normalized_oid, normalized_access_key))
     if cached is not None:
         return cached
-    loop = asyncio.get_running_loop()
-    payload = await loop.run_in_executor(None, _fetch_creation_detail_sync, normalized_oid, normalized_access_key)
+    payload = await get_ccw_gateway().creation_detail(normalized_oid, normalized_access_key)
     preview = build_preview(normalized_oid, payload, normalized_access_key)
     response_cache.set_ccw_creation(_cache_key(normalized_oid, normalized_access_key), preview)
     return preview
@@ -499,11 +411,14 @@ async def previews_from_text(text: str, limit: int = 3) -> list[dict[str, Any]]:
     refs = extract_creation_refs(text, limit=min(3, limit)) if limit > 0 else []
     if not refs:
         return []
+    if not ccw_gateway_available():
+        # 没有接入 CCW：不做卡片，也不为每条带链接的消息刷一遍日志
+        return []
 
     async def resolve(ref: dict[str, str]) -> dict[str, Any] | None:
         try:
             return await fetch_creation_preview(ref["oid"], ref.get("access_key", ""))
-        except (HTTPError, URLError, TimeoutError, ValueError, json.JSONDecodeError, OSError) as exc:
+        except FETCH_ERRORS as exc:
             logger.warning("Failed to resolve CCW creation preview oid=%s access_key=%s: %s", ref["oid"], bool(ref.get("access_key")), exc)
             return None
 

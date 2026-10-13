@@ -25,7 +25,9 @@ from app.models.message import FeaturedMessage, MentionAllUsage, Message, Messag
 from app.models.penalty import UserViolation
 from app.models.poll import GroupEmoji, Poll, PollVote
 from app.models.post import Post, PostComment, PostCommentLike, PostLike, PostMention, PostNotification, PostTopic, PostTopicLink
+from app.models.profile_like import ProfileLike
 from app.models.report import AdminAuditLog, ContentModerationRecord, PasswordResetRequest, UserReport
+from app.models.shop import ShopAccount, ShopItem, ShopPurchase
 from app.models.sticker import FavoriteSticker, StickerAsset
 from app.models.system import SystemSetting
 from app.models.task import Task, TaskActivity, TaskAssignee, TaskComment, TaskGroup, TaskGroupItem, TaskList, TaskWatcher
@@ -111,4 +113,8 @@ __all__ = [
     "JuryHallVote",
     "JuryHallComment",
     "JuryHallReport",
+    "ShopItem",
+    "ShopPurchase",
+    "ShopAccount",
+    "ProfileLike",
 ]

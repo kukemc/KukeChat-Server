@@ -17,7 +17,7 @@ from app.models.enums import UserStatus
 from app.models.report import PasswordResetRequest
 from app.models.user import AuthSession, CcwPasswordChallenge, User
 from app.schemas.auth import AccountLookupRead, CookieSessionRead, PasswordResetRequestCreate, Token, UserLogin, UserRegister
-from app.services.ccw import CHALLENGE_ALPHABET, fetch_comment_page
+from app.services.ccw import CHALLENGE_ALPHABET, ccw_gateway_available, fetch_comment_page
 
 
 OFFICIAL_GROUP_ID = 1
@@ -328,6 +328,8 @@ async def confirm_ccw_password_challenge(db: AsyncSession, user: User, code: str
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="验证码不存在或已过期，请重新获取")
     if not user.ccw_student_oid:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="该账号未绑定 CCW，无法使用验证码验证")
+    if not ccw_gateway_available():
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="本服务未接入 CCW，无法使用验证码验证")
     comments = await fetch_comment_page()
     matched = _find_code_comment(comments, user.ccw_student_oid, challenge.code)
     if matched is None:

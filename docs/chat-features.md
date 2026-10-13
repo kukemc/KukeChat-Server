@@ -1,4 +1,4 @@
-# 投票、正在输入、群表情、戳一戳、公告回应
+# 投票、正在输入、群表情、戳一戳、公告回应、资料点赞
 
 路径前缀 `/api/v1`。带 `code` 的错误，`detail` 是 `{ code, message }`，`message` 是可直接展示的中文。
 
@@ -311,3 +311,59 @@
 ### 5.4 后台
 
 `GET /admin/announcements` 的每一项同样带 `reactions`（`reacted_by_me` 恒为 false）。
+
+## 6. 资料点赞
+
+给别人的个人空间 / 资料卡点赞，赞数累计，参照 QQ 的名片赞。
+
+### 6.1 规则
+
+- 每人每天（UTC+8 自然日）可以给同一个人点 1 个赞；第二天可以再点。赞数只增不减，点了不能取消。
+- 不能给自己点赞；不能给机器人点赞。
+- 每人每天最多给 `targets_per_day`（默认 50）个不同的人点赞。
+- 被平台禁言 / 封禁的人不能点赞。
+
+### 6.2 用户对象
+
+`UserPublic` 新增 `profile_like_count`（整数，累计收到的赞）。旧客户端不认识，不受影响。
+
+### 6.3 接口
+
+`GET /users/{user_id}/likes` → 我和这个人之间的点赞状态：
+
+```jsonc
+{
+  "user_id": 42,
+  "like_count": 6024,        // 累计
+  "today_count": 12,         // 今天收到的
+  "liked_today": false,      // 我今天给他点过没有；看自己时恒为 false
+  "can_like": true,          // 我现在能不能点（不是自己、不是机器人、今天没点过、没到每日上限、没被禁言）
+  "reason": null,            // 不能点的原因：self / bot / muted / liked_today / limit；能点时为 null
+  "left_today": 37           // 我今天还能给多少个不同的人点赞
+}
+```
+
+`POST /users/{user_id}/likes` → 点一个赞，返回同上的对象（`liked_today: true`）。
+
+| HTTP | `detail.code` | 含义 |
+| --- | --- | --- |
+| 404 | `user_not_found` | 用户不存在 |
+| 400 | `cannot_like_self` / `cannot_like_bot` | |
+| 409 | `already_liked_today` | 今天已经给他点过了 |
+| 429 | `like_limit` | 今天点赞的人数到上限了。`detail.resets_at` 是明天 0 点（UTC+8） |
+| 403 | `account_muted` | 被禁言期间不能点赞 |
+
+`GET /users/me/likes/received?limit=20&offset=0` → 谁赞了我，按时间倒序：
+
+```jsonc
+{ "items": [ { "user": { /* UserPublic */ }, "created_at": "…", "today": true } ],
+  "total": 6024, "today_count": 12 }
+```
+
+同一个人每天一条。`limit` 1–50。
+
+`GET /users/likes/options` → `{ "targets_per_day": 50 }`。
+
+### 6.4 实时事件
+
+`user.profile.liked`：`{ "from_user": { /* UserPublic */ }, "like_count": 6025, "today_count": 13 }`，发给被赞的人本人。不写通知中心（太频繁）；同一个被赞者 3 秒内的多次点赞合并成一次事件，`from_user` 是最后一个。

@@ -7,6 +7,9 @@
 *.p12
 *.pfx
 
+# 私有覆盖层：集成点（CCW 网关、金币账本）的实现，不开源，部署时另行带上。见 README「集成点」
+app/_private/
+
 # Python
 __pycache__/
 *.py[cod]

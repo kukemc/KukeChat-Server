@@ -176,9 +176,36 @@ python -m pytest tests/ -q
 | `REDIS_URL` | 单进程可留空；**多 worker / 多实例时必填**，否则 WebSocket 无法跨进程广播 |
 | `STORAGE_BACKEND` | `local` 或 `s3` |
 | `CONTENT_MODERATION_ENABLED` | 默认关闭。本项目不自带审核服务，启用时必须提供 `CONTENT_MODERATION_URL` |
-| `CCW_BIND_*` | CCW 账号绑定，留空则该功能整体不可用 |
+| `CCW_BIND_*` | CCW 账号绑定，留空则该功能整体不可用。另外还需要接入 CCW 网关，见下面的「集成点」 |
 
 仓库不内置任何生产地址、密钥或运营方标识。
+
+### 集成点
+
+有两处功能依赖外部平台，**怎么向外部平台取数不在这个仓库里**。仓库只定义接口（`app/integrations/`）和占位实现，
+业务逻辑（绑定流程、资料同步、商店、作品链接卡片怎么拼）都在开源的部分：
+
+| 接口 | 文件 | 提供什么 | 没有实现时 |
+| --- | --- | --- | --- |
+| CCW 网关 `CcwGateway` | `app/integrations/ccw_gateway.py` | `latest_comments(subject_oid, subject_type)` 某个评论区最新一页评论；`student_payloads(student_oid)` 某个学生的资料与主页统计；`creation_detail(oid, access_key)` 某个作品的详情。取不到统一抛 `CcwUnavailable` | CCW 账号绑定显示为未开放（发起绑定返回 503，轮询评论的后台任务不启动）；资料同步、消息 / 动态 / 组队里的作品链接卡片静默跳过；用评论验证码改密码不可用 |
+| 金币账本 `CoinLedger` | `app/integrations/coin_ledger.py` | `credited_to(account_id)` 某个账号累计入账多少；`recent_credits()` / `all_credits()` 名单；`topup_url()` 充值页；`configured()` / `source()`。核实不了统一抛 `CoinsUnavailable` | 商店能逛、能领等级解锁的商品、能装备；余额恒为 `stale`，花币购买返回 503（详见 [`docs/shop.md`](docs/shop.md)） |
+
+**自己部署时怎么提供实现**：在 `app/_private/`（已在 `.gitignore` 里，不会入库）放一个 Python 包，导出两个不带参数的工厂函数：
+
+```python
+# app/_private/__init__.py
+from app.integrations import CcwGateway, CoinLedger
+
+def create_ccw_gateway() -> CcwGateway: ...
+def create_coin_ledger() -> CoinLedger: ...
+```
+
+启动时 `app/integrations/loader.py` 发现这个包就用它，没有就用占位实现。这个包存在但有问题（导入报错、缺工厂函数、
+返回的不是接口的实现）时服务**启动即失败**，不会悄悄退回占位实现。两个接口各自的约定写在对应文件的文档字符串里；
+实现要自己负责不阻塞事件循环（同步请求放进线程池）。只想接其中一个，另一个工厂返回 `NullCcwGateway()` / `NullCoinLedger()` 即可。
+
+测试里用 `integrations.use_ccw_gateway(...)` / `use_coin_ledger(...)` 换成假实现，例子见 `tests/integration_fakes.py`。
+本仓库的全部测试在没有 `app/_private` 的情况下通过。
 
 ### 关于 JWT_SECRET_KEY
 
@@ -192,6 +219,7 @@ python -m pytest tests/ -q
 app/
   api/v1/       REST 端点，按业务域拆分
   core/         配置、数据库、鉴权依赖、安全工具
+  integrations/ 外部平台的集成点：只有接口与占位实现（见「集成点」）
   models/       SQLAlchemy 模型
   schemas/      Pydantic 请求/响应模型
   services/     业务逻辑

@@ -83,6 +83,12 @@ class User(Base):
     # 对外展示的风纪委员层级（trainee / regular / senior）。冗余自 jury_members：只有在任且本人选择公开时有值，
     # 由 jury_points.sync_badge 维护。用户对象出现在消息发送等热路径上，序列化时不能再去查 jury_members
     jury_badge: Mapped[str | None] = mapped_column(String(12), nullable=True)
+    # 商店里装备着的装饰（docs/shop.md 2.3）：{"bubble": {"sku": ..., "style": {...}}} 的 JSON，没装备为空。
+    # 冗余自 shop_items / shop_purchases，由 services/shop.py 维护；和 jury_badge 一样，序列化用户时不再查别的表
+    cosmetics: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 资料累计收到的赞（docs/chat-features.md 第 6 节），只增不减。冗余自 profile_likes，由 services/profile_likes.py
+    # 在点赞的同一个事务里用 UPDATE ... SET x = x + 1 维护；序列化用户时直接读这一列，不查别的表
+    profile_like_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     registration_ip: Mapped[str | None] = mapped_column(String(45), unique=True, index=True, nullable=True)
     last_login_ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

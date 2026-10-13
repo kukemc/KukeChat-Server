@@ -12,10 +12,24 @@ KukeChat 自己不发币、不存币。余额是算出来的：
 余额 = 这个人给 KukeChat 官方作品累计投出的币 − 在商店里已经花掉的币
 ```
 
-- 「累计投出的币」由**服务端**向 CCW 的公开投币排行核实（按用户绑定的 CCW 账号匹配），不采信客户端报的数。按用户投出的数量算，不扣平台回收的那部分。
+- 「累计投出的币」由**服务端**通过可插拔的余额来源核实（按用户绑定的 CCW 账号匹配，见 1.1），不采信客户端报的数。按用户投出的数量算，不扣平台回收的那部分。
 - 以前给官方作品投过币的人，绑定 CCW 账号后自带余额。
 - 必须先绑定 CCW 账号。没绑定的人能逛商店，不能买。
 - 充值就是去官方作品投币：客户端打开 `shop.donate_url`（作品页），用户投完回来点「刷新余额」。任何平台（扩展、桌面端、移动端）都是这个流程，客户端不调用任何投币接口。
+
+### 1.1 余额来源
+
+「某个 CCW 账号累计投了多少币」不是这个仓库里的代码去查的。商店只依赖一个接口 —— `app/integrations/coin_ledger.py` 的 `CoinLedger`：
+
+| 方法 | 含义 |
+| --- | --- |
+| `configured()` | 现在能不能核实余额 |
+| `credited_to(account_id)` | 这个账号累计入账多少；确实没有返回 0，核实不了抛 `CoinsUnavailable` |
+| `recent_credits(limit)` / `all_credits(fresh=)` | 最近入账的账号 / 全部账号的名单（后台对账用全量） |
+| `topup_url()` | 充值页地址，就是接口里的 `donate_url` |
+| `source()` | 余额来源的标识和它取自哪个配置项，后台设置页展示用 |
+
+实现由部署方提供（见 README 的「集成点」）。核实不了一律按「现在不知道」处理，绝不当成 0。**没有接入余额来源时**和「没配置官方作品」一样：能逛、能领等级解锁的商品，`donate_url` 为 null，已绑定用户的余额恒为 `stale`，花币购买返回 503 `verification_unavailable`。
 
 ## 2. 商品
 
@@ -135,7 +149,7 @@ KukeChat 自己不发币、不存币。余额是算出来的：
 | 409 | `ccw_not_bound` | 没绑定 CCW 账号 |
 | 409 | `item_locked` | 不卖，且等级不够 |
 | 402 | `insufficient_coins` | 余额不够。`detail` 里带 `balance`（数字，当前余额）、`price`、`shortfall`、`donate_url` |
-| 503 | `verification_unavailable` | 现在核实不了余额（CCW 接口不通），稍后再试。不会扣币 |
+| 503 | `verification_unavailable` | 现在核实不了余额（余额来源不通，或者没有接入），稍后再试。不会扣币 |
 
 ### 3.4 `PUT /shop/equipped`
 
@@ -144,6 +158,17 @@ body `{ "slot": "bubble", "sku": "bubble.aurora" }`，`sku` 传 null 表示卸�
 ### 3.5 `GET /shop/purchases?limit&offset`
 
 我的购买记录：`{ items: [{ id, item: { sku, name, category }, price, source, created_at }], total }`。`source` ∈ `purchase` 买的 / `level` 等级解锁 / `grant` 赠送。
+
+### 3.6 细节
+
+- `GET /shop` 不会向 CCW 发请求，只返回上次核实的结果。**绑定后从没核实过的人 `verified_at` 是 null、余额是 0**——客户端打开商店时如果 `bound` 为 true 且 `verified_at` 为 null，应当自动调一次 `POST /shop/balance/refresh`。
+- 没配置官方作品（或者没有接入余额来源，见 1.1）时 `donate_url` 为 null，余额恒为 `stale`，购买返回 503。
+- 购买时的检查顺序：`item_not_found` → `already_owned` → `item_unavailable` → 等级免费领 / `item_locked` → `ccw_not_bound` → 503 → 402。等级够了的免费领取不要求绑定 CCW。
+- 同一个 CCW 账号的币不能换绑到别的 KukeChat 账号再花一遍：`balance.spent` 里包含这个 CCW 账号在别的 KukeChat 账号上已经花掉的部分。
+- `GET /shop/purchases` 的每条多 `revoked_at`（被后台收回的时间，否则 null）和 `refunded`。被收回的商品可以再次获得。
+- 被后台收回时，本人只会在「正装备着这件」的情况下收到 `user.cosmetics.updated`；商店页的「已拥有」要到下次拉取才变。
+- `user.cosmetics.updated` 第一次变化立即发，5 秒内的后续变化合并成最后一次。
+- 其它错误码：422 `invalid_slot`（装备时槽不存在）。
 
 ## 4. 实时事件
 
@@ -161,7 +186,7 @@ body `{ "slot": "bubble", "sku": "bubble.aurora" }`，`sku` 传 null 表示卸�
 | `POST /admin/shop/items`、`PUT /admin/shop/items/{id}` | 新建 / 修改：`sku`（新建后不可改）、`category`、`name`、`description`、`price`、`unlock_level`、`style`、`preview_text`、`tag`、`is_active`、`sort`、`available_until`。`style` 不合法返回 422 `invalid_style` 并说明哪个字段 |
 | `GET /admin/shop/purchases?user_id=&item_id=&limit&offset` | 购买记录 |
 | `GET /admin/shop/accounts?q=&mismatch=&limit&offset` | 每个用户的累计投币、已花、余额、上次核实时间；`mismatch=true` 只看「花的比投的多」的 |
-| `POST /admin/shop/reconcile` | 向 CCW 拉一次完整的投币排行，更新所有已绑定用户的累计投币，返回 `{ donors, matched, updated, mismatched: [...] }` |
+| `POST /admin/shop/reconcile` | 向余额来源拉一次完整的投币名单，更新所有已绑定用户的累计投币，返回 `{ donors, matched, updated, mismatched: [...] }`。拉不到完整名单时 503，什么都不改 |
 | `POST /admin/shop/users/{user_id}/grant` | `{ item_id, note }` 赠送 |
 | `POST /admin/shop/users/{user_id}/revoke` | `{ item_id, note }` 收回（同时卸下） |
 | `GET /admin/shop/settings` | 官方作品、各项阈值（只读） |

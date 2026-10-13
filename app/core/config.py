@@ -60,13 +60,27 @@ class Settings(BaseSettings):
     moderation_alert_email: str | None = None
     moderation_alert_cooldown_minutes: int = Field(default=30, ge=1, le=1440)
     # CCW 账号绑定：用户在指定作品下留言，服务端轮询评论完成校验。
-    # 这些值与具体运营方绑定，未配置时 CCW 绑定功能不可用。
+    # 这些值与具体运营方绑定，未配置时 CCW 绑定功能不可用。真正向 CCW 取数的实现不在本仓库里（见 README「集成点」），
+    # 没有接入时这些值填了也不生效。
     ccw_bind_subject_oid: str | None = None
     ccw_bind_subject_type: str = "CREATION"
-    # 访问 CCW 接口时携带的访客标识。请填入你自己的值，不要复用他人的。
+    # 访问 CCW 时使用的访客标识（由 CCW 网关的实现使用）。请填入你自己的值，不要复用他人的。
     ccw_bind_guest_id: str | None = None
     ccw_bind_poll_interval_seconds: int = Field(default=20, ge=5, le=300)
     ccw_bind_challenge_minutes: int = Field(default=20, ge=3, le=120)
+    # —— 商店（docs/shop.md）——
+    # 金币余额 = 用户给这个作品累计投的币 − 已花。留空时退回 ccw_bind_subject_oid；两个都没配，
+    # 或者没配 ccw_bind_guest_id，或者没有接入余额来源（见 README「集成点」）时，余额功能不可用：能逛、能领等级解锁的商品，不能买。
+    ccw_shop_creation_oid: str | None = None
+    # 每人多少秒内最多向 CCW 核实一次余额；购买时在这段时间内核实成功过就直接用
+    shop_refresh_interval_seconds: int = Field(default=20, ge=1, le=3600)
+    # 给余额来源的实现用的两个参数：核实时先看「最近投过币的前 N 人」，不在里面再取全量；全量结果在进程内缓存多少秒
+    shop_ranking_recent_limit: int = Field(default=200, ge=1, le=1000)
+    shop_ranking_cache_seconds: int = Field(default=60, ge=0, le=3600)
+    # shop.changed 同一进程多少秒内最多发一次
+    shop_changed_interval_seconds: int = Field(default=30, ge=0, le=3600)
+    # user.cosmetics.updated 同一个用户多少秒内最多发一次（间隔内的变化并成一次，发最后的状态）
+    shop_cosmetics_event_interval_seconds: int = Field(default=5, ge=0, le=3600)
     # 邀请链接的落地页。用户打开它即可加入群聊 / 添加好友，
     # 通常指向你部署了 KukeChat 客户端的页面。
     invite_base_url: str = "http://localhost:5173"
@@ -237,6 +251,11 @@ class Settings(BaseSettings):
     announcement_reaction_per_user: int = Field(default=5, ge=1, le=100)
     announcement_reaction_per_announcement: int = Field(default=30, ge=1, le=1000)
     announcement_reaction_per_minute: int = Field(default=20, ge=1, le=10000)
+    # 资料点赞（docs/chat-features.md 第 6 节）。客户端通过 GET /users/likes/options 读每日上限，不要在别处写死。
+    # 每人每天（UTC+8 自然日）最多给多少个不同的人点赞
+    profile_like_targets_per_day: int = Field(default=50, ge=1, le=100000)
+    # 实时事件 user.profile.liked 的合并窗口：同一个被赞者在这段时间里收到的赞只推一次
+    profile_like_event_merge_seconds: float = Field(default=3.0, ge=0, le=60)
     task_reminder_check_interval_seconds: int = Field(default=60, ge=10, le=3600)
     task_reminder_advance_hours: int = Field(default=24, ge=1, le=168)
     smtp_enabled: bool = False

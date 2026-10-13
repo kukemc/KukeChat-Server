@@ -658,3 +658,21 @@ async def init_db() -> None:
                         {"message_id": message_id},
                     )
                 await conn.execute(text("CREATE UNIQUE INDEX uq_featured_message ON featured_messages (message_id)"))
+
+            # 商店（docs/shop.md）。新表 shop_items / shop_purchases / shop_accounts 由上面的 create_all 建，这里只补已有表的列。
+            for table_name, column_name, column_sql in (("users", "cosmetics", "cosmetics TEXT"),):
+                if table_name not in table_names:
+                    continue
+                columns = await conn.execute(text(f"PRAGMA table_info({table_name})"))
+                if column_name not in {row[1] for row in columns}:
+                    await conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_sql}"))
+
+            # 资料点赞（docs/chat-features.md 第 6 节）。新表 profile_likes 由上面的 create_all 建，这里只补 users 上的累计列。
+            for table_name, column_name, column_sql in (
+                ("users", "profile_like_count", "profile_like_count INTEGER NOT NULL DEFAULT 0"),
+            ):
+                if table_name not in table_names:
+                    continue
+                columns = await conn.execute(text(f"PRAGMA table_info({table_name})"))
+                if column_name not in {row[1] for row in columns}:
+                    await conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_sql}"))

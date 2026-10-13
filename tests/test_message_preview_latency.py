@@ -7,21 +7,28 @@ import json
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 import app.models  # noqa: F401
+from app import integrations
 from app.core.database import Base
 from app.models.conversation import Conversation, ConversationMember
 from app.models.enums import ConversationType, MemberRole
 from app.models.message import Message
 from app.models.user import User
 from app.services import ccw, messages, response_cache
+from integration_fakes import FakeCcwGateway
 
 OIDS = ("111111111111111111111111", "222222222222222222222222", "333333333333333333333333", "444444444444444444444444")
+
+
+def fake_gateway(fetch) -> FakeCcwGateway:
+    """作品详情由 fetch(oid, access_key) 提供的假网关；fetch 是同步的，跑在线程里（和真实网关一样不挡事件循环）。"""
+    return FakeCcwGateway(creation_fetch=fetch)
 
 
 def creation_url(oid: str, access_key: str = "") -> str:
@@ -50,7 +57,7 @@ class PreviewConcurrencyTests(unittest.IsolatedAsyncioTestCase):
                     active -= 1
 
         content = " ".join([creation_url(OIDS[0], "privateA"), creation_url(OIDS[1]), creation_url(OIDS[2], "privateB"), creation_url(OIDS[3])])
-        with patch.object(ccw, "_fetch_creation_detail_sync", side_effect=fetch), patch.object(response_cache, "get_ccw_creation", return_value=None), patch.object(response_cache, "set_ccw_creation"):
+        with integrations.use_ccw_gateway(fake_gateway(fetch)), patch.object(response_cache, "get_ccw_creation", return_value=None), patch.object(response_cache, "set_ccw_creation"):
             start = time.monotonic()
             previews = await ccw.previews_from_text(content, limit=100)
             elapsed = time.monotonic() - start
@@ -71,7 +78,7 @@ class PreviewConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             time.sleep(0.08)
             return {"body": {"oid": oid, "title": oid}}
 
-        with patch.object(ccw, "_fetch_creation_detail_sync", side_effect=fetch), patch.object(response_cache, "get_ccw_creation", return_value=None), patch.object(response_cache, "set_ccw_creation"):
+        with integrations.use_ccw_gateway(fake_gateway(fetch)), patch.object(response_cache, "get_ccw_creation", return_value=None), patch.object(response_cache, "set_ccw_creation"):
             start = time.monotonic()
             previews = await ccw.previews_from_text(" ".join(map(creation_url, OIDS[:3])))
             elapsed = time.monotonic() - start
@@ -80,7 +87,8 @@ class PreviewConcurrencyTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cache_separates_access_keys(self) -> None:
         cache: dict[str, dict] = {}
-        with patch.object(ccw, "_fetch_creation_detail_sync", return_value={"body": {"oid": OIDS[0]}}) as fetch, patch.object(response_cache, "get_ccw_creation", side_effect=cache.get), patch.object(response_cache, "set_ccw_creation", side_effect=cache.__setitem__):
+        fetch = Mock(return_value={"body": {"oid": OIDS[0]}})
+        with integrations.use_ccw_gateway(fake_gateway(fetch)), patch.object(response_cache, "get_ccw_creation", side_effect=cache.get), patch.object(response_cache, "set_ccw_creation", side_effect=cache.__setitem__):
             await ccw.fetch_creation_preview(OIDS[0], "keyA")
             await ccw.fetch_creation_preview(OIDS[0], "keyB")
             await ccw.fetch_creation_preview(OIDS[0], "keyA")
@@ -112,14 +120,15 @@ class MessagePreviewTests(unittest.IsolatedAsyncioTestCase):
         await self.engine.dispose()
 
     async def test_plain_text_never_touches_preview_io_or_metadata(self) -> None:
-        with patch.object(ccw, "_fetch_creation_detail_sync", side_effect=AssertionError("external IO")), patch.object(messages, "enrich_metadata_with_previews", side_effect=AssertionError("enricher entered")):
+        with integrations.use_ccw_gateway(fake_gateway(Mock(side_effect=AssertionError("external IO")))), patch.object(messages, "enrich_metadata_with_previews", side_effect=AssertionError("enricher entered")):
             async with self.sessions() as db:
                 sent = await messages.send_message(db, self.conversation_id, await db.get(User, self.sender_id), "plain message", metadata={"client": "preserved"})
                 self.assertEqual(json.loads(sent.metadata_json), {"client": "preserved"})
 
     async def test_preview_persisted_and_unauthorized_user_not_fetched(self) -> None:
         url = creation_url(OIDS[3], "secret")
-        with patch.object(ccw, "_fetch_creation_detail_sync", return_value={"body": {"oid": OIDS[3], "title": "sample"}}) as fetch:
+        fetch = Mock(return_value={"body": {"oid": OIDS[3], "title": "sample"}})
+        with integrations.use_ccw_gateway(fake_gateway(fetch)):
             async with self.sessions() as db:
                 with self.assertRaises(HTTPException) as rejected:
                     await messages.send_message(db, self.conversation_id, await db.get(User, self.outsider_id), url)
@@ -134,7 +143,7 @@ class MessagePreviewTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(stored.metadata_json, sent.metadata_json)
 
     async def test_forbidden_mention_all_does_not_fetch(self) -> None:
-        with patch.object(ccw, "_fetch_creation_detail_sync", side_effect=AssertionError("external IO")):
+        with integrations.use_ccw_gateway(fake_gateway(Mock(side_effect=AssertionError("external IO")))):
             async with self.sessions() as db:
                 with self.assertRaises(HTTPException) as rejected:
                     await messages.send_message(db, self.conversation_id, await db.get(User, self.sender_id), creation_url(OIDS[0]), metadata={"mention_all": True})
@@ -174,7 +183,7 @@ class MessagePreviewTests(unittest.IsolatedAsyncioTestCase):
                     async with sessions() as db:
                         await messages.send_message(db, conversation_id, await db.get(User, user_id), creation_url(OIDS[0]))
 
-                with patch.object(ccw, "_fetch_creation_detail_sync", side_effect=fetch), patch.object(response_cache, "get_ccw_creation", return_value=None):
+                with integrations.use_ccw_gateway(fake_gateway(fetch)), patch.object(response_cache, "get_ccw_creation", return_value=None):
                     task = asyncio.create_task(send())
                     try:
                         self.assertTrue(await asyncio.to_thread(fetching.wait, 1))

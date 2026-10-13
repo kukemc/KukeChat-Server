@@ -13,6 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 
+from app import integrations
 from app.api.v1.router import api_router
 from app.core.config import settings
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -25,6 +26,7 @@ from app.services.account_levels import start_account_level_worker, stop_account
 from app.services.cases import start_jury_sweep_worker, stop_jury_sweep_worker
 from app.services.ccw import start_ccw_binding_worker, stop_ccw_binding_worker
 from app.services.moderation import start_moderation_retry_worker, stop_moderation_retry_worker
+from app.services.shop import ensure_default_items as ensure_default_shop_items
 from app.services.task import start_task_reminder_worker, stop_task_reminder_worker
 from app.services.task_assistant import ensure_task_assistant_bot
 from app.services.system_settings import export_public_download_metadata, get_public_download_settings
@@ -34,6 +36,8 @@ from app.websocket.routes import router as websocket_router
 
 DOWNLOAD_ICON_URL = "https://m.ccw.site/gandi_application/user_assets/640168abc245d7bf4c6a6a23b03cd29c.png"
 transport_metrics = TransportMetrics() if settings.transport_metrics_enabled else None
+# 集成点（CCW 网关、金币账本）：有私有实现就用，没有就用占位实现。放在导入时做，私有包有问题启动时就报错
+integrations.load()
 # The sole switch and 60-second task cover HTTP ASGI and all local WS/Redis publishers.
 for _realtime_manager in (manager, admin_manager, bot_manager, game_manager):
     _realtime_manager.transport_metrics = transport_metrics
@@ -76,6 +80,8 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
     await init_db()
     async with AsyncSessionLocal() as db:
         await ensure_task_assistant_bot(db)
+        # 商店的初始商品（幂等，已有的不动）
+        await ensure_default_shop_items(db)
     await manager.start()
     await admin_manager.start()
     await bot_manager.start()

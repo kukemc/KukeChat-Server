@@ -198,6 +198,8 @@ async def run(args):
         if args.mode == "slow-preview":
             from app.services import ccw
             patches.enter_context(patch.object(ccw, "fetch_creation_preview", fake_preview))
+            # Without a CCW gateway implementation previews are skipped outright; pretend one is plugged in.
+            patches.enter_context(patch.object(ccw, "ccw_gateway_available", lambda: True))
         patches.enter_context(patch.object(api, "send_message", track("api_callable_total", original_api)))
         # This endpoint always schedules an admin signal; never permit a real network connection.
         # Stub only the optional admin channel; user Redis presence and broadcast are real methods.

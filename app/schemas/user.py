@@ -1,11 +1,33 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
 from app.models.enums import PlatformRole, PresenceStatus, UserStatus
+
+
+def parse_cosmetics(value: Any) -> dict[str, Any]:
+    """users.cosmetics 那一列（JSON 文本）-> { 槽位: { sku, style } }。空的、解析不了的、形状不对的一律给 {}。
+
+    只解析这一列本身，不查库：用户对象在消息发送等热路径上。
+    """
+    if not value:
+        return {}
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return {}
+    if not isinstance(value, dict):
+        return {}
+    return {
+        slot: {"sku": entry["sku"], "style": entry["style"]}
+        for slot, entry in value.items()
+        if isinstance(slot, str) and isinstance(entry, dict) and isinstance(entry.get("sku"), str) and isinstance(entry.get("style"), dict)
+    }
 
 
 class UserPublic(BaseModel):
@@ -54,7 +76,16 @@ class UserPublic(BaseModel):
     account_level: int = 0
     # 公开展示的风纪委员层级：trainee / regular / senior；不是在任委员或本人没选择公开时为 null
     jury_badge: str | None = None
+    # 装备着的商店装饰（docs/shop.md 2.3）：{ 槽位: { sku, style } }，没装备时是 {}
+    cosmetics: dict[str, Any] = Field(default_factory=dict)
+    # 资料累计收到的赞，见 docs/chat-features.md 第 6 节。直接读 users.profile_like_count 这一列
+    profile_like_count: int = 0
     created_at: datetime
+
+    @field_validator("cosmetics", mode="before")
+    @classmethod
+    def _load_cosmetics(cls, value: Any) -> dict[str, Any]:
+        return parse_cosmetics(value)
 
 
 class UserRead(UserPublic):
@@ -89,6 +120,37 @@ class PokeOptionsRead(BaseModel):
     actions: list[str]
     default_action: str
     suffix_max_length: int
+
+
+class ProfileLikeOptions(BaseModel):
+    targets_per_day: int
+
+
+class ProfileLikeState(BaseModel):
+    """我和这个人之间的点赞状态（docs/chat-features.md 6.3）。"""
+
+    user_id: int
+    like_count: int
+    today_count: int
+    # 看自己时恒为 false
+    liked_today: bool
+    can_like: bool
+    # can_like 为 false 时说明为什么不能点，同时成立时取靠前的一个；能点时为 null
+    reason: Literal["self", "bot", "muted", "liked_today", "limit"] | None = None
+    # 我今天还能给多少个不同的人点赞；看自己时也照常返回
+    left_today: int
+
+
+class ProfileLikeReceivedItem(BaseModel):
+    user: UserPublic
+    created_at: datetime
+    today: bool
+
+
+class ProfileLikeReceivedPage(BaseModel):
+    items: list[ProfileLikeReceivedItem]
+    total: int
+    today_count: int
 
 
 class UserPresenceUpdate(BaseModel):

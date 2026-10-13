@@ -1,18 +1,17 @@
 from __future__ import annotations
 
-import json
 from typing import Annotated, Any
-from urllib.error import HTTPError, URLError
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.dependencies import get_current_user
+from app.integrations import CcwUnavailable
 from app.models.user import User
 from app.schemas.ccw import CcwBindingChallengeRead, CcwSyncProfilePayload
 from app.schemas.user import UserRead
-from app.services.ccw import OID_PATTERN, ccw_bind_creation_url, check_binding_challenges_once, create_binding_challenge, fetch_creation_preview, latest_binding_challenge, sync_bound_student, unbind_student
+from app.services.ccw import FETCH_ERRORS, OID_PATTERN, ccw_bind_creation_url, ccw_gateway_available, check_binding_challenges_once, create_binding_challenge, fetch_creation_preview, latest_binding_challenge, sync_bound_student, unbind_student
 
 
 router = APIRouter()
@@ -44,11 +43,15 @@ async def ccw_creation_preview(
     if not OID_PATTERN.fullmatch(oid):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="无效的作品 ID")
 
+    if not ccw_gateway_available():
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="本服务未接入 CCW，无法获取作品信息")
     try:
         return await fetch_creation_preview(oid.lower(), access_key)
-    except HTTPError as exc:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="CCW 作品接口请求失败") from exc
-    except (URLError, TimeoutError, ValueError, json.JSONDecodeError, OSError) as exc:
+    except CcwUnavailable as exc:
+        # 对方明确返回了错误码，和「连不上 / 返回的内容看不懂」分开提示
+        detail = "CCW 作品接口请求失败" if exc.upstream_status is not None else "无法解析 CCW 作品详情"
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=detail) from exc
+    except (ValueError, OSError) as exc:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="无法解析 CCW 作品详情") from exc
 
 
@@ -77,7 +80,7 @@ async def check_my_ccw_binding(
 ) -> CcwBindingChallengeRead | None:
     try:
         await check_binding_challenges_once(db, current_user.id)
-    except (HTTPError, URLError, TimeoutError, ValueError, json.JSONDecodeError, OSError) as exc:
+    except FETCH_ERRORS as exc:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="检查 CCW 评论失败，请稍后重试") from exc
     challenge = await latest_binding_challenge(db, current_user.id)
     return _challenge_read(challenge) if challenge is not None else None
