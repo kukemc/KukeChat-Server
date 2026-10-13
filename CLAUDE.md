@@ -12,9 +12,9 @@ FastAPI + SQLAlchemy 2（全异步）+ WebSocket。206 个 REST 端点，三条�
 | --- | --- | --- |
 | KukeChat-Server | 本仓库（公开） | 后端 API |
 | KukeChat-Client | `../KukeChat-Client`（公开） | 客户端三端 |
-| KukeChat | `../KukeChat`（私有） | 后台管理端 + 运维脚本 |
+| KukeChat | `../KukeChat`（私有） | 后台管理端、部署与运维 |
 
-> `../KukeChat/FastAPI/` 是拆分前的旧副本，**不要在那里改代码**。
+> 后端只有本仓库这一份，开发和发布都在 `main` 上。
 
 ## 常用命令
 
