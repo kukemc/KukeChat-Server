@@ -174,40 +174,22 @@
     .dl.is-disabled.is-primary small { color: var(--muted); }
     .hint { margin: 18px 0 0; font-size: 13px; color: var(--faint); }
 
-    /* ── 产品界面示意 ── */
-    .shot { margin: 72px auto 0; max-width: 980px; }
-    .window {
+    /* ── 产品截图 ── */
+    .shot { margin: 72px auto 0; max-width: 1040px; perspective: 1600px; }
+    .frame {
       overflow: hidden;
       border: 1px solid var(--line-strong);
-      border-radius: 16px;
+      border-radius: 18px;
       background: var(--card);
       box-shadow: var(--shadow);
-      text-align: left;
+      transform-origin: 50% 0;
     }
-    .titlebar { display: flex; align-items: center; gap: 7px; height: 40px; padding: 0 16px; border-bottom: 1px solid var(--line); }
-    .titlebar i { width: 10px; height: 10px; border-radius: 50%; background: var(--line-strong); }
-    .titlebar span { margin-left: auto; margin-right: auto; padding-right: 51px; font-size: 12px; color: var(--faint); }
-    .app { display: grid; grid-template-columns: 280px minmax(0, 1fr); height: 440px; }
-    .side { border-right: 1px solid var(--line); padding: 14px 10px; overflow: hidden; }
-    .search { height: 32px; margin: 0 6px 12px; border-radius: 8px; background: var(--chip); display: flex; align-items: center; padding: 0 12px; font-size: 12px; color: var(--faint); }
-    .conv { display: flex; align-items: center; gap: 12px; padding: 10px; border-radius: 10px; }
-    .conv.on { background: var(--chip); }
-    .av { flex: 0 0 auto; display: grid; place-items: center; width: 38px; height: 38px; border-radius: 50%; background: var(--bubble); border: 1px solid var(--line); font-size: 14px; font-weight: 600; color: var(--muted); }
-    .conv-t { min-width: 0; flex: 1; }
-    .conv-t b { display: flex; justify-content: space-between; font-size: 13px; font-weight: 600; }
-    .conv-t b em { font-style: normal; font-weight: 400; font-size: 11px; color: var(--faint); }
-    .conv-t small { display: block; margin-top: 2px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 12px; color: var(--muted); }
-    .chat { display: flex; flex-direction: column; min-width: 0; }
-    .chat-head { display: flex; align-items: center; justify-content: space-between; height: 56px; padding: 0 22px; border-bottom: 1px solid var(--line); }
-    .chat-head b { font-size: 14px; font-weight: 600; }
-    .chat-head small { font-size: 12px; color: var(--faint); }
-    .msgs { flex: 1; display: flex; flex-direction: column; justify-content: flex-end; gap: 12px; padding: 22px; overflow: hidden; }
-    .msg { display: flex; align-items: flex-end; gap: 10px; max-width: 78%; }
-    .msg .av { width: 28px; height: 28px; font-size: 11px; }
-    .bubble { padding: 9px 14px; border-radius: 18px; background: var(--bubble); font-size: 14px; line-height: 1.5; }
-    .msg.me { align-self: flex-end; flex-direction: row-reverse; }
-    .msg.me .bubble { background: var(--ink); color: var(--ink-fg); }
-    .composer { margin: 0 22px 20px; height: 42px; border: 1px solid var(--line); border-radius: 999px; display: flex; align-items: center; padding: 0 18px; font-size: 13px; color: var(--faint); }
+    .rise.shot .frame { animation: tilt 1.4s cubic-bezier(.2, .7, .2, 1) .44s both; }
+    .frame-bar { display: flex; align-items: center; gap: 7px; height: 38px; padding: 0 16px; border-bottom: 1px solid var(--line); }
+    .frame-bar i { width: 10px; height: 10px; border-radius: 50%; background: var(--line-strong); }
+    .frame-bar span { margin: 0 auto; padding-right: 51px; font-size: 12px; color: var(--faint); }
+    .frame-view { position: relative; overflow: hidden; background: var(--bg-soft); }
+    .frame-view img { width: 100%; height: auto; }
 
     /* ── 通用分区 ── */
     section.block { padding: 120px 0 0; }
@@ -285,18 +267,18 @@
     .reveal.is-in { opacity: 1; transform: none; }
     .no-js .reveal { opacity: 1; transform: none; }
     @keyframes rise { to { opacity: 1; transform: none; } }
+    @keyframes tilt { from { transform: rotateX(14deg) scale(.96); } to { transform: none; } }
     @keyframes ping { 0% { opacity: .6; transform: scale(.6); } 80%, 100% { opacity: 0; transform: scale(1.6); } }
 
     @media (prefers-reduced-motion: reduce) {
       html { scroll-behavior: auto; }
-      .rise, .reveal { opacity: 1 !important; transform: none !important; animation: none !important; transition: none !important; }
+      .rise, .reveal, .rise.shot .frame { opacity: 1 !important; transform: none !important; animation: none !important; transition: none !important; }
       .pulse i::after { animation: none; }
       .dl, .nav { transition: none; }
     }
 
     /* ── 窄屏 ── */
     @media (max-width: 900px) {
-      .app { grid-template-columns: 220px minmax(0, 1fr); }
       .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .stat:nth-child(3) { padding-left: 0; border-left: 0; }
@@ -314,13 +296,11 @@
       .dl-copy { flex-direction: row; align-items: baseline; justify-content: space-between; flex: 1; gap: 12px; }
       .dl-copy small { margin-top: 0; }
       .shot { margin-top: 52px; }
-      .window { border-radius: 14px; }
-      .app { grid-template-columns: minmax(0, 1fr); height: 380px; }
-      .side { display: none; }
-      .titlebar span { padding-right: 0; }
-      .msgs { padding: 16px; }
-      .msg { max-width: 88%; }
-      .composer { margin: 0 16px 16px; }
+      .frame { border-radius: 14px; }
+      .frame-bar { height: 32px; }
+      .frame-bar span { padding-right: 0; }
+      /* 手机上只露中间的聊天区：截图里聊天区在 325–1060px（共 1280px 宽） */
+      .frame-view img { width: 174.2%; max-width: none; margin-left: -44.2%; }
       section.block { padding-top: 88px; }
       .grid { grid-template-columns: minmax(0, 1fr); margin-top: 40px; border-left: 0; }
       .feat { padding: 28px 0 30px; border-right: 0; }
@@ -371,31 +351,17 @@
         </div>
         <p class="hint rise d4">__HINT__</p>
 
-        <div class="shot rise d5" aria-hidden="true">
-          <div class="window">
-            <div class="titlebar"><i></i><i></i><i></i><span>KukeChat</span></div>
-            <div class="app">
-              <aside class="side">
-                <div class="search">搜索</div>
-                <div class="conv on"><span class="av">创</span><span class="conv-t"><b>创作者小组<em>刚刚</em></b><small>新作品今晚就发，大家来帮忙测测</small></span></div>
-                <div class="conv"><span class="av">阿</span><span class="conv-t"><b>阿澈<em>21:40</em></b><small>那个特效你是怎么做的？</small></span></div>
-                <div class="conv"><span class="av">像</span><span class="conv-t"><b>像素画同好会<em>20:12</em></b><small>[群公告] 本周主题：夏天</small></span></div>
-                <div class="conv"><span class="av">小</span><span class="conv-t"><b>小鹿<em>昨天</em></b><small>收到啦，谢谢～</small></span></div>
-                <div class="conv"><span class="av">音</span><span class="conv-t"><b>音游制作组<em>周二</em></b><small>谱面我放群文件了</small></span></div>
-              </aside>
-              <div class="chat">
-                <div class="chat-head"><b>创作者小组</b><small>36 人 · 8 人在线</small></div>
-                <div class="msgs">
-                  <div class="msg"><span class="av">阿</span><span class="bubble">新作品今晚就发，大家来帮忙测测</span></div>
-                  <div class="msg"><span class="av">鹿</span><span class="bubble">好耶，我先占个沙发</span></div>
-                  <div class="msg me"><span class="bubble">链接发群里了，有 bug 直接 @我</span></div>
-                  <div class="msg"><span class="av">阿</span><span class="bubble">收到，十分钟后给你反馈</span></div>
-                </div>
-                <div class="composer">发消息…</div>
-              </div>
+        <figure class="shot rise d5">
+          <div class="frame">
+            <div class="frame-bar" aria-hidden="true"><i></i><i></i><i></i><span>KukeChat</span></div>
+            <div class="frame-view">
+              <picture>
+                <source srcset="/download/assets/app-dark.webp" media="(prefers-color-scheme: dark)" />
+                <img src="/download/assets/app-light.webp" width="2560" height="1800" alt="KukeChat Windows 版界面：左侧是会话列表，中间是群聊，右侧是群公告和群成员" decoding="async" fetchpriority="high" />
+              </picture>
             </div>
           </div>
-        </div>
+        </figure>
       </div>
     </section>
 

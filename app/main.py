@@ -8,7 +8,7 @@ from collections.abc import AsyncGenerator
 from pathlib import Path, PurePosixPath
 
 from fastapi import Depends, FastAPI, Request
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -285,6 +285,26 @@ async def download_page(request: Request, db: AsyncSession = Depends(get_db)) ->
     for placeholder, value in replacements.items():
         html = html.replace(placeholder, value)
     return HTMLResponse(html)
+
+
+# 下载页用的静态图（产品截图）。只认白名单里的文件名，路径参数不会拼进文件系统路径
+_DOWNLOAD_ASSET_DIR = Path(__file__).resolve().parent / "static" / "download"
+_DOWNLOAD_ASSETS = {
+    "app-light.webp": "image/webp",
+    "app-dark.webp": "image/webp",
+}
+
+
+@app.get("/download/assets/{name}", include_in_schema=False)
+async def download_asset(name: str) -> Response:
+    media_type = _DOWNLOAD_ASSETS.get(name)
+    if media_type is None:
+        return Response(status_code=404)
+    return FileResponse(
+        _DOWNLOAD_ASSET_DIR / name,
+        media_type=media_type,
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
 
 
 @app.get("/desktop-update.json", include_in_schema=False)
