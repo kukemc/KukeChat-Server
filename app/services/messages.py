@@ -446,6 +446,9 @@ def build_new_message_read(message: Message, current_user_id: int) -> MessageRea
         from app.services import polls as poll_service
 
         poll_service.fill_empty_state(read)
+    client_nonce = getattr(message, "_client_nonce", None)
+    if isinstance(client_nonce, str) and client_nonce:
+        read.client_nonce = client_nonce
     return read
 
 

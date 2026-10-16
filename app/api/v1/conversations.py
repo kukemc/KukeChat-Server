@@ -326,6 +326,9 @@ async def send_message_updates(db: AsyncSession, event_type: str, message: Messa
             data = await message_service.build_message_read(db, message, message.sender_id)
         else:
             data = message_service.build_new_message_read(message, message.sender_id)
+        client_nonce = getattr(message, "_client_nonce", None)
+        if isinstance(client_nonce, str) and client_nonce and getattr(data, "client_nonce", None) is None:
+            data.client_nonce = client_nonce
         if online_ids:
             await manager.send_to_users(online_ids, event_type, data)
         await send_bot_message_updates(db, event_type, message.conversation_id, data, sender_id=message.sender_id)
@@ -1245,6 +1248,9 @@ async def send_message(
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> MessageRead:
     message = await message_service.send_message(db, conversation_id, current_user, payload.content, payload.type, payload.metadata)
+    # 乐观发送：client_nonce 不落库，挂在这次的消息对象上，POST 返回和 message.created 都原样带回
+    if payload.client_nonce:
+        setattr(message, "_client_nonce", payload.client_nonce)
     message_data = message_service.build_new_message_read(message, current_user.id)
     member_ids = await online_conversation_member_ids(db, conversation_id)
     response_cache.invalidate_user_conversations(set(member_ids) | {current_user.id})

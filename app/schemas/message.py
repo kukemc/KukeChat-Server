@@ -13,6 +13,8 @@ class MessageCreate(BaseModel):
     type: MessageType = MessageType.TEXT
     content: str = Field(default="", max_length=2000)
     metadata: dict[str, Any] | None = None
+    # 客户端乐观发送用的本地标记（docs/chat-features.md 第 11 节）：不落库，只在 POST 返回和 message.created 里原样带回
+    client_nonce: str | None = Field(default=None, min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
 
     @field_validator("type")
     @classmethod
@@ -142,6 +144,8 @@ class MessageRead(BaseModel):
     bookmarked_by_me: bool = False
     featured: bool = False
     conversation: object | None = None
+    # 只出现在刚发出的这条消息的 POST 返回和 message.created 里：发送者请求时带的 client_nonce，原样回显
+    client_nonce: str | None = None
 
 
 class MessageSearchResult(BaseModel):

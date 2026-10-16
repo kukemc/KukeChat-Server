@@ -1,4 +1,4 @@
-# 投票、正在输入、群表情、戳一戳、公告回应、资料点赞、会话列表上的提及提示
+# 投票、正在输入、群表情、戳一戳、公告回应、资料点赞、会话列表上的提及提示、乐观发送
 
 路径前缀 `/api/v1`。带 `code` 的错误，`detail` 是 `{ code, message }`，`message` 是可直接展示的中文。
 
@@ -495,3 +495,12 @@
 - 例外：自己刚处理掉的申请（收到的好友申请已通过 / 已拒绝，自己审核的入群申请）虽然 `updated_at` 变新了，也不算新通知。
 - `new_count` = `unread` 为 true 的条数，客户端角标用它。`unread_count` 与 `new_count` 相同，留着兼容旧客户端；`pending_count`、`counts` 不变。
 - 两列都是启动时 `ALTER TABLE … ADD COLUMN` 补的可空列，不回填。
+
+## 11. 乐观发送（`client_nonce`）
+
+客户端点发送后先在本地显示一条「发送中」的消息，等服务器确认后原地换成真消息。为了把两者对上，发消息时可以带一个本地标记：
+
+- `POST /conversations/{cid}/messages` 的请求体加可选字段 `client_nonce`：1–64 位，只允许 `[A-Za-z0-9_-]`，不合规返回 422。
+- 原样回显：这次 POST 的返回 `MessageRead.client_nonce`，以及这条消息的 `message.created` 事件里的 `client_nonce`（发给全会话的同一份数据，不含敏感信息）。
+- 不落库：历史分页、单条消息、别的事件里恒为 `null`。不写进 `metadata`，也不受 `metadata` 的任何规则影响。
+- 客户端：POST 返回和 `message.created` 谁先到都行，按 `client_nonce` 找到本地那条替换，另一份按 `id` 去重。
