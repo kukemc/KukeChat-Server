@@ -1,0 +1,612 @@
+<!doctype html>
+<html lang="zh-CN" data-platform="__PLATFORM__">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>下载 KukeChat</title>
+  <meta name="description" content="下载 KukeChat：Windows、Android 与 CCW 社区扩展。私聊、群聊、动态，一个账号三端互通。" />
+  <meta name="color-scheme" content="light dark" />
+  <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)" />
+  <meta name="theme-color" content="#0a0a0b" media="(prefers-color-scheme: dark)" />
+  <link rel="icon" type="image/png" href="__ICON_URL__" />
+  <link rel="apple-touch-icon" href="__ICON_URL__" />
+  <style>
+    :root {
+      --bg: #ffffff;
+      --bg-soft: #fafafa;
+      --fg: #0a0a0a;
+      --fg-2: #3a3a3c;
+      --muted: #6e6e73;
+      --faint: #a1a1a6;
+      --line: rgba(0, 0, 0, .08);
+      --line-strong: rgba(0, 0, 0, .14);
+      --card: #ffffff;
+      --ink: #0a0a0a;
+      --ink-fg: #ffffff;
+      --ink-hover: #2a2a2c;
+      --chip: rgba(0, 0, 0, .04);
+      --bubble: #f2f2f4;
+      --halo: rgba(0, 0, 0, .035);
+      --shadow: 0 1px 2px rgba(0, 0, 0, .04), 0 24px 64px -24px rgba(0, 0, 0, .18);
+      --live: #1f9d55;
+      --grain-opacity: .035;
+      --sans: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", system-ui, sans-serif;
+      color-scheme: light;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0a0a0b;
+        --bg-soft: #0f0f11;
+        --fg: #f5f5f7;
+        --fg-2: #d2d2d7;
+        --muted: #98989d;
+        --faint: #636366;
+        --line: rgba(255, 255, 255, .08);
+        --line-strong: rgba(255, 255, 255, .16);
+        --card: #111113;
+        --ink: #f5f5f7;
+        --ink-fg: #0a0a0a;
+        --ink-hover: #ffffff;
+        --chip: rgba(255, 255, 255, .05);
+        --bubble: #1c1c1f;
+        --halo: rgba(255, 255, 255, .05);
+        --shadow: 0 1px 2px rgba(0, 0, 0, .4), 0 32px 80px -24px rgba(0, 0, 0, .7);
+        --live: #34c759;
+        --grain-opacity: .05;
+        color-scheme: dark;
+      }
+    }
+
+    *, *::before, *::after { box-sizing: border-box; }
+    html { -webkit-text-size-adjust: 100%; scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      overflow-x: hidden;
+      background: var(--bg);
+      color: var(--fg);
+      font-family: var(--sans);
+      font-size: 16px;
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+      text-rendering: optimizeLegibility;
+    }
+    body::before {
+      /* 极淡的颗粒感 */
+      content: "";
+      position: fixed;
+      inset: 0;
+      z-index: 0;
+      pointer-events: none;
+      opacity: var(--grain-opacity);
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 .5 0 0 0 0 .5 0 0 0 0 .5 0 0 0 1 0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+    }
+    a { color: inherit; text-decoration: none; }
+    img { display: block; max-width: 100%; }
+    .wrap { position: relative; z-index: 1; width: 100%; max-width: 1120px; margin: 0 auto; padding: 0 24px; }
+
+    /* ── 导航 ── */
+    .nav {
+      position: sticky; top: 0; z-index: 20;
+      border-bottom: 1px solid transparent;
+      transition: border-color .3s ease, background-color .3s ease;
+    }
+    /* 顶部时透明，和 hero 的光晕连成一片；滚动后才出现毛玻璃和细描边 */
+    .nav.is-scrolled, .no-js .nav {
+      background: color-mix(in srgb, var(--bg) 78%, transparent);
+      -webkit-backdrop-filter: saturate(180%) blur(18px);
+      backdrop-filter: saturate(180%) blur(18px);
+      border-bottom-color: var(--line);
+    }
+    .nav .wrap { display: flex; align-items: center; justify-content: space-between; height: 60px; }
+    .brand { display: inline-flex; align-items: center; gap: 10px; font-weight: 600; font-size: 16px; letter-spacing: -.01em; }
+    .brand img { width: 26px; height: 26px; border-radius: 7px; }
+    .nav-links { display: flex; align-items: center; gap: 28px; font-size: 14px; color: var(--muted); }
+    .nav-links a:hover { color: var(--fg); }
+    .nav-cta {
+      display: inline-flex; align-items: center; height: 32px; padding: 0 14px;
+      border-radius: 999px; background: var(--ink); color: var(--ink-fg) !important;
+      font-size: 13px; font-weight: 500;
+      transition: background .2s ease;
+    }
+    .nav-cta:hover { background: var(--ink-hover); }
+
+    /* ── Hero ── */
+    .hero { position: relative; margin-top: -60px; padding: 156px 0 40px; text-align: center; }
+    .hero::before {
+      /* 很淡的单色光晕 */
+      content: "";
+      position: absolute; left: 50%; top: -120px; z-index: -1;
+      width: min(1100px, 100%); height: 640px;
+      transform: translateX(-50%);
+      background: radial-gradient(closest-side, var(--halo), color-mix(in srgb, var(--halo) 40%, transparent) 55%, transparent);
+      pointer-events: none;
+    }
+    .eyebrow {
+      display: inline-flex; align-items: center; gap: 8px;
+      height: 30px; padding: 0 14px;
+      border: 1px solid var(--line-strong); border-radius: 999px;
+      font-size: 13px; color: var(--muted);
+    }
+    .eyebrow b { color: var(--fg); font-weight: 500; }
+    .eyebrow i { width: 3px; height: 3px; border-radius: 50%; background: var(--faint); }
+    h1 {
+      margin: 28px auto 0;
+      max-width: 14em;
+      font-size: clamp(44px, 7.4vw, 88px);
+      font-weight: 600;
+      line-height: 1.06;
+      letter-spacing: -.035em;
+    }
+    h1 .soft { color: var(--faint); }
+    .lead {
+      margin: 24px auto 0;
+      max-width: 34em;
+      font-size: clamp(17px, 1.9vw, 20px);
+      line-height: 1.7;
+      color: var(--muted);
+      text-wrap: pretty;
+    }
+
+    .downloads {
+      display: flex; flex-wrap: wrap; justify-content: center; gap: 12px;
+      margin: 44px auto 0;
+    }
+    .dl {
+      display: inline-flex; align-items: center; gap: 12px;
+      height: 56px; padding: 0 24px 0 20px;
+      border: 1px solid var(--line-strong); border-radius: 999px;
+      background: var(--card); color: var(--fg);
+      transition: border-color .2s ease, background .2s ease, transform .2s ease;
+    }
+    .dl:hover { border-color: var(--fg); }
+    .dl:active { transform: scale(.98); }
+    .dl svg { flex: 0 0 auto; width: 20px; height: 20px; }
+    .dl-copy { display: flex; flex-direction: column; align-items: flex-start; line-height: 1.2; text-align: left; }
+    .dl-copy strong { font-size: 15px; font-weight: 600; letter-spacing: -.01em; }
+    .dl-copy small { margin-top: 3px; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+    .dl.is-primary { order: -1; background: var(--ink); color: var(--ink-fg); border-color: var(--ink); }
+    .dl.is-primary:hover { background: var(--ink-hover); border-color: var(--ink-hover); }
+    .dl.is-primary small { color: color-mix(in srgb, var(--ink-fg) 62%, transparent); }
+    .dl.is-disabled { pointer-events: none; opacity: .42; border-style: dashed; }
+    .dl.is-disabled.is-primary { background: transparent; color: var(--fg); border-color: var(--line-strong); }
+    .dl.is-disabled.is-primary small { color: var(--muted); }
+    .hint { margin: 18px 0 0; font-size: 13px; color: var(--faint); }
+
+    /* ── 产品界面示意 ── */
+    .shot { margin: 72px auto 0; max-width: 980px; }
+    .window {
+      overflow: hidden;
+      border: 1px solid var(--line-strong);
+      border-radius: 16px;
+      background: var(--card);
+      box-shadow: var(--shadow);
+      text-align: left;
+    }
+    .titlebar { display: flex; align-items: center; gap: 7px; height: 40px; padding: 0 16px; border-bottom: 1px solid var(--line); }
+    .titlebar i { width: 10px; height: 10px; border-radius: 50%; background: var(--line-strong); }
+    .titlebar span { margin-left: auto; margin-right: auto; padding-right: 51px; font-size: 12px; color: var(--faint); }
+    .app { display: grid; grid-template-columns: 280px minmax(0, 1fr); height: 440px; }
+    .side { border-right: 1px solid var(--line); padding: 14px 10px; overflow: hidden; }
+    .search { height: 32px; margin: 0 6px 12px; border-radius: 8px; background: var(--chip); display: flex; align-items: center; padding: 0 12px; font-size: 12px; color: var(--faint); }
+    .conv { display: flex; align-items: center; gap: 12px; padding: 10px; border-radius: 10px; }
+    .conv.on { background: var(--chip); }
+    .av { flex: 0 0 auto; display: grid; place-items: center; width: 38px; height: 38px; border-radius: 50%; background: var(--bubble); border: 1px solid var(--line); font-size: 14px; font-weight: 600; color: var(--muted); }
+    .conv-t { min-width: 0; flex: 1; }
+    .conv-t b { display: flex; justify-content: space-between; font-size: 13px; font-weight: 600; }
+    .conv-t b em { font-style: normal; font-weight: 400; font-size: 11px; color: var(--faint); }
+    .conv-t small { display: block; margin-top: 2px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 12px; color: var(--muted); }
+    .chat { display: flex; flex-direction: column; min-width: 0; }
+    .chat-head { display: flex; align-items: center; justify-content: space-between; height: 56px; padding: 0 22px; border-bottom: 1px solid var(--line); }
+    .chat-head b { font-size: 14px; font-weight: 600; }
+    .chat-head small { font-size: 12px; color: var(--faint); }
+    .msgs { flex: 1; display: flex; flex-direction: column; justify-content: flex-end; gap: 12px; padding: 22px; overflow: hidden; }
+    .msg { display: flex; align-items: flex-end; gap: 10px; max-width: 78%; }
+    .msg .av { width: 28px; height: 28px; font-size: 11px; }
+    .bubble { padding: 9px 14px; border-radius: 18px; background: var(--bubble); font-size: 14px; line-height: 1.5; }
+    .msg.me { align-self: flex-end; flex-direction: row-reverse; }
+    .msg.me .bubble { background: var(--ink); color: var(--ink-fg); }
+    .composer { margin: 0 22px 20px; height: 42px; border: 1px solid var(--line); border-radius: 999px; display: flex; align-items: center; padding: 0 18px; font-size: 13px; color: var(--faint); }
+
+    /* ── 通用分区 ── */
+    section.block { padding: 120px 0 0; }
+    .kicker { margin: 0; font-size: 13px; font-weight: 500; color: var(--muted); letter-spacing: .02em; }
+    h2 { margin: 12px 0 0; font-size: clamp(30px, 4.2vw, 48px); font-weight: 600; line-height: 1.15; letter-spacing: -.03em; }
+    .sub { margin: 16px 0 0; max-width: 32em; color: var(--muted); font-size: 17px; text-wrap: pretty; }
+
+    /* ── 亮点 ── */
+    .grid {
+      display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+      margin-top: 56px;
+      border-top: 1px solid var(--line); border-left: 1px solid var(--line);
+    }
+    .feat { padding: 36px 32px 40px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+    .feat svg { width: 22px; height: 22px; color: var(--fg); }
+    .feat h3 { margin: 22px 0 0; font-size: 17px; font-weight: 600; letter-spacing: -.01em; }
+    .feat p { margin: 8px 0 0; font-size: 14.5px; line-height: 1.7; color: var(--muted); }
+
+    /* ── 实时数据 ── */
+    .live-row { display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; flex-wrap: wrap; }
+    .pulse { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
+    .pulse i { position: relative; width: 7px; height: 7px; border-radius: 50%; background: var(--live); }
+    .pulse i::after { content: ""; position: absolute; inset: -4px; border-radius: 50%; border: 1px solid var(--live); opacity: 0; animation: ping 2.4s ease-out infinite; }
+    .stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin-top: 48px; border-top: 1px solid var(--line); }
+    .stat { padding: 28px 0 0; }
+    .stat + .stat { padding-left: 28px; border-left: 1px solid var(--line); }
+    .stat b { display: block; font-size: clamp(30px, 4vw, 44px); font-weight: 600; letter-spacing: -.03em; line-height: 1.1; font-variant-numeric: tabular-nums; }
+    .stat span { display: block; margin-top: 8px; font-size: 13px; color: var(--muted); }
+
+    /* ── 更新日志 ── */
+    .notes { margin-top: 48px; padding: 32px; border: 1px solid var(--line); border-radius: 16px; background: var(--bg-soft); }
+    .notes-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+    .notes-head b { font-size: 17px; font-weight: 600; }
+    .notes-head span { font-size: 13px; color: var(--faint); font-variant-numeric: tabular-nums; }
+    .notes ul { margin: 18px 0 0; padding: 0; list-style: none; display: grid; gap: 10px; }
+    .notes li { position: relative; padding-left: 18px; font-size: 14.5px; color: var(--fg-2); line-height: 1.65; }
+    .notes li::before { content: ""; position: absolute; left: 2px; top: .78em; width: 5px; height: 1px; background: var(--faint); }
+
+    /* ── 常见问题 ── */
+    .faq { margin-top: 48px; border-top: 1px solid var(--line); }
+    .faq details { border-bottom: 1px solid var(--line); }
+    .faq summary {
+      display: flex; align-items: center; justify-content: space-between; gap: 16px;
+      padding: 22px 0; cursor: pointer; list-style: none;
+      font-size: 16px; font-weight: 500;
+    }
+    .faq summary::-webkit-details-marker { display: none; }
+    .faq summary::after {
+      content: ""; flex: 0 0 auto; width: 9px; height: 9px;
+      border-right: 1.5px solid var(--muted); border-bottom: 1.5px solid var(--muted);
+      transform: translateY(-3px) rotate(45deg); transition: transform .25s ease;
+    }
+    .faq details[open] summary::after { transform: translateY(2px) rotate(-135deg); }
+    .faq p { margin: -6px 0 22px; max-width: 46em; font-size: 15px; line-height: 1.75; color: var(--muted); }
+    .faq b { color: var(--fg-2); font-weight: 500; }
+
+    /* ── 结尾 ── */
+    .closing { padding: 140px 0 120px; text-align: center; }
+    .closing h2 { max-width: 12em; margin-left: auto; margin-right: auto; }
+    .closing .downloads { margin-top: 36px; }
+
+    footer { position: relative; z-index: 1; border-top: 1px solid var(--line); }
+    footer .wrap { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; padding-top: 28px; padding-bottom: 40px; font-size: 13px; color: var(--faint); }
+    footer .brand { font-size: 14px; color: var(--fg); }
+    footer .brand img { width: 20px; height: 20px; border-radius: 5px; }
+    footer nav { display: flex; gap: 22px; }
+    footer nav a:hover { color: var(--fg); }
+
+    [hidden] { display: none !important; }
+
+    /* ── 入场动画 ── */
+    .rise { opacity: 0; transform: translateY(14px); animation: rise .9s cubic-bezier(.2, .7, .2, 1) forwards; }
+    .d1 { animation-delay: .06s; } .d2 { animation-delay: .14s; } .d3 { animation-delay: .22s; } .d4 { animation-delay: .3s; } .d5 { animation-delay: .44s; }
+    .reveal { opacity: 0; transform: translateY(18px); transition: opacity .9s cubic-bezier(.2, .7, .2, 1), transform .9s cubic-bezier(.2, .7, .2, 1); }
+    .reveal.is-in { opacity: 1; transform: none; }
+    .no-js .reveal { opacity: 1; transform: none; }
+    @keyframes rise { to { opacity: 1; transform: none; } }
+    @keyframes ping { 0% { opacity: .6; transform: scale(.6); } 80%, 100% { opacity: 0; transform: scale(1.6); } }
+
+    @media (prefers-reduced-motion: reduce) {
+      html { scroll-behavior: auto; }
+      .rise, .reveal { opacity: 1 !important; transform: none !important; animation: none !important; transition: none !important; }
+      .pulse i::after { animation: none; }
+      .dl, .nav { transition: none; }
+    }
+
+    /* ── 窄屏 ── */
+    @media (max-width: 900px) {
+      .app { grid-template-columns: 220px minmax(0, 1fr); }
+      .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .stat:nth-child(3) { padding-left: 0; border-left: 0; }
+      .stat:nth-child(n+3) { margin-top: 28px; }
+    }
+    @media (max-width: 640px) {
+      .wrap { padding: 0 20px; }
+      .nav-links a:not(.nav-cta) { display: none; }
+      .hero { padding: 124px 0 24px; }
+      h1 { font-size: min(9.4vw, 52px); letter-spacing: -.03em; }
+      h1 .soft { white-space: nowrap; }
+      .lead { font-size: 16px; }
+      .downloads { flex-direction: column; align-items: stretch; gap: 10px; margin-top: 36px; }
+      .dl { height: 60px; justify-content: flex-start; padding: 0 22px; }
+      .dl-copy { flex-direction: row; align-items: baseline; justify-content: space-between; flex: 1; gap: 12px; }
+      .dl-copy small { margin-top: 0; }
+      .shot { margin-top: 52px; }
+      .window { border-radius: 14px; }
+      .app { grid-template-columns: minmax(0, 1fr); height: 380px; }
+      .side { display: none; }
+      .titlebar span { padding-right: 0; }
+      .msgs { padding: 16px; }
+      .msg { max-width: 88%; }
+      .composer { margin: 0 16px 16px; }
+      section.block { padding-top: 88px; }
+      .grid { grid-template-columns: minmax(0, 1fr); margin-top: 40px; border-left: 0; }
+      .feat { padding: 28px 0 30px; border-right: 0; }
+      .stats { margin-top: 36px; }
+      .stat + .stat { padding-left: 20px; }
+      .stat:nth-child(3) { padding-left: 0; }
+      .notes { padding: 24px 20px; }
+      .closing { padding: 100px 0 88px; }
+      footer .wrap { flex-direction: column; align-items: flex-start; }
+    }
+  </style>
+</head>
+<body class="no-js">
+  <header class="nav" id="nav">
+    <div class="wrap">
+      <a class="brand" href="#top" aria-label="KukeChat">
+        <img src="__ICON_URL__" alt="" width="26" height="26" referrerpolicy="no-referrer" />
+        <span>KukeChat</span>
+      </a>
+      <nav class="nav-links" aria-label="页面导航">
+        <a href="#features">亮点</a>
+        <a href="#faq">常见问题</a>
+        <a class="nav-cta" href="#top">下载</a>
+      </nav>
+    </div>
+  </header>
+
+  <main id="top">
+    <section class="hero">
+      <div class="wrap">
+        <div class="eyebrow rise"><b>KukeChat</b><i></i><span>Windows · Android · CCW 社区扩展</span></div>
+        <h1 class="rise d1">好好聊天，<br /><span class="soft">本来就该这么简单。</span></h1>
+        <p class="lead rise d2">为 Scratcher 打造的聊天应用。私聊、群聊、动态都在这里，电脑、手机和 CCW 社区之间随时接着聊。</p>
+
+        <div class="downloads rise d3" role="group" aria-label="选择平台下载">
+          <a class="dl__PC_CLASS__" href="__PC_HREF__" target="_blank" rel="noreferrer"__PC_ARIA__>
+            __WINDOWS_ICON__
+            <span class="dl-copy"><strong>Windows 版</strong><small>__PC_META__</small></span>
+          </a>
+          <a class="dl__ANDROID_CLASS__" href="__ANDROID_HREF__" target="_blank" rel="noreferrer"__ANDROID_ARIA__>
+            __ANDROID_ICON__
+            <span class="dl-copy"><strong>Android 版</strong><small>__MOBILE_META__</small></span>
+          </a>
+          <a class="dl__SCRATCH_CLASS__" href="__SCRATCH_HREF__" target="_blank" rel="noreferrer"__SCRATCH_ARIA__>
+            __SCRATCH_ICON__
+            <span class="dl-copy"><strong>CCW 社区扩展</strong><small>__SCRATCH_META__</small></span>
+          </a>
+        </div>
+        <p class="hint rise d4">__HINT__</p>
+
+        <div class="shot rise d5" aria-hidden="true">
+          <div class="window">
+            <div class="titlebar"><i></i><i></i><i></i><span>KukeChat</span></div>
+            <div class="app">
+              <aside class="side">
+                <div class="search">搜索</div>
+                <div class="conv on"><span class="av">创</span><span class="conv-t"><b>创作者小组<em>刚刚</em></b><small>新作品今晚就发，大家来帮忙测测</small></span></div>
+                <div class="conv"><span class="av">阿</span><span class="conv-t"><b>阿澈<em>21:40</em></b><small>那个特效你是怎么做的？</small></span></div>
+                <div class="conv"><span class="av">像</span><span class="conv-t"><b>像素画同好会<em>20:12</em></b><small>[群公告] 本周主题：夏天</small></span></div>
+                <div class="conv"><span class="av">小</span><span class="conv-t"><b>小鹿<em>昨天</em></b><small>收到啦，谢谢～</small></span></div>
+                <div class="conv"><span class="av">音</span><span class="conv-t"><b>音游制作组<em>周二</em></b><small>谱面我放群文件了</small></span></div>
+              </aside>
+              <div class="chat">
+                <div class="chat-head"><b>创作者小组</b><small>36 人 · 8 人在线</small></div>
+                <div class="msgs">
+                  <div class="msg"><span class="av">阿</span><span class="bubble">新作品今晚就发，大家来帮忙测测</span></div>
+                  <div class="msg"><span class="av">鹿</span><span class="bubble">好耶，我先占个沙发</span></div>
+                  <div class="msg me"><span class="bubble">链接发群里了，有 bug 直接 @我</span></div>
+                  <div class="msg"><span class="av">阿</span><span class="bubble">收到，十分钟后给你反馈</span></div>
+                </div>
+                <div class="composer">发消息…</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="block" id="features">
+      <div class="wrap">
+        <div class="reveal">
+          <p class="kicker">亮点</p>
+          <h2>该有的都有，<br />不该有的一样没有。</h2>
+          <p class="sub">没有花哨的打扰，只有顺手的聊天。每一处细节，都是为了让你聊得更专注。</p>
+        </div>
+        <div class="grid reveal">
+          <div class="feat">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.4A8 8 0 1 1 21 12Z"/></svg>
+            <h3>消息，即时送达</h3>
+            <p>私聊、群聊实时同步，已读、撤回、引用回复一个不少，聊起来不卡顿。</p>
+          </div>
+          <div class="feat">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="9" cy="8" r="3.2"/><path d="M3 19.5c.8-3.2 3.2-5 6-5s5.2 1.8 6 5"/><path d="M15.5 5.2a3 3 0 0 1 0 5.6M18 14.8c1.5.7 2.6 2.1 3 4.2"/></svg>
+            <h3>群聊，井井有条</h3>
+            <p>公告、管理员、群文件、待办，小团队协作和兴趣社群都能装得下。</p>
+          </div>
+          <div class="feat">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M3 9h18M8 14h8"/></svg>
+            <h3>动态，分享日常</h3>
+            <p>发一条动态，晒作品、聊灵感，朋友的点赞和评论第一时间看到。</p>
+          </div>
+          <div class="feat">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2.5" y="4" width="13" height="10" rx="2"/><path d="M6 18h6"/><rect x="17" y="8" width="4.5" height="12" rx="1.2"/></svg>
+            <h3>三端，无缝接力</h3>
+            <p>同一个账号，Windows、Android 和 CCW 社区扩展随时切换，记录全部跟着走。</p>
+          </div>
+          <div class="feat">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4.5" y="10.5" width="15" height="10" rx="2.5"/><path d="M8 10.5V7.5a4 4 0 0 1 8 0v3"/></svg>
+            <h3>私聊，只属于你们</h3>
+            <p>后台无法翻阅私聊内容。只有在被举报时，才会查看举报那一刻留下的证据。</p>
+          </div>
+          <div class="feat">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M5.6 18.4l2.1-2.1M16.3 7.7l2.1-2.1"/></svg>
+            <h3>细节，经得起推敲</h3>
+            <p>克制的界面、顺滑的动效、亮暗两套配色，用久了也不会腻。</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="block" id="live" hidden>
+      <div class="wrap">
+        <div class="live-row reveal">
+          <div>
+            <p class="kicker">此刻</p>
+            <h2>大家都在这里。</h2>
+          </div>
+          <span class="pulse" id="live-online" hidden><i></i><span><b id="online-num">—</b> 人正在线上</span></span>
+        </div>
+        <div class="stats reveal">
+          <div class="stat"><b data-stat="registered_users">—</b><span>位注册用户</span></div>
+          <div class="stat"><b data-stat="messages">—</b><span>条消息</span></div>
+          <div class="stat"><b data-stat="groups">—</b><span>个群聊</span></div>
+          <div class="stat"><b data-stat="messages_last_7_days">—</b><span>条近 7 天新消息</span></div>
+        </div>
+        <div class="notes reveal" id="notes" hidden>
+          <div class="notes-head"><b id="notes-title">最近更新</b><span id="notes-meta"></span></div>
+          <ul id="notes-list"></ul>
+        </div>
+      </div>
+    </section>
+
+    <section class="block" id="faq">
+      <div class="wrap">
+        <div class="reveal">
+          <p class="kicker">常见问题</p>
+          <h2>装之前，先看一眼。</h2>
+        </div>
+        <div class="faq reveal">
+          <details>
+            <summary>安卓提示「安装失败」或「与已安装的应用冲突」？</summary>
+            <p>如果你装过<b>很早期的旧版</b>，新版的签名和它不一样，系统不允许直接覆盖。请先<b>卸载旧版</b>，再安装新下载的安装包。账号和聊天记录都在云端，重新登录就回来了。</p>
+          </details>
+          <details>
+            <summary>Windows 弹出「Windows 已保护你的电脑」怎么办？</summary>
+            <p>这是系统对新发布程序的常规提醒。点<b>「更多信息」</b>，再点<b>「仍要运行」</b>即可继续安装。</p>
+          </details>
+          <details>
+            <summary>CCW 社区扩展怎么用？</summary>
+            <p>点上面的「CCW 社区扩展」打开链接，在 CCW 里就能直接登录聊天，不用另外装任何东西，适合在作品和社区里随手回消息。</p>
+          </details>
+          <details>
+            <summary>几个版本的账号通用吗？</summary>
+            <p>通用。同一个账号可以同时在电脑、手机和社区扩展上登录，消息和好友都会实时同步。</p>
+          </details>
+          <details>
+            <summary>以后怎么更新？</summary>
+            <p>有新版本时，客户端会主动提醒你，按提示更新就好。你也可以随时回到这个页面下载最新版。</p>
+          </details>
+        </div>
+      </div>
+    </section>
+
+    <section class="closing">
+      <div class="wrap reveal">
+        <h2>现在就开始聊吧。</h2>
+        <div class="downloads">
+          <a class="dl__PC_CLASS__" href="__PC_HREF__" target="_blank" rel="noreferrer"__PC_ARIA__>
+            __WINDOWS_ICON__
+            <span class="dl-copy"><strong>Windows 版</strong><small>__PC_META__</small></span>
+          </a>
+          <a class="dl__ANDROID_CLASS__" href="__ANDROID_HREF__" target="_blank" rel="noreferrer"__ANDROID_ARIA__>
+            __ANDROID_ICON__
+            <span class="dl-copy"><strong>Android 版</strong><small>__MOBILE_META__</small></span>
+          </a>
+          <a class="dl__SCRATCH_CLASS__" href="__SCRATCH_HREF__" target="_blank" rel="noreferrer"__SCRATCH_ARIA__>
+            __SCRATCH_ICON__
+            <span class="dl-copy"><strong>CCW 社区扩展</strong><small>__SCRATCH_META__</small></span>
+          </a>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="wrap">
+      <span class="brand"><img src="__ICON_URL__" alt="" width="20" height="20" referrerpolicy="no-referrer" />KukeChat</span>
+      <nav aria-label="页脚">
+        <a href="#features">亮点</a>
+        <a href="#faq">常见问题</a>
+        <a href="#top">下载</a>
+      </nav>
+      <span>© <span id="year">2026</span> KukeChat</span>
+    </div>
+  </footer>
+
+  <script>
+    (function () {
+      document.body.classList.remove('no-js');
+      var year = document.getElementById('year');
+      if (year) year.textContent = String(new Date().getFullYear());
+
+      // 导航滚动后加细描边
+      var nav = document.getElementById('nav');
+      var onScroll = function () { nav.classList.toggle('is-scrolled', window.scrollY > 8); };
+      window.addEventListener('scroll', onScroll, { passive: true });
+      onScroll();
+
+      // 进入视口再浮现；不支持 IntersectionObserver 时直接显示
+      var reveals = document.querySelectorAll('.reveal');
+      if ('IntersectionObserver' in window) {
+        var io = new IntersectionObserver(function (entries) {
+          entries.forEach(function (entry) {
+            if (entry.isIntersecting) { entry.target.classList.add('is-in'); io.unobserve(entry.target); }
+          });
+        }, { rootMargin: '0px 0px -8% 0px', threshold: 0.08 });
+        reveals.forEach(function (node) { io.observe(node); });
+      } else {
+        reveals.forEach(function (node) { node.classList.add('is-in'); });
+      }
+
+      // 渐进增强：读同域公开接口显示实时数据；失败时整块不出现，页面照常可用
+      function bigNumber(value) {
+        var n = Number(value) || 0;
+        if (n >= 100000000) return (n / 100000000).toFixed(1).replace(/\.0$/, '') + ' 亿';
+        if (n >= 10000) return (n / 10000).toFixed(1).replace(/\.0$/, '') + ' 万';
+        return n.toLocaleString('zh-CN');
+      }
+      function shortDate(iso) {
+        var d = iso ? new Date(iso) : null;
+        return d && !isNaN(d.getTime()) ? d.getFullYear() + '/' + (d.getMonth() + 1) + '/' + d.getDate() : '';
+      }
+      function render(data) {
+        var stats = data && data.stats;
+        if (stats) {
+          document.querySelectorAll('[data-stat]').forEach(function (node) {
+            node.textContent = bigNumber(stats[node.getAttribute('data-stat')]);
+          });
+          if (stats.online !== null && stats.online !== undefined) {
+            document.getElementById('online-num').textContent = bigNumber(stats.online);
+            document.getElementById('live-online').hidden = false;
+          }
+        }
+        var releases = (data && data.releases) || {};
+        var prefer = document.documentElement.getAttribute('data-platform') === 'android' ? ['android', 'windows'] : ['windows', 'android'];
+        var latest = null, platform = null;
+        for (var i = 0; i < prefer.length && !latest; i++) {
+          var r = releases[prefer[i]];
+          if (r && r.latest && r.latest.changelog) { latest = r.latest; platform = prefer[i]; }
+        }
+        if (latest) {
+          var list = document.getElementById('notes-list');
+          list.textContent = '';
+          String(latest.changelog).split(/\r?\n/).forEach(function (line) {
+            line = line.trim();
+            if (/^[-*•]\s*/.test(line) && list.childElementCount < 6) {
+              var li = document.createElement('li');
+              li.textContent = line.replace(/^[-*•]\s*/, '');
+              list.appendChild(li);
+            }
+          });
+          if (list.childElementCount) {
+            document.getElementById('notes-title').textContent = '最近更新 · ' + (platform === 'android' ? 'Android' : 'Windows');
+            document.getElementById('notes-meta').textContent = ['v' + latest.version, shortDate(latest.published_at)].filter(Boolean).join(' · ');
+            document.getElementById('notes').hidden = false;
+          }
+        }
+        if (stats || latest) document.getElementById('live').hidden = false;
+      }
+      if (window.fetch) {
+        fetch('/public/showcase', { headers: { Accept: 'application/json' } })
+          .then(function (res) { if (!res.ok) throw new Error(String(res.status)); return res.json(); })
+          .then(render)
+          .catch(function () { /* 拿不到实时数据就不显示，不影响下载 */ });
+      }
+    })();
+  </script>
+</body>
+</html>

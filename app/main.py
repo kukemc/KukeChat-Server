@@ -200,6 +200,27 @@ async def realtime_health() -> dict[str, int | str | bool]:
     }
 
 
+_DOWNLOAD_TEMPLATE_PATH = Path(__file__).resolve().parent / "templates" / "download.html"
+_download_template_cache: str | None = None
+
+
+def _download_template() -> str:
+    global _download_template_cache
+    if _download_template_cache is None:
+        _download_template_cache = _DOWNLOAD_TEMPLATE_PATH.read_text(encoding="utf-8")
+    return _download_template_cache
+
+
+def _detect_platform(user_agent: str) -> str:
+    """按 UA 猜访问者的平台：android / ios / desktop"""
+    ua = user_agent.lower()
+    if "android" in ua:
+        return "android"
+    if any(token in ua for token in ("iphone", "ipad", "ipod")):
+        return "ios"
+    return "desktop"
+
+
 @app.get("/download", include_in_schema=False)
 async def download_page(request: Request, db: AsyncSession = Depends(get_db)) -> Response:
     download_settings = await get_public_download_settings(db, request)
@@ -208,118 +229,62 @@ async def download_page(request: Request, db: AsyncSession = Depends(get_db)) ->
     scratch_url = _html_attr(download_settings.scratch_url)
     pc_version = _html_text(download_settings.pc_version or download_settings.version or "最新版")
     mobile_version = _html_text(download_settings.mobile_version or "最新版")
-    pc_disabled = "" if download_settings.pc_url else " is-disabled"
-    android_disabled = "" if download_settings.android_url else " is-disabled"
-    scratch_disabled = "" if download_settings.scratch_url else " is-disabled"
-    pc_href = pc_url or "#"
-    android_href = android_url or "#"
-    scratch_href = scratch_url or "#"
-    icon_url = _html_attr(DOWNLOAD_ICON_URL)
-    return HTMLResponse(
-        """
-<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>KukeChat 下载中心</title>
-  <link rel="icon" type="image/png" href="__ICON_URL__" />
-  <link rel="apple-touch-icon" href="__ICON_URL__" />
-  <style>
-    :root { color-scheme: dark; --bg:#050712; --panel:rgba(255,255,255,.08); --line:rgba(255,255,255,.16); --text:#f8fbff; --muted:#a9b5c8; --blue:#4aa8ff; --cyan:#39e7ff; --purple:#8b5cf6; --pink:#ff5fd2; }
-    * { box-sizing: border-box; }
-    body { margin:0; min-height:100vh; overflow-x:hidden; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; color:var(--text); background: radial-gradient(circle at 18% 18%, rgba(74,168,255,.34), transparent 28%), radial-gradient(circle at 78% 10%, rgba(139,92,246,.28), transparent 26%), radial-gradient(circle at 62% 86%, rgba(255,95,210,.18), transparent 30%), var(--bg); }
-    body::before { content:""; position:fixed; inset:0; pointer-events:none; background-image: linear-gradient(rgba(255,255,255,.045) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,.045) 1px, transparent 1px); background-size: 48px 48px; mask-image: linear-gradient(to bottom, rgba(0,0,0,.9), transparent 82%); }
-    .orb { position:fixed; border-radius:999px; filter: blur(14px); opacity:.7; animation: drift 9s ease-in-out infinite alternate; }
-    .orb.one { width:240px; height:240px; left:7vw; top:12vh; background:rgba(57,231,255,.22); }
-    .orb.two { width:320px; height:320px; right:8vw; top:18vh; background:rgba(139,92,246,.18); animation-delay:-2s; }
-    .orb.three { width:220px; height:220px; left:45vw; bottom:5vh; background:rgba(255,95,210,.16); animation-delay:-4s; }
-    .page { position:relative; z-index:1; width:min(1180px, calc(100vw - 36px)); min-height:100vh; margin:0 auto; display:grid; align-items:center; padding:56px 0; }
-    .hero { display:grid; grid-template-columns: minmax(0, 1.08fr) minmax(360px, .92fr); gap:34px; align-items:center; }
-    .badge { display:inline-flex; align-items:center; gap:10px; width:max-content; border:1px solid rgba(74,168,255,.36); border-radius:999px; padding:9px 14px; background:rgba(74,168,255,.12); color:#d9f4ff; font-weight:800; font-size:13px; letter-spacing:.04em; box-shadow:0 0 40px rgba(57,231,255,.12); }
-    .dot { width:8px; height:8px; border-radius:999px; background:var(--cyan); box-shadow:0 0 18px var(--cyan); }
-    h1 { margin:22px 0 18px; font-size:clamp(44px, 7vw, 86px); line-height:.95; letter-spacing:-.07em; }
-    .grad { background:linear-gradient(100deg,#fff 8%,#c8ecff 38%,#b8a7ff 68%,#ffb8ec); -webkit-background-clip:text; background-clip:text; color:transparent; }
-    .lead { max-width:680px; margin:0; color:var(--muted); font-size:clamp(17px, 2.2vw, 21px); line-height:1.8; }
-    .actions { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:16px; width:min(760px, 100%); margin-top:34px; }
-    .download-btn { position:relative; isolation:isolate; display:flex; align-items:center; gap:16px; min-width:0; min-height:116px; padding:22px 24px; border-radius:30px; border:1px solid rgba(255,255,255,.18); text-decoration:none; color:white; overflow:hidden; background:linear-gradient(135deg,rgba(74,168,255,.92),rgba(139,92,246,.9)); box-shadow:0 22px 60px rgba(74,168,255,.26); transition: transform .32s cubic-bezier(.2,.8,.2,1), box-shadow .32s ease, border-color .32s ease; }
-    .download-btn.android { background:linear-gradient(135deg,rgba(42,220,156,.92),rgba(57,231,255,.82)); box-shadow:0 22px 60px rgba(42,220,156,.2); }
-    .download-btn.scratch { grid-column:1 / -1; min-height:104px; background:linear-gradient(135deg,rgba(255,159,64,.94),rgba(255,95,210,.84)); box-shadow:0 22px 60px rgba(255,159,64,.2); }
-    .download-btn::before { content:""; position:absolute; inset:-60% -20%; z-index:-1; background:linear-gradient(120deg,transparent 35%,rgba(255,255,255,.36),transparent 65%); transform:translateX(-60%); transition:transform .7s ease; }
-    .download-btn:hover { transform:translateY(-4px) scale(1.015); border-color:rgba(255,255,255,.38); box-shadow:0 28px 82px rgba(74,168,255,.34); }
-    .download-btn:hover::before { transform:translateX(60%); }
-    .download-btn.is-disabled { pointer-events:none; opacity:.48; filter:saturate(.5); }
-    .icon { display:grid; flex:0 0 auto; place-items:center; width:58px; height:58px; border-radius:21px; background:rgba(255,255,255,.16); box-shadow:inset 0 1px 0 rgba(255,255,255,.22); }
-    .button-copy { min-width:0; }
-    .button-copy strong { display:block; overflow:visible; white-space:normal; font-size:24px; line-height:1.15; letter-spacing:-.04em; }
-    .button-copy span { display:block; margin-top:8px; overflow:visible; white-space:normal; color:rgba(255,255,255,.82); font-size:14px; line-height:1.35; font-weight:800; }
-    .device { position:relative; min-height:610px; display:grid; place-items:center; perspective:1100px; }
-    .glass-card { position:relative; width:min(430px, 100%); border:1px solid var(--line); border-radius:42px; background:linear-gradient(180deg,rgba(255,255,255,.16),rgba(255,255,255,.07)); box-shadow:0 40px 110px rgba(0,0,0,.38), inset 0 1px 0 rgba(255,255,255,.18); backdrop-filter: blur(24px); padding:22px; transform:rotateY(-8deg) rotateX(4deg); animation: float 5.6s ease-in-out infinite; }
-    .screen { min-height:560px; border-radius:31px; overflow:hidden; border:1px solid rgba(255,255,255,.14); background:linear-gradient(160deg,rgba(8,13,30,.98),rgba(17,26,56,.92)); }
-    .screen-top { height:170px; padding:22px; background:radial-gradient(circle at 80% 22%,rgba(57,231,255,.46),transparent 30%), linear-gradient(135deg,rgba(74,168,255,.42),rgba(139,92,246,.34)); }
-    .mini-brand { display:flex; align-items:center; gap:10px; font-weight:900; }
-    .app-icon { width:34px; height:34px; border-radius:12px; object-fit:cover; box-shadow:0 10px 28px rgba(0,0,0,.2); }
-    .brand-icon { width:38px; height:38px; border-radius:14px; object-fit:cover; box-shadow:0 12px 30px rgba(0,0,0,.22), inset 0 1px 0 rgba(255,255,255,.2); }
-    .screen-title { margin:34px 0 0; font-size:30px; line-height:1.04; letter-spacing:-.05em; }
-    .screen-body { padding:20px; display:grid; gap:14px; }
-    .chat-line { height:66px; border-radius:22px; background:rgba(255,255,255,.08); border:1px solid rgba(255,255,255,.1); animation: pulse 3.2s ease-in-out infinite; }
-    .chat-line:nth-child(2) { width:84%; animation-delay:-.7s; }
-    .chat-line:nth-child(3) { width:92%; animation-delay:-1.3s; }
-    .version-card { margin-top:34px; display:inline-grid; gap:8px; grid-template-columns:auto auto; align-items:center; border:1px solid rgba(255,255,255,.14); border-radius:22px; padding:12px 16px; background:rgba(255,255,255,.08); backdrop-filter:blur(14px); color:#d7e3f5; font-weight:800; }
-    .version-card span { color:var(--muted); font-size:12px; }
-    .version-card strong { font-size:14px; }
-    .features { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:12px; margin-top:34px; max-width:720px; }
-    .feature { border:1px solid rgba(255,255,255,.12); border-radius:22px; padding:16px; background:rgba(255,255,255,.07); backdrop-filter:blur(16px); color:#d8e3f4; }
-    .feature strong { display:block; margin-bottom:6px; color:white; }
-    .feature span { color:var(--muted); font-size:13px; line-height:1.5; }
-    @keyframes float { 0%,100% { transform:rotateY(-8deg) rotateX(4deg) translateY(0); } 50% { transform:rotateY(-4deg) rotateX(2deg) translateY(-14px); } }
-    @keyframes drift { from { transform:translate3d(0,0,0) scale(1); } to { transform:translate3d(26px,-22px,0) scale(1.08); } }
-    @keyframes pulse { 0%,100% { opacity:.72; transform:translateX(0); } 50% { opacity:1; transform:translateX(6px); } }
-    @media (max-width: 920px) { .page { padding:34px 0; } .hero { grid-template-columns:1fr; } .actions { grid-template-columns:1fr; } .download-btn.scratch { grid-column:auto; } .device { min-height:auto; } .glass-card { transform:none; animation:none; } .features { grid-template-columns:1fr; } h1 { font-size:clamp(42px, 13vw, 68px); } }
-    @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation:none !important; transition:none !important; } }
-  </style>
-</head>
-<body>
-  <div class="orb one"></div><div class="orb two"></div><div class="orb three"></div>
-  <main class="page">
-    <section class="hero">
-      <div>
-        <div class="badge"><img class="app-icon" src="__ICON_URL__" alt="" /><span class="dot"></span>KukeChat Download Center</div>
-        <h1><span class="grad">高能聊天</span><br />现在就绪</h1>
-        <p class="lead">下载 KukeChat 最新客户端，体验丝滑动效、群聊协作、动态空间和跨端同步。选择适合你的平台，开启更酷的聊天体验。</p>
-        <div class="version-card"><span>PC 版本</span><strong>__PC_VERSION__</strong><span>移动端</span><strong>__MOBILE_VERSION__</strong></div>
-        <div class="actions">
-          <a class="download-btn__PC_DISABLED__" href="__PC_HREF__" target="_blank" rel="noreferrer">
-            <span class="icon">__WINDOWS_ICON__</span><span class="button-copy"><strong>下载 PC 端</strong><span>Windows 桌面客户端</span></span>
-          </a>
-          <a class="download-btn android__ANDROID_DISABLED__" href="__ANDROID_HREF__" target="_blank" rel="noreferrer">
-            <span class="icon">__ANDROID_ICON__</span><span class="button-copy"><strong>下载安卓端</strong><span>Android 移动客户端</span></span>
-          </a>
-          <a class="download-btn scratch__SCRATCH_DISABLED__" href="__SCRATCH_HREF__" target="_blank" rel="noreferrer">
-            <span class="icon">__SCRATCH_ICON__</span><span class="button-copy"><strong>Scratch 扩展版</strong><span>CCW / Scratch 扩展链接</span></span>
-          </a>
-        </div>
-        <div class="features"><div class="feature"><strong>QQ 风格体验</strong><span>熟悉的聊天节奏，更现代的视觉质感。</span></div><div class="feature"><strong>实时群聊</strong><span>公告、权限、禁言、动态消息实时同步。</span></div><div class="feature"><strong>高端动效</strong><span>桌面端细腻切换动画，操作反馈更丝滑。</span></div></div>
-      </div>
-      <div class="device" aria-hidden="true"><div class="glass-card"><div class="screen"><div class="screen-top"><div class="mini-brand"><img class="brand-icon" src="__ICON_URL__" alt="" /><span>KukeChat</span></div><h2 class="screen-title">Chat with<br />motion.</h2></div><div class="screen-body"><div class="chat-line"></div><div class="chat-line"></div><div class="chat-line"></div></div></div></div></div>
-    </section>
-  </main>
-</body>
-</html>
-"""
-        .replace("__PC_VERSION__", pc_version)
-        .replace("__MOBILE_VERSION__", mobile_version)
-        .replace("__PC_DISABLED__", pc_disabled)
-        .replace("__ANDROID_DISABLED__", android_disabled)
-        .replace("__SCRATCH_DISABLED__", scratch_disabled)
-        .replace("__PC_HREF__", pc_href)
-        .replace("__ANDROID_HREF__", android_href)
-        .replace("__SCRATCH_HREF__", scratch_href)
-        .replace("__ICON_URL__", icon_url)
-        .replace("__WINDOWS_ICON__", _svg_windows())
-        .replace("__ANDROID_ICON__", _svg_android())
-        .replace("__SCRATCH_ICON__", _svg_scratch()),
-    )
+    # 纯数字版本号前面补个 v，「最新版」这类文字原样显示
+    pc_version = f"v{pc_version}" if pc_version[:1].isdigit() else pc_version
+    mobile_version = f"v{mobile_version}" if mobile_version[:1].isdigit() else mobile_version
+    available = {
+        "pc": bool(download_settings.pc_url),
+        "android": bool(download_settings.android_url),
+        "scratch": bool(download_settings.scratch_url),
+    }
+
+    # 安卓访问把 Android 设为主按钮，iOS 没有客户端就推荐社区扩展，其余（电脑）推荐 Windows；
+    # 推荐的那一端没有链接时，顺延到第一个能下的
+    platform = _detect_platform(request.headers.get("user-agent", ""))
+    preferred = {"android": "android", "ios": "scratch"}.get(platform, "pc")
+    primary = next((key for key in (preferred, "pc", "android", "scratch") if available[key]), None)
+    names = {"pc": "Windows 版", "android": "Android 版", "scratch": "CCW 社区扩展"}
+    if primary is None:
+        hint = "下载链接正在准备中，请稍后再来看看。"
+    elif platform == "ios":
+        hint = (
+            "iOS 版还在路上，先用 CCW 社区扩展在浏览器里聊吧。"
+            if primary == "scratch"
+            else "iOS 版还在路上，可以先在电脑或安卓手机上使用。"
+        )
+    else:
+        hint = f"已按你的设备推荐 {names[primary]}，其他平台也能随时下载。"
+
+    def button_class(key: str) -> str:
+        return ("" if available[key] else " is-disabled") + (" is-primary" if key == primary else "")
+
+    def button_aria(key: str) -> str:
+        return "" if available[key] else ' aria-disabled="true" tabindex="-1"'
+
+    replacements = {
+        "__PLATFORM__": platform,
+        "__PC_CLASS__": button_class("pc"),
+        "__ANDROID_CLASS__": button_class("android"),
+        "__SCRATCH_CLASS__": button_class("scratch"),
+        "__PC_ARIA__": button_aria("pc"),
+        "__ANDROID_ARIA__": button_aria("android"),
+        "__SCRATCH_ARIA__": button_aria("scratch"),
+        "__PC_META__": pc_version if available["pc"] else "暂未开放",
+        "__MOBILE_META__": mobile_version if available["android"] else "暂未开放",
+        "__SCRATCH_META__": "在 CCW 里直接用" if available["scratch"] else "暂未开放",
+        "__PC_HREF__": pc_url or "#",
+        "__ANDROID_HREF__": android_url or "#",
+        "__SCRATCH_HREF__": scratch_url or "#",
+        "__HINT__": _html_text(hint),
+        "__ICON_URL__": _html_attr(DOWNLOAD_ICON_URL),
+        "__WINDOWS_ICON__": _svg_windows(),
+        "__ANDROID_ICON__": _svg_android(),
+        "__SCRATCH_ICON__": _svg_scratch(),
+    }
+    html = _download_template()
+    for placeholder, value in replacements.items():
+        html = html.replace(placeholder, value)
+    return HTMLResponse(html)
 
 
 @app.get("/desktop-update.json", include_in_schema=False)
