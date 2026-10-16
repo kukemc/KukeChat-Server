@@ -48,11 +48,21 @@ def uncertain_text_record(records: list[ContentModerationRecord], *, allow_image
     """
     texts = [record for record in records if record.content_type == "text"]
     others = [record for record in records if record.content_type != "text"]
-    if len(texts) != 1 or texts[0].decision != "review":
+    if len(texts) != 1 or texts[0].decision != "review" or is_moderation_error(texts[0]):
         return None
     if others and (not allow_images or any(record.decision != "allow" for record in others)):
         return None
     return texts[0]
+
+
+def is_moderation_error(record: ContentModerationRecord) -> bool:
+    """审核服务出错（上游模型挂了、输出解析失败）时也记成 review、置信度 0，但那不是「机器拿不准」，只是没审成。
+    这种不能交给委员：内容本身多半没问题（2026-10-16 一天 90 条 review 里 39 条是这种，进队列的全是正常聊天）。"""
+    from app.services import moderation as moderation_service
+
+    raw = moderation_service._raw_result(record)
+    listed = moderation_service._json_list(record.categories)
+    return raw.get("decision") == "error" or bool(raw.get("error_code")) or "moderation_error" in listed
 
 
 def _machine_categories(record: ContentModerationRecord) -> tuple[str, set[str]]:
