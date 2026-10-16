@@ -51,6 +51,9 @@ class Conversation(Base):
     # 群文件空间：最近一次解锁文件的档位，和宽限到期时间（档位到期后 30 天内可读不可传）
     plus_files_tier: Mapped[str | None] = mapped_column(String(12), nullable=True)
     plus_files_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 后台单独给这个群设的人数上限（docs/group-plus.md 9.2）：空 = 跟随档位，0 = 不限，正数 = 就是这个上限。
+    # 用 core/group_plus_tiers.member_limit_of() 取，不要直接读
+    member_limit_override: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # 群文件默认保留多少小时：24 / 168 / 720
     file_default_ttl_hours: Mapped[int] = mapped_column(Integer, default=24, server_default="24")
     is_temporary: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")

@@ -1,6 +1,7 @@
 """商店（docs/shop.md）：用 CCW 金币换聊天装饰，目前有气泡皮肤和头像框。
 
-KukeChat 不发币也不存币。余额 = 用户给官方作品累计投的币 − 在这里花掉的 − 送礼花掉的 − 发出的红包 + 抢到的红包 + 退回的红包
+KukeChat 不发币也不存币。余额 = 用户给官方作品累计投的币 − 在这里花掉的 − 送礼花掉的 − 群升级花掉的 − 发出的红包 + 抢到的红包 + 退回的红包
++ 后台赠送的（coin_grants，可正可负，见 admin_grant_coins）
 （红包见 docs/red-packets.md、services/red_packets.py，礼物见 docs/gifts.md、services/gifts.py；
 红包和礼物那几项直接对它们自己的表求和，这里没有另外的列）。
 累计投了多少由可插拔的余额来源核实（app/integrations/coin_ledger.py 的 CoinLedger 接口，实现不在本仓库里）；
@@ -42,7 +43,7 @@ from app.integrations import CoinsUnavailable, get_coin_ledger
 from app.models.gift import GiftRecord
 from app.models.group_plus import GroupPlusRecord
 from app.models.red_packet import RedPacket, RedPacketShare
-from app.models.shop import ShopAccount, ShopItem, ShopPurchase
+from app.models.shop import CoinGrant, ShopAccount, ShopItem, ShopPurchase
 from app.models.user import User
 from app.schemas.user import UserPublic, load_cosmetics, parse_cosmetics
 from app.services.reports import log_admin_action
@@ -377,6 +378,11 @@ def _shared_group_plus_query(user_id: Any, oid: Any) -> Any:
     )
 
 
+def _granted_query(user_id: Any) -> Any:
+    """后台给这个人加 / 扣的金币净额（coin_grants.amount 之和，扣除是负数）。记在 KukeChat 账号上，不跟 CCW 账号走。"""
+    return select(func.coalesce(func.sum(CoinGrant.amount), 0)).where(CoinGrant.user_id == user_id)
+
+
 def available_expression(user_id: int, oid: str) -> Any:
     """余额的 SQL 表达式（对着 shop_accounts 里这个人的那一行算），扣款语句的条件用它：余额够才扣。
 
@@ -394,6 +400,7 @@ def available_expression(user_id: int, oid: str) -> Any:
         - _gift_out_query(user_id).scalar_subquery()
         - _group_plus_out_query(user_id).scalar_subquery()
         + _packet_in_query(user_id).scalar_subquery()
+        + _granted_query(user_id).scalar_subquery()
     )
 
 
@@ -432,6 +439,7 @@ async def _balance(db: AsyncSession, user_id: int, oid: str | None) -> dict[str,
     ).one()
     sent, refunded = int(sent or 0), int(refunded or 0)
     received = int(await db.scalar(_packet_in_query(user_id)) or 0)
+    granted = int(await db.scalar(_granted_query(user_id)) or 0)
     # 账户里的累计投币是按另一个 CCW 账号核实的（换绑了）：作废，等重新核实
     current = account is not None and oid is not None and account.ccw_oid == oid
     donated = account.donated if current else 0
@@ -445,7 +453,7 @@ async def _balance(db: AsyncSession, user_id: int, oid: str | None) -> dict[str,
         "bound": oid is not None,
         "donated": donated,
         "spent": spent,
-        "balance": donated - spent - gift_spent - group_plus_spent - sent + received + refunded,
+        "balance": donated - spent - gift_spent - group_plus_spent - sent + received + refunded + granted,
         "verified_at": _aware(account.verified_at) if current else None,
         "stale": stale,
         "red_packet_sent": sent,
@@ -453,6 +461,7 @@ async def _balance(db: AsyncSession, user_id: int, oid: str | None) -> dict[str,
         "red_packet_refunded": refunded,
         "gift_spent": gift_spent,
         "group_plus_spent": group_plus_spent,
+        "granted": granted,
     }
 
 
@@ -1508,10 +1517,11 @@ async def stop_expiry_worker() -> None:
 # ---------------------------------------------------------------- 后台：账户与对账
 
 
-def _account_columns() -> tuple[Any, Any, Any, Any, Any, Any, Any, Any, Any]:
+def _account_columns() -> tuple[Any, Any, Any, Any, Any, Any, Any, Any, Any, Any]:
     """账户列表用的几个 SQL 表达式，口径和 _balance 一致：
 
-    (是否按现在绑定的账号核实的, 有效累计投币, 被别的账号花掉的（含用红包发出去的、送礼花掉的）, 余额, 红包发出的, 红包抢到的, 红包退回的, 送礼花掉的)。
+    (是否按现在绑定的账号核实的, 有效累计投币, 被别的账号花掉的（含用红包发出去的、送礼花掉的）, 余额, 红包发出的, 红包抢到的, 红包退回的, 送礼花掉的,
+    群升级花掉的, 后台赠送的净额)。
     """
     current = and_(User.ccw_student_oid.is_not(None), User.ccw_student_oid == ShopAccount.ccw_oid)
     donated = case((current, ShopAccount.donated), else_=0)
@@ -1526,7 +1536,9 @@ def _account_columns() -> tuple[Any, Any, Any, Any, Any, Any, Any, Any, Any]:
     sent = select(func.coalesce(func.sum(RedPacket.total), 0)).where(RedPacket.sender_id == User.id).correlate(User).scalar_subquery()
     refunded = select(func.coalesce(func.sum(RedPacket.refunded_amount), 0)).where(RedPacket.sender_id == User.id).correlate(User).scalar_subquery()
     received = _packet_in_query(User.id).correlate(User).scalar_subquery()
-    return current, donated, shared, donated - ShopAccount.spent - shared - gifted - plus - sent + received + refunded, sent, received, refunded, gifted, plus
+    granted = _granted_query(User.id).correlate(User).scalar_subquery()
+    balance = donated - ShopAccount.spent - shared - gifted - plus - sent + received + refunded + granted
+    return current, donated, shared, balance, sent, received, refunded, gifted, plus, granted
 
 
 def _account_view(
@@ -1539,10 +1551,11 @@ def _account_view(
     refunded: int = 0,
     gifted: int = 0,
     plus: int = 0,
+    granted: int = 0,
 ) -> dict[str, Any]:
     oid = _bound_oid(user)
     current = oid is not None and account.ccw_oid == oid
-    balance = donated - account.spent - shared - gifted - plus - sent + received + refunded
+    balance = donated - account.spent - shared - gifted - plus - sent + received + refunded + granted
     return {
         "user": _admin_user_view(user),
         "ccw_oid": oid,
@@ -1561,6 +1574,7 @@ def _account_view(
         "red_packet_refunded": refunded,
         "gift_spent": gifted,
         "group_plus_spent": plus,
+        "granted": granted,
     }
 
 
@@ -1569,7 +1583,7 @@ async def admin_list_accounts(db: AsyncSession, *, q: str | None, mismatch: bool
 
     只有核实过余额、对账时对上了投币记录、或者抢到过红包的用户才有账户，没出现在这里的人就是没投过、没花过也没抢到过。
     """
-    _current, donated, shared, balance, sent, received, refunded, gifted, plus = _account_columns()
+    _current, donated, shared, balance, sent, received, refunded, gifted, plus, granted = _account_columns()
     clauses = []
     term = (q or "").strip()
     if term:
@@ -1583,7 +1597,7 @@ async def admin_list_accounts(db: AsyncSession, *, q: str | None, mismatch: bool
     base = select(ShopAccount).join(User, User.id == ShopAccount.user_id).where(*clauses)
     total = await db.scalar(select(func.count()).select_from(base.subquery()))
     rows = await db.execute(
-        select(ShopAccount, User, donated, shared, sent, received, refunded, gifted, plus)
+        select(ShopAccount, User, donated, shared, sent, received, refunded, gifted, plus, granted)
         .join(User, User.id == ShopAccount.user_id)
         .where(*clauses)
         .order_by(balance.asc(), ShopAccount.user_id.asc())
@@ -1593,11 +1607,150 @@ async def admin_list_accounts(db: AsyncSession, *, q: str | None, mismatch: bool
     return {
         "items": [
             _account_view(
-                account, user, int(row_donated or 0), int(row_shared or 0), int(row_sent or 0), int(row_received or 0), int(row_refunded or 0), int(row_gifted or 0), int(row_plus or 0)
+                account,
+                user,
+                int(row_donated or 0),
+                int(row_shared or 0),
+                int(row_sent or 0),
+                int(row_received or 0),
+                int(row_refunded or 0),
+                int(row_gifted or 0),
+                int(row_plus or 0),
+                int(row_granted or 0),
             )
-            for account, user, row_donated, row_shared, row_sent, row_received, row_refunded, row_gifted, row_plus in rows.all()
+            for account, user, row_donated, row_shared, row_sent, row_received, row_refunded, row_gifted, row_plus, row_granted in rows.all()
         ],
         "total": int(total or 0),
+    }
+
+
+# ---------------------------------------------------------------- 后台：赠送 / 扣除金币（docs/shop.md 5.2）
+
+COIN_GRANT_MAX = 1_000_000
+COIN_GRANT_REASON_MAX = 200
+COIN_GRANT_EVENT_PREFIX = "coin_grant"
+
+
+def _coin_grant_view(grant: CoinGrant, user: User | None, admin: User | None) -> dict[str, Any]:
+    return {
+        "id": grant.id,
+        "user_id": grant.user_id,
+        "user": _admin_user_view(user),
+        "amount": grant.amount,
+        "reason": grant.reason,
+        "admin_id": grant.admin_id,
+        "admin": _admin_user_view(admin),
+        "created_at": _aware(grant.created_at),
+    }
+
+
+def validate_coin_grant(amount: Any, reason: Any) -> tuple[int, str]:
+    """金额是非 0 整数、绝对值不超过 COIN_GRANT_MAX；原因必填、不超过 200 字。不合法抛 422。"""
+    if isinstance(amount, bool) or not isinstance(amount, int) or amount == 0 or abs(amount) > COIN_GRANT_MAX:
+        raise _error(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, "invalid_amount", f"金额要是非 0 整数，绝对值不超过 {COIN_GRANT_MAX:,}", field="amount"
+        )
+    text_reason = reason.strip() if isinstance(reason, str) else ""
+    if not text_reason:
+        raise _error(status.HTTP_422_UNPROCESSABLE_ENTITY, "invalid_reason", "要写明原因", field="reason")
+    if len(text_reason) > COIN_GRANT_REASON_MAX:
+        raise _error(status.HTTP_422_UNPROCESSABLE_ENTITY, "invalid_reason", f"原因最多 {COIN_GRANT_REASON_MAX} 字", field="reason")
+    return amount, text_reason
+
+
+async def admin_grant_coins(db: AsyncSession, admin: User, user_id: int, amount: Any, reason: Any) -> dict[str, Any]:
+    """POST /admin/shop/grants：给一个用户加（amount > 0）或扣（amount < 0）金币。
+
+    写 coin_grants 一行 + 审计日志 shop.coins.grant，提交之后给本人发 shop.balance.changed（reason = coin_grant）。
+    扣除时按完整公式算的余额扣完不能为负，否则 409 insufficient_balance（带 balance），什么都不写。
+    和购买 / 发红包一样先过 _write_lock，事务的第一条语句就拿写锁，余额检查和写入之间不会被别的花币插进来。
+    """
+    admin_id = admin.id
+    amount, reason = validate_coin_grant(amount, reason)
+    target = await db.get(User, user_id)
+    if target is None:
+        raise _error(status.HTTP_404_NOT_FOUND, "user_not_found", "用户不存在")
+    oid = _bound_oid(target)
+    now = _now()
+    outcome: dict[str, Any] = {}
+    async with _write_lock():
+        try:
+            # 事务的第一条语句：从这里到提交一直拿着写锁。没有账户就建一行，这样他会出现在后台的账户列表里
+            touched = await db.execute(
+                update(ShopAccount).where(ShopAccount.user_id == user_id).values(updated_at=now).execution_options(synchronize_session=False)
+            )
+            if touched.rowcount != 1:
+                db.add(ShopAccount(user_id=user_id, created_at=now, updated_at=now))
+                await db.flush()
+            before = (await _balance(db, user_id, oid))["balance"]
+            if amount < 0 and before + amount < 0:
+                await db.rollback()
+                raise _error(
+                    status.HTTP_409_CONFLICT,
+                    "insufficient_balance",
+                    f"他现在只有 {before} 金币，扣 {-amount} 之后会变成负数",
+                    balance=before,
+                    amount=amount,
+                )
+            grant = CoinGrant(user_id=user_id, amount=amount, reason=reason, admin_id=admin_id, created_at=now)
+            db.add(grant)
+            await db.flush()
+            await log_admin_action(
+                db,
+                admin_id,
+                "shop.coins.grant",
+                "user",
+                user_id,
+                {"grant_id": grant.id, "amount": amount, "reason": reason, "balance_before": before, "balance_after": before + amount},
+            )
+            outcome = {"id": grant.id, "before": before}
+            await db.commit()
+        except HTTPException:
+            raise
+        except BaseException:
+            await db.rollback()
+            raise
+    change = f"{COIN_GRANT_EVENT_PREFIX}.{'granted' if amount > 0 else 'deducted'}"
+    announce_balance(user_id, change, grant_id=outcome["id"], amount=amount)
+    row = await db.get(CoinGrant, outcome["id"])
+    admin_row = await db.get(User, admin_id)
+    target = await db.get(User, user_id)
+    return {
+        "grant": _coin_grant_view(row, target, admin_row),
+        "balance_before": outcome["before"],
+        "balance": await _balance(db, user_id, oid),
+    }
+
+
+async def admin_list_coin_grants(
+    db: AsyncSession, *, user_id: int | None, admin_id: int | None, direction: str | None, limit: int, offset: int
+) -> dict[str, Any]:
+    """GET /admin/shop/grants：赠送 / 扣除记录，新的在前。summary 是筛选范围内的合计。"""
+    clauses = []
+    if user_id is not None:
+        clauses.append(CoinGrant.user_id == user_id)
+    if admin_id is not None:
+        clauses.append(CoinGrant.admin_id == admin_id)
+    if direction == "grant":
+        clauses.append(CoinGrant.amount > 0)
+    elif direction == "deduct":
+        clauses.append(CoinGrant.amount < 0)
+    total = int(await db.scalar(select(func.count()).select_from(CoinGrant).where(*clauses)) or 0)
+    granted_total, deducted_total = (
+        await db.execute(
+            select(
+                func.coalesce(func.sum(case((CoinGrant.amount > 0, CoinGrant.amount), else_=0)), 0),
+                func.coalesce(func.sum(case((CoinGrant.amount < 0, -CoinGrant.amount), else_=0)), 0),
+            ).where(*clauses)
+        )
+    ).one()
+    rows = (await db.execute(select(CoinGrant).where(*clauses).order_by(CoinGrant.id.desc()).offset(offset).limit(limit))).scalars().all()
+    ids = {row.user_id for row in rows} | {row.admin_id for row in rows if row.admin_id is not None}
+    users = {user.id: user for user in (await db.execute(select(User).where(User.id.in_(ids)))).scalars().all()} if ids else {}
+    return {
+        "items": [_coin_grant_view(row, users.get(row.user_id), users.get(row.admin_id) if row.admin_id is not None else None) for row in rows],
+        "total": total,
+        "summary": {"granted": int(granted_total or 0), "deducted": int(deducted_total or 0), "net": int(granted_total or 0) - int(deducted_total or 0)},
     }
 
 

@@ -77,3 +77,9 @@ api_router.include_router(group_plus.plans_router, prefix="/group-plus", tags=["
 api_router.include_router(group_plus.conversation_router, prefix="/conversations", tags=["group-plus"])
 api_router.include_router(group_plus.search_router, prefix="/search", tags=["search"])
 api_router.include_router(admin_group_plus.router, prefix="/admin", tags=["admin"])
+
+# 发版服务（docs/releases.md）：公开的 /releases/latest、/releases，后台 /admin/releases/...
+from app.api.v1 import releases  # noqa: E402
+
+api_router.include_router(releases.public_router, prefix="/releases", tags=["releases"])
+api_router.include_router(releases.admin_router, prefix="/admin", tags=["admin"])

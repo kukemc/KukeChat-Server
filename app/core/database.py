@@ -775,6 +775,8 @@ async def init_db() -> None:
                 ("conversations", "plus_files_tier", "plus_files_tier VARCHAR(12)"),
                 ("conversations", "plus_files_until", "plus_files_until DATETIME"),
                 ("conversations", "file_default_ttl_hours", "file_default_ttl_hours INTEGER NOT NULL DEFAULT 24"),
+                # 后台单独设的人数上限：空 = 跟随档位（老群都是空），0 = 不限
+                ("conversations", "member_limit_override", "member_limit_override INTEGER"),
                 # 临时文件（空间放不下时传的 24 小时文件，不占配额）；老文件都是空间文件
                 ("group_files", "temporary", "temporary BOOLEAN NOT NULL DEFAULT 0"),
             ):

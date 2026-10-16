@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from fastapi import Request
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
@@ -26,8 +27,21 @@ async def get_download_url(db: AsyncSession) -> str | None:
     return value or None
 
 
-async def get_public_download_settings(db: AsyncSession) -> DownloadSettingsRead:
-    return await get_download_settings(db)
+async def get_public_download_settings(db: AsyncSession, request: Request | None = None) -> DownloadSettingsRead:
+    """对外（/download 页、/desktop-update.json）的取值：某个平台在发版服务里有已发布的 stable 版本，就用它的版本号和安装包；
+    没有才用这里手填的值（docs/releases.md 1.3）。后台「下载配置」页读的是 get_download_settings，仍是手填值。"""
+    manual = await get_download_settings(db)
+    from app.services.releases import legacy_overlay
+
+    overlay = await legacy_overlay(db, request)
+    changes: dict[str, str] = {}
+    if "windows" in overlay:
+        version, url = overlay["windows"]
+        changes.update(pc_version=version, version=version, pc_url=url, url=url)
+    if "android" in overlay:
+        version, url = overlay["android"]
+        changes.update(mobile_version=version, android_url=url)
+    return manual.model_copy(update=changes) if changes else manual
 
 
 async def get_download_settings(db: AsyncSession) -> DownloadSettingsRead:
@@ -91,8 +105,8 @@ async def update_download_settings(db: AsyncSession, admin_id: int, pc_url: str 
     return await get_download_settings(db)
 
 
-async def export_public_download_metadata(db: AsyncSession) -> dict[str, str | bool | None]:
-    settings = await get_download_settings(db)
+async def export_public_download_metadata(db: AsyncSession, request: Request | None = None) -> dict[str, str | bool | None]:
+    settings = await get_public_download_settings(db, request)
     url = settings.pc_url
     filename = url.rstrip("/").split("/")[-1] if url else None
     return {

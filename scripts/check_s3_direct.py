@@ -48,7 +48,18 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-_opener = urllib.request.build_opener(_NoRedirect)
+def _ssl_context():
+    """有的服务器上 Python 找不到系统根证书（urllib 校验 https 失败）：用 botocore 自带的那份，和后端访问存储时一致。"""
+    import ssl
+    from pathlib import Path as _Path
+
+    import botocore
+
+    bundle = _Path(botocore.__file__).parent / "cacert.pem"
+    return ssl.create_default_context(cafile=str(bundle)) if bundle.exists() else ssl.create_default_context()
+
+
+_opener = urllib.request.build_opener(_NoRedirect, urllib.request.HTTPSHandler(context=_ssl_context()))
 
 
 def http(method: str, url: str, *, data: bytes | None = None, headers: dict[str, str] | None = None) -> tuple[int, dict[str, str], bytes]:
@@ -62,7 +73,7 @@ def http(method: str, url: str, *, data: bytes | None = None, headers: dict[str,
 
 def show_cors(bucket: str) -> None:
     try:
-        rules = storage._s3_client().get_bucket_cors(Bucket=bucket).get("CORSRules", [])
+        rules = storage._client_for(bucket).get_bucket_cors(Bucket=bucket).get("CORSRules", [])
     except ClientError as exc:
         code = str(exc.response.get("Error", {}).get("Code", ""))
         if code == "NoSuchCORSConfiguration":
@@ -87,7 +98,7 @@ def show_cors(bucket: str) -> None:
 
 def apply_cors(bucket: str) -> None:
     try:
-        storage._s3_client().put_bucket_cors(Bucket=bucket, CORSConfiguration={"CORSRules": [CORS_RULE]})
+        storage._client_for(bucket).put_bucket_cors(Bucket=bucket, CORSConfiguration={"CORSRules": [CORS_RULE]})
     except (BotoCoreError, ClientError) as exc:
         code = exc.response.get("Error", {}).get("Code", "") if isinstance(exc, ClientError) else exc.__class__.__name__
         if code == "NotImplemented":

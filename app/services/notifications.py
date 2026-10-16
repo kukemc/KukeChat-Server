@@ -17,6 +17,7 @@ from app.models.bot import Bot, BotReview
 from app.models.message import Message
 from app.models.penalty import UserViolation
 from app.models.post import PostNotification
+from app.models.shop import CoinGrant
 from app.models.teamup import TeamupComment, TeamupProfile
 from app.models.user import User
 from app.schemas.notification import UnifiedNotificationListRead, UnifiedNotificationRead
@@ -388,6 +389,32 @@ async def _jury_notifications(db: AsyncSession, user_id: int) -> list[UnifiedNot
     ]
 
 
+async def _coin_grant_notifications(db: AsyncSession, user_id: int) -> list[UnifiedNotificationRead]:
+    """后台赠送 / 扣除金币（docs/shop.md 5.2）。走 system 类别的通用样式，旧客户端不用升级也能看到。"""
+    cutoff = datetime.now(UTC) - timedelta(days=30)
+    result = await db.execute(
+        select(CoinGrant).where(CoinGrant.user_id == user_id, CoinGrant.created_at >= cutoff).order_by(CoinGrant.id.desc()).limit(30)
+    )
+    items: list[UnifiedNotificationRead] = []
+    for grant in result.scalars().all():
+        title = f"后台赠送了你 {grant.amount} 金币" if grant.amount > 0 else f"后台扣除了你 {-grant.amount} 金币"
+        items.append(
+            UnifiedNotificationRead(
+                id=f"coin_grant:{grant.id}",
+                category="system",
+                type="coin_grant",
+                title=title,
+                body=grant.reason,
+                time=grant.created_at,
+                unread=False,
+                pending=False,
+                action="none",
+                payload={"grant_id": grant.id, "amount": grant.amount},
+            )
+        )
+    return items
+
+
 def _as_utc(value: datetime | None) -> datetime | None:
     # SQLite 读回来的时间不带时区；库里存的都是 UTC
     if value is None:
@@ -417,7 +444,8 @@ async def list_unified_notifications(db: AsyncSession, user_id: int, limit: int 
     penalties = await _moderation_notifications(db, user_id)
     report_results = await _report_result_notifications(db, user_id)
     jury = await _jury_notifications(db, user_id)
-    items = [*friends, *groups, *posts, *interactions, *systems, *penalties, *report_results, *jury]
+    coin_grants = await _coin_grant_notifications(db, user_id)
+    items = [*friends, *groups, *posts, *interactions, *systems, *penalties, *report_results, *jury, *coin_grants]
     # 账号等级的升级通知（docs/account-level.md 第 4 节）
     from app.services import account_levels as account_level_service
 

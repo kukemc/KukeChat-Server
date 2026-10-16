@@ -39,6 +39,11 @@ class Settings(BaseSettings):
     # 群文件（group-files/ 前缀）单独放的私有桶，和主桶共用 endpoint / 凭据。配了它（且 storage_backend = s3）群文件就走
     # 预签名 URL 直传直下，不经过后端（docs/group-plus.md 第 5 节）；不配就和以前一样存主桶、由后端转发。
     s3_private_bucket: str | None = None
+    # 私有桶单独的访问凭据（雨云等服务商的桶级密钥只能访问自己的桶）；不配时私有桶也用上面那对
+    s3_private_access_key_id: str | None = None
+    s3_private_secret_access_key: str | None = None
+    # 发版服务（docs/releases.md）单个安装包的大小上限
+    release_max_artifact_bytes: int = Field(default=1024 * 1024 * 1024, ge=1024 * 1024, le=8 * 1024 * 1024 * 1024)
     image_quality: int = Field(default=82, ge=1, le=95)
     image_max_dimension: int = Field(default=2048, ge=128, le=8192)
     image_thumbnail_max_dimension: int = Field(default=360, ge=64, le=2048)

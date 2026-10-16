@@ -91,6 +91,9 @@ _PUBLIC_AUDIO_SUFFIXES = frozenset({".webm", ".ogg", ".mp3", ".m4a", ".aac", ".w
 _PUBLIC_CACHE_CONTROL = "public, max-age=3600"
 _S3_CLIENT = None
 _S3_PRESIGN_CLIENT = None
+# 私有桶配了单独的凭据时用这两个（见 _client_for）
+_S3_PRIVATE_CLIENT = None
+_S3_PRIVATE_PRESIGN_CLIENT = None
 # 群文件（docs/group-plus.md 第 5 节）：配了 S3_PRIVATE_BUCKET 时这个前缀下的对象放私有桶，其余照旧放主桶（主桶开着公开读）
 PRIVATE_PREFIX = "group-files/"
 OCTET_STREAM = "application/octet-stream"
@@ -223,10 +226,35 @@ def _s3_client():
 
 
 def _bucket_for(normalized: str) -> str | None:
-    """这个 key 放哪个桶：群文件前缀且配了私有桶 → 私有桶；否则主桶。凭据、endpoint 两个桶共用。"""
+    """这个 key 放哪个桶：群文件前缀且配了私有桶 → 私有桶；否则主桶。endpoint 共用；凭据见 _client_for。"""
     if settings.s3_private_bucket and normalized.startswith(PRIVATE_PREFIX):
         return settings.s3_private_bucket
     return settings.s3_bucket
+
+
+def _private_credentials() -> tuple[str, str] | None:
+    """私有桶单独的凭据（两项都配了才算）；没配返回 None，私有桶和主桶共用一对凭据。"""
+    key_id, secret = settings.s3_private_access_key_id, settings.s3_private_secret_access_key
+    return (key_id, secret) if key_id and secret else None
+
+
+def _client_for(bucket: str | None):
+    """访问某个桶用的客户端：私有桶且配了单独凭据 → 私有桶客户端；其余用主客户端。"""
+    global _S3_PRIVATE_CLIENT
+    credentials = _private_credentials()
+    if not (credentials and settings.s3_private_bucket and bucket == settings.s3_private_bucket):
+        return _s3_client()
+    _s3_client()  # 复用缺配置的检查
+    if _S3_PRIVATE_CLIENT is None:
+        _S3_PRIVATE_CLIENT = boto3.client(
+            "s3",
+            endpoint_url=settings.s3_endpoint_url,
+            aws_access_key_id=credentials[0],
+            aws_secret_access_key=credentials[1],
+            region_name=settings.s3_region,
+            config=S3_CONFIG,
+        )
+    return _S3_PRIVATE_CLIENT
 
 
 def direct_transfer_enabled() -> bool:
@@ -250,12 +278,31 @@ def _s3_presign_client():
     return _S3_PRESIGN_CLIENT
 
 
+def _presign_client_for(bucket: str | None):
+    """预签名用的客户端，选凭据的规则同 _client_for。"""
+    global _S3_PRIVATE_PRESIGN_CLIENT
+    credentials = _private_credentials()
+    if not (credentials and settings.s3_private_bucket and bucket == settings.s3_private_bucket):
+        return _s3_presign_client()
+    _s3_client()
+    if _S3_PRIVATE_PRESIGN_CLIENT is None:
+        _S3_PRIVATE_PRESIGN_CLIENT = boto3.client(
+            "s3",
+            endpoint_url=settings.s3_endpoint_url,
+            aws_access_key_id=credentials[0],
+            aws_secret_access_key=credentials[1],
+            region_name=settings.s3_region,
+            config=S3_CONFIG.merge(Config(signature_version="s3v4")),
+        )
+    return _S3_PRIVATE_PRESIGN_CLIENT
+
+
 def presign_put(key: str, size: int, expires_in: int = 900) -> tuple[str, dict[str, str]]:
     """直传用的预签名 PUT。签名里带 Content-Type 和 Content-Length，长度不对的请求桶会拒（取决于服务商，见 scripts/check_s3_direct.py）。
     返回 (url, 客户端必须带上的请求头)；Content-Length 由客户端的 HTTP 库按请求体自己填。"""
     normalized = _normalize_key(key)
     try:
-        url = _s3_presign_client().generate_presigned_url(
+        url = _presign_client_for(_bucket_for(normalized)).generate_presigned_url(
             "put_object",
             Params={"Bucket": _bucket_for(normalized), "Key": normalized, "ContentType": OCTET_STREAM, "ContentLength": int(size)},
             ExpiresIn=expires_in,
@@ -272,7 +319,7 @@ def presign_get(key: str, expires_in: int = 300, content_disposition: str | None
     if content_disposition:
         params["ResponseContentDisposition"] = content_disposition
     try:
-        return _s3_presign_client().generate_presigned_url("get_object", Params=params, ExpiresIn=expires_in)
+        return _presign_client_for(params["Bucket"]).generate_presigned_url("get_object", Params=params, ExpiresIn=expires_in)
     except (BotoCoreError, ClientError) as exc:
         raise _storage_error() from exc
 
@@ -299,7 +346,7 @@ def put_object(key: str, data: bytes | BinaryIO, content_type: str) -> str:
         if _is_public_media_key(normalized):
             extra_args["CacheControl"] = _PUBLIC_CACHE_CONTROL
         try:
-            _s3_client().upload_fileobj(
+            _client_for(_bucket_for(normalized)).upload_fileobj(
                 body,
                 _bucket_for(normalized),
                 normalized,
@@ -331,7 +378,7 @@ def get_object(key: str, max_bytes: int | None = None) -> StoredObject:
     normalized = _normalize_key(key)
     if settings.storage_backend == "s3":
         try:
-            response = _s3_client().get_object(Bucket=_bucket_for(normalized), Key=normalized)
+            response = _client_for(_bucket_for(normalized)).get_object(Bucket=_bucket_for(normalized), Key=normalized)
             stream = response["Body"]
             try:
                 if max_bytes is not None and (response.get("ContentLength") or 0) > max_bytes:
@@ -380,7 +427,7 @@ def delete_objects(keys: list[str]) -> None:
             # 一次最多 1000 个（S3 的上限）
             for start in range(0, len(bucket_keys), 1000):
                 try:
-                    _s3_client().delete_objects(
+                    _client_for(bucket).delete_objects(
                         Bucket=bucket,
                         Delete={"Objects": [{"Key": key} for key in bucket_keys[start : start + 1000]], "Quiet": True},
                     )
@@ -477,7 +524,7 @@ def object_size(key: str) -> int | None:
     normalized = _normalize_key(key)
     if settings.storage_backend == "s3":
         try:
-            response = _s3_client().head_object(Bucket=_bucket_for(normalized), Key=normalized)
+            response = _client_for(_bucket_for(normalized)).head_object(Bucket=_bucket_for(normalized), Key=normalized)
             return int(response.get("ContentLength") or 0)
         except ClientError as exc:
             code = str(exc.response.get("Error", {}).get("Code", ""))

@@ -13,7 +13,9 @@
 向 CCW 核实余额这些要等外部的事都在拿锁之前做完。
 
 群的档位是 conversations.plus_tier / plus_expires_at 两列；有效档位要看到期时间（core/group_plus_tiers）。
-到期不需要定时任务：读的时候现场判断。
+到期不需要定时任务：读的时候现场判断。永久档位（只有后台能给）是把到期时间写成 2999-12-31 的哨兵值，
+判断用 tiers.is_permanent；永久的群不能再买（409 already_permanent）。
+人数上限另有一列 conversations.member_limit_override（后台单独设：空跟随档位 / 0 不限 / 正数），取值一律走 tiers.member_limit_of。
 """
 
 from __future__ import annotations
@@ -197,8 +199,20 @@ async def admin_update_settings(db: AsyncSession, admin: User, changes: dict[str
 # ---------------------------------------------------------------- 档位上限（修剪、加人、精华用）
 
 
-def member_limit(conversation: Conversation, now: datetime | None = None) -> int:
-    return tiers.TIERS[tiers.conversation_tier(conversation, now)]["member_limit"]
+def member_limit(conversation: Conversation, now: datetime | None = None) -> int | None:
+    """现在的人数上限；None 是不限（后台设了 member_limit_override = 0）。"""
+    return tiers.member_limit_of(conversation, now)
+
+
+def limits_view(conversation: Conversation, tier: str, now: datetime | None = None) -> dict[str, Any]:
+    """PlusLimits：档位的上限，人数上限按 member_limit_override 改过。不限时 member_limit 为 null、member_limit_unlimited 为 true。"""
+    limit = tiers.member_limit_of(conversation, now)
+    return {
+        **tiers.limits_for(tier),
+        "member_limit": limit,
+        "member_limit_unlimited": limit is None,
+        "member_limit_override": conversation.member_limit_override,
+    }
 
 
 def featured_limit(conversation: Conversation, now: datetime | None = None) -> int:
@@ -210,6 +224,8 @@ async def ensure_member_capacity(db: AsyncSession, conversation: Conversation, a
     if adding <= 0 or conversation.type != ConversationType.GROUP or conversation.id == OFFICIAL_GROUP_ID:
         return
     limit = member_limit(conversation)
+    if limit is None:
+        return
     count = int(
         await db.scalar(select(func.count()).select_from(ConversationMember).where(ConversationMember.conversation_id == conversation.id)) or 0
     )
@@ -271,7 +287,8 @@ async def plus_view(db: AsyncSession, conversation: Conversation, role: MemberRo
         "tier": tier,
         "tier_name": tiers.TIERS[tier]["name"],
         "expires_at": _iso(conversation.plus_expires_at) if tier != tiers.FREE else None,
-        "limits": tiers.limits_for(tier),
+        "permanent": tiers.conversation_permanent(conversation, now),
+        "limits": limits_view(conversation, tier, now),
         "usage": {
             "member_count": usage["member_count"],
             "featured_count": usage["featured_count"],
@@ -284,9 +301,13 @@ async def plus_view(db: AsyncSession, conversation: Conversation, role: MemberRo
 
 
 def plus_fields(conversation: Conversation, now: datetime | None = None) -> dict[str, Any]:
-    """会话对象上的 plus_tier / plus_expires_at。"""
+    """会话对象上的 plus_tier / plus_expires_at / plus_permanent。"""
     tier = tiers.conversation_tier(conversation, now)
-    return {"plus_tier": tier, "plus_expires_at": _iso(conversation.plus_expires_at) if tier != tiers.FREE else None}
+    return {
+        "plus_tier": tier,
+        "plus_expires_at": _iso(conversation.plus_expires_at) if tier != tiers.FREE else None,
+        "plus_permanent": tier != tiers.FREE and tiers.is_permanent(conversation.plus_expires_at),
+    }
 
 
 # ---------------------------------------------------------------- 报价与购买
@@ -296,6 +317,14 @@ def compute_plan(conversation: Conversation, tier: str, period: str, price: int,
     """按群现在的状态算这次买的是什么（新开 / 续期 / 升级）。买更低的档位在当前档位到期前不允许。"""
     current = tiers.conversation_tier(conversation, now)
     current_expires = tiers.aware(conversation.plus_expires_at) if current != tiers.FREE else None
+    if current != tiers.FREE and tiers.is_permanent(current_expires):
+        # 永久档位（后台给的）：续期没有意义，升级 / 降级都只会让它变成有期限的，一律不卖
+        raise _error(
+            status.HTTP_409_CONFLICT,
+            "already_permanent",
+            f"这个群已经是永久 {tiers.TIERS[current]['name']}，不用再购买",
+            current_tier=current,
+        )
     days = period_days(period)
     duration = timedelta(days=days)
     forfeited = timedelta(0)
@@ -518,6 +547,7 @@ async def _record_views(db: AsyncSession, records: list[GroupPlusRecord], *, wit
             "prev_expires_at": _iso(record.prev_expires_at),
             "new_tier": record.new_tier,
             "new_expires_at": _iso(record.new_expires_at),
+            "permanent": record.new_tier != tiers.FREE and tiers.is_permanent(record.new_expires_at),
             "forfeited_days": record.forfeited_days,
             "user": UserPublic.model_validate(owner) if owner is not None else None,
             "note": record.note,
@@ -547,15 +577,63 @@ async def list_group_records(db: AsyncSession, user: User, conversation_id: int,
 # ---------------------------------------------------------------- 后台
 
 
+async def _admin_group_item(db: AsyncSession, conversation: Conversation, now: datetime) -> dict[str, Any]:
+    usage = await usage_of(db, conversation.id, now)
+    owner = (
+        await db.execute(
+            select(User)
+            .join(ConversationMember, ConversationMember.user_id == User.id)
+            .where(ConversationMember.conversation_id == conversation.id, ConversationMember.role == MemberRole.OWNER)
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    expires = tiers.aware(conversation.plus_expires_at)
+    recorded_free = conversation.plus_tier == tiers.FREE
+    expired = recorded_free or expires is None or expires <= now
+    limit = tiers.member_limit_of(conversation, now)
+    return {
+        "conversation_id": conversation.id,
+        "title": conversation.title,
+        "avatar_url": conversation.avatar_url,
+        "member_count": usage["member_count"],
+        "owner": {"id": owner.id, "display_name": owner.nickname or owner.username} if owner is not None else None,
+        "tier": conversation.plus_tier if not expired else tiers.FREE,
+        "recorded_tier": conversation.plus_tier,
+        "expires_at": expires if not recorded_free else None,
+        "days_left": 0 if expired else max(0, (expires - now).days),
+        # 免费群（从没买过 / 已取消）不算「过期」
+        "expired": expired and not recorded_free,
+        "permanent": not expired and tiers.is_permanent(expires),
+        "member_limit": limit,
+        "member_limit_unlimited": limit is None,
+        "member_limit_override": conversation.member_limit_override,
+        "files_state": tiers.file_state(conversation, now)["state"],
+        "featured_count": usage["featured_count"],
+    }
+
+
 async def admin_groups(
-    db: AsyncSession, *, tier: str | None, expiring_within_days: int | None, q: str | None, include_expired: bool, limit: int, offset: int
+    db: AsyncSession,
+    *,
+    tier: str | None,
+    expiring_within_days: int | None,
+    q: str | None,
+    include_expired: bool,
+    limit: int,
+    offset: int,
+    include_free: bool = False,
 ) -> dict[str, Any]:
+    """后台群列表。默认只列有档位的群；include_free=True 列所有群（按群名 / id 找群、设人数上限用），tier / 到期筛选照样生效。"""
     now = _now()
-    clauses = [Conversation.type == ConversationType.GROUP, Conversation.plus_tier != tiers.FREE, Conversation.plus_expires_at.is_not(None)]
-    if not include_expired:
-        clauses.append(Conversation.plus_expires_at > now)
+    clauses: list[Any] = [Conversation.type == ConversationType.GROUP]
+    if not include_free:
+        clauses += [Conversation.plus_tier != tiers.FREE, Conversation.plus_expires_at.is_not(None)]
+        if not include_expired:
+            clauses.append(Conversation.plus_expires_at > now)
     if tier in tiers.PAID_TIERS:
         clauses.append(Conversation.plus_tier == tier)
+        if include_free:
+            clauses.append(Conversation.plus_expires_at > now)
     if expiring_within_days is not None:
         clauses.append(Conversation.plus_expires_at > now)
         clauses.append(Conversation.plus_expires_at <= now + timedelta(days=expiring_within_days))
@@ -565,54 +643,39 @@ async def admin_groups(
         match = Conversation.title.ilike(like)
         clauses.append(match | (Conversation.id == int(term)) if term.isdigit() else match)
     total = int(await db.scalar(select(func.count()).select_from(Conversation).where(*clauses)) or 0)
-    rows = (
-        await db.execute(select(Conversation).where(*clauses).order_by(Conversation.plus_expires_at.asc(), Conversation.id.asc()).offset(offset).limit(limit))
-    ).scalars().all()
-    items = []
-    for conversation in rows:
-        usage = await usage_of(db, conversation.id, now)
-        owner = (
-            await db.execute(
-                select(User)
-                .join(ConversationMember, ConversationMember.user_id == User.id)
-                .where(ConversationMember.conversation_id == conversation.id, ConversationMember.role == MemberRole.OWNER)
-                .limit(1)
-            )
-        ).scalar_one_or_none()
-        expires = tiers.aware(conversation.plus_expires_at)
-        expired = expires is None or expires <= now
-        items.append(
-            {
-                "conversation_id": conversation.id,
-                "title": conversation.title,
-                "avatar_url": conversation.avatar_url,
-                "member_count": usage["member_count"],
-                "owner": {"id": owner.id, "display_name": owner.nickname or owner.username} if owner is not None else None,
-                "tier": conversation.plus_tier if not expired else tiers.FREE,
-                "recorded_tier": conversation.plus_tier,
-                "expires_at": expires,
-                "days_left": 0 if expired else max(0, (expires - now).days),
-                "expired": expired,
-                "files_state": tiers.file_state(conversation, now)["state"],
-                "featured_count": usage["featured_count"],
-            }
-        )
-    return {"items": items, "total": total}
+    order = (Conversation.id.asc(),) if include_free else (Conversation.plus_expires_at.asc(), Conversation.id.asc())
+    rows = (await db.execute(select(Conversation).where(*clauses).order_by(*order).offset(offset).limit(limit))).scalars().all()
+    return {"items": [await _admin_group_item(db, conversation, now) for conversation in rows], "total": total}
+
+
+async def admin_group(db: AsyncSession, conversation_id: int) -> dict[str, Any]:
+    """GET /admin/group-plus/groups/{cid}：任意一个群（含免费群）的档位、人数、人数上限。不含消息内容。"""
+    conversation = await db.get(Conversation, conversation_id)
+    if conversation is None or conversation.type != ConversationType.GROUP:
+        raise _error(status.HTTP_404_NOT_FOUND, "group_not_found", "群不存在")
+    return await _admin_group_item(db, conversation, _now())
 
 
 async def admin_grant(db: AsyncSession, admin: User, payload: dict[str, Any]) -> dict[str, Any]:
-    """POST /admin/group-plus/grant：赠送 / 取消。同档位在原到期上加；不同档位直接替换（后台可以降档）；tier=free 是取消。"""
+    """POST /admin/group-plus/grant：赠送 / 取消。同档位在原到期上加；不同档位直接替换（后台可以降档）；tier=free 是取消。
+
+    permanent=true 是送成永久（到期时间写成哨兵值，days 不用传）。给已经是永久的同档位再送天数：保持永久，不变。
+    """
     admin_id = admin.id
     conversation_id = payload.get("conversation_id")
     tier = payload.get("tier")
     days = payload.get("days")
+    permanent = payload.get("permanent")
     note = (payload.get("note") or "").strip() or None
     if not isinstance(conversation_id, int) or isinstance(conversation_id, bool):
         raise _error(status.HTTP_422_UNPROCESSABLE_ENTITY, "invalid_group", "conversation_id 不对")
     if tier not in tiers.ALL_TIERS:
         raise _error(status.HTTP_422_UNPROCESSABLE_ENTITY, "invalid_tier", "tier 只能是 free / pro / pro_plus / max")
-    if tier != tiers.FREE and (isinstance(days, bool) or not isinstance(days, int) or not 1 <= days <= 3650):
-        raise _error(status.HTTP_422_UNPROCESSABLE_ENTITY, "invalid_days", "days 要在 1–3650 之间")
+    if permanent is not None and not isinstance(permanent, bool):
+        raise _error(status.HTTP_422_UNPROCESSABLE_ENTITY, "invalid_permanent", "permanent 只能是 true / false")
+    permanent = bool(permanent) and tier != tiers.FREE
+    if tier != tiers.FREE and not permanent and (isinstance(days, bool) or not isinstance(days, int) or not 1 <= days <= 3650):
+        raise _error(status.HTTP_422_UNPROCESSABLE_ENTITY, "invalid_days", "days 要在 1–3650 之间（或者传 permanent: true 送成永久）")
     conversation = await db.get(Conversation, conversation_id)
     if conversation is None or conversation.type != ConversationType.GROUP:
         raise _error(status.HTTP_404_NOT_FOUND, "group_not_found", "群不存在")
@@ -629,11 +692,18 @@ async def admin_grant(db: AsyncSession, admin: User, payload: dict[str, Any]) ->
             if tier == tiers.FREE:
                 action, source = "revoke", "revoke"
                 new_tier, new_expires, grant_days = tiers.FREE, None, 0
+            elif permanent:
+                action, source = "grant", "grant"
+                new_tier, new_expires, grant_days = tier, tiers.PERMANENT_EXPIRES_AT, 0
             else:
                 action, source = "grant", "grant"
                 new_tier, grant_days = tier, int(days)
-                base = current_expires if current == tier and current_expires is not None else now
-                new_expires = base + timedelta(days=grant_days)
+                if current == tier and tiers.is_permanent(current_expires):
+                    # 已经是永久的同档位：加天数没有意义，保持永久
+                    new_expires = current_expires
+                else:
+                    base = current_expires if current == tier and current_expires is not None else now
+                    new_expires = base + timedelta(days=grant_days)
             record = GroupPlusRecord(
                 conversation_id=conversation_id,
                 source=source,
@@ -662,7 +732,14 @@ async def admin_grant(db: AsyncSession, admin: User, payload: dict[str, Any]) ->
             else:
                 await log_admin_action(
                     db, admin_id, "group_plus.grant", "conversation", conversation_id,
-                    {"tier": tier, "days": grant_days, "prev_tier": current, "new_expires_at": new_expires.isoformat(), "note": note},
+                    {
+                        "tier": tier,
+                        "days": grant_days,
+                        "permanent": tiers.is_permanent(new_expires),
+                        "prev_tier": current,
+                        "new_expires_at": new_expires.isoformat(),
+                        "note": note,
+                    },
                 )
             record_id = record.id
             await db.commit()
@@ -675,6 +752,54 @@ async def admin_grant(db: AsyncSession, admin: User, payload: dict[str, Any]) ->
         "record": (await _record_views(db, [row], with_title=True))[0],
         "conversation": {"conversation_id": conversation_id, **plus_fields(conversation)},
         "reason": "revoke" if tier == tiers.FREE else "grant",
+    }
+
+
+def parse_member_limit_override(value: Any) -> int | None:
+    """null = 跟随档位，0 = 不限，1–100000 = 自定义上限。不合法抛 422 invalid_member_limit。"""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= tiers.MEMBER_LIMIT_OVERRIDE_MAX:
+        raise _error(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "invalid_member_limit",
+            f"member_limit_override 只能是 null（跟随档位）、0（不限）或 1–{tiers.MEMBER_LIMIT_OVERRIDE_MAX}",
+        )
+    return value
+
+
+async def admin_set_member_limit(db: AsyncSession, admin: User, conversation_id: int, value: Any) -> dict[str, Any]:
+    """PUT /admin/group-plus/groups/{cid}/member-limit：单独设这个群的人数上限（null 跟随档位 / 0 不限 / 正数）。
+
+    只影响之后的加人（已有成员不踢；自定义的上限比现有人数小，也只是不能再加）。有变化才写审计日志 group_plus.member_limit。
+    """
+    admin_id = admin.id
+    override = parse_member_limit_override(value)
+    conversation = await db.get(Conversation, conversation_id)
+    if conversation is None or conversation.type != ConversationType.GROUP:
+        raise _error(status.HTTP_404_NOT_FOUND, "group_not_found", "群不存在")
+    async with shop_service._write_lock():
+        try:
+            await db.execute(
+                update(Conversation).where(Conversation.id == conversation_id).values(updated_at=Conversation.updated_at).execution_options(synchronize_session=False)
+            )
+            fresh = await db.get(Conversation, conversation_id, populate_existing=True)
+            previous = fresh.member_limit_override
+            changed = previous != override
+            if changed:
+                fresh.member_limit_override = override
+                await db.flush()
+                await log_admin_action(db, admin_id, "group_plus.member_limit", "conversation", conversation_id, {"old": previous, "new": override})
+            await db.commit()
+        except BaseException:
+            await db.rollback()
+            raise
+    conversation = await db.get(Conversation, conversation_id, populate_existing=True)
+    return {
+        "group": await _admin_group_item(db, conversation, _now()),
+        "conversation": {"conversation_id": conversation_id, **plus_fields(conversation)},
+        "changed": changed,
+        "previous": previous,
     }
 
 

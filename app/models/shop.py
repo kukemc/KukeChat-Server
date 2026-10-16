@@ -132,3 +132,22 @@ class ShopAccount(Base):
     last_error: Mapped[str | None] = mapped_column(String(200), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class CoinGrant(Base):
+    """后台给某个用户加 / 扣的金币（docs/shop.md 第 1 节、5.2）。只增不改：每一笔是一行，amount 正数是赠送、负数是扣除。
+
+    余额公式直接对这张表求和（services/shop.py 的 _granted_query / available_expression），没有另外的余额列。
+    记在 KukeChat 账号上，不跟 CCW 账号走：换绑不影响，也不进「同一个 CCW 账号的币只能花一次」那条规则。
+    """
+
+    __tablename__ = "coin_grants"
+    __table_args__ = (Index("ix_coin_grants_user", "user_id", "id"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    amount: Mapped[int] = mapped_column(Integer)
+    reason: Mapped[str] = mapped_column(String(200))
+    # 操作的管理员；账号删了留空
+    admin_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)

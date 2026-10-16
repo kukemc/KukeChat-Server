@@ -9,8 +9,11 @@
 KukeChat 自己不发币、不存币。余额是算出来的：
 
 ```
-余额 = 这个人给 KukeChat 官方作品累计投出的币 − 在商店里已经花掉的币 − 送礼花掉的币 − 发出的红包总额 + 抢到的红包 + 退回的红包
+余额 = 这个人给 KukeChat 官方作品累计投出的币 − 在商店里已经花掉的币 − 送礼花掉的币 − 群升级花掉的币
+     − 发出的红包总额 + 抢到的红包 + 退回的红包 + 后台赠送的币（扣除记为负数）
 ```
+
+「后台赠送的币」（`balance.granted`）是管理员在后台手动加 / 扣的金币（见 5.2），记在 KukeChat 账号上、不跟 CCW 账号走（换绑不影响，也不进下面的换绑防刷规则）；和抢到的红包一样能花，但花之前同样要绑定 CCW 账号、能向余额来源核实（购买的流程不变）。群升级见 [`group-plus.md`](group-plus.md)。
 
 后三项是红包（[`red-packets.md`](red-packets.md)）：发红包时立刻扣整包金额，没被领完的部分在红包结束时退回；抢到的币和投出来的币一样能花。币只在用户之间流动，总量不变。
 「送礼花掉的」是礼物（[`gifts.md`](gifts.md)）：送礼物、送商店商品给别人，是真消耗，对方不得币。
@@ -184,7 +187,10 @@ KukeChat 自己不发币、不存币。余额是算出来的：
     "red_packet_sent": 0,             // 红包：发出的整包金额之和 / 抢到的 / 没被领完退回来的
     "red_packet_received": 0,
     "red_packet_refunded": 0,
-    "gift_spent": 0                   // 送礼物 / 送商品花掉的币。balance = donated − spent − gift_spent − red_packet_sent + red_packet_received + red_packet_refunded
+    "gift_spent": 0,                  // 送礼物 / 送商品花掉的币
+    "group_plus_spent": 0,            // 买群升级花掉的币
+    "granted": 0                      // 后台赠送的币（赠送 − 扣除，见 5.2）。
+                                      // balance = donated − spent − gift_spent − group_plus_spent − red_packet_sent + red_packet_received + red_packet_refunded + granted
   },
   "equipped": { "bubble": "bubble.aurora", "frame": "frame.galaxy" },     // 每个槽装备的 sku，没装备的槽不出现
   "donate_url": "https://www.ccw.site/detail/…",
@@ -247,7 +253,7 @@ body `{ "slot": "bubble", "sku": "bubble.aurora" }`，`sku` 传 null 表示卸�
 | `shop.item.expiring` | `{ item: { sku, name, category }, expires_at }` | 我的一件限时商品快到期了（到期前 3 天，每次到期只发一次），**只发给本人**。见 2.5 |
 | `shop.item.expired` | `{ item: { sku, name, category } }` | 我的一件限时商品到期了，装备着的话已经被卸下，**只发给本人**（每次到期只发一次）。最多比到期时间晚一分钟 |
 | `user.cosmetics.updated` | `{ user_id, cosmetics }` | 有人换了装扮，见 2.3 |
-| `shop.balance.changed` | `{ reason, change, balance, red_packet_id }` | 我的余额变了，**只发给本人**（别的设备跟着变）。`balance` 是完整的 balance 对象（3.1），可以直接整个替换本地的，也可以收到就重拉。`reason` 是来源：`"red_packet"` 或 `"gift"`；`change` 是具体哪一种：`red_packet.sent` 发了红包 / `red_packet.claimed` 领到了 / `red_packet.refunded` 红包结束、没领完的退回来了（带 `red_packet_id`）/ `gift.sent` 送了礼（带 `gift_id`，送礼记录的 id）。商店购买、后台退款暂时不发（购买接口的返回里已经带了最新的 balance）。客户端遇到不认识的 `reason` / `change` 也照样更新余额，以后别的来源加进来不用改 |
+| `shop.balance.changed` | `{ reason, change, balance, red_packet_id }` | 我的余额变了，**只发给本人**（别的设备跟着变）。`balance` 是完整的 balance 对象（3.1），可以直接整个替换本地的，也可以收到就重拉。`reason` 是来源：`"red_packet"` 或 `"gift"`；`change` 是具体哪一种：`red_packet.sent` 发了红包 / `red_packet.claimed` 领到了 / `red_packet.refunded` 红包结束、没领完的退回来了（带 `red_packet_id`）/ `gift.sent` 送了礼（带 `gift_id`，送礼记录的 id）/ `coin_grant.granted`、`coin_grant.deducted` 后台给我加 / 扣了金币（`reason = "coin_grant"`，带 `grant_id`、`amount`，见 5.2）。商店购买、后台退款暂时不发（购买接口的返回里已经带了最新的 balance）。客户端遇到不认识的 `reason` / `change` 也照样更新余额，以后别的来源加进来不用改 |
 
 ## 5. 后台
 
@@ -256,16 +262,50 @@ body `{ "slot": "bubble", "sku": "bubble.aurora" }`，`sku` 传 null 表示卸�
 | `GET /admin/shop/items` | 全部商品（含下架的），每项带已售数量 |
 | `POST /admin/shop/items`、`PUT /admin/shop/items/{id}` | 新建 / 修改：`sku`（新建后不可改）、`category`、`name`、`description`、`price`、`unlock_level`、`style`、`preview_text`、`tag`、`is_active`、`sort`、`available_until`、`duration_days`（有效期，1–3650 天；null 是永久。不合法是 422 `invalid_item`，`detail.field = "duration_days"`。改它只影响之后的购买 / 赠送）。`style` 按 `category` 校验（气泡 2.2，头像框 2.4），不合法返回 422 `invalid_style` 并说明哪个字段；只改 `category` 不改 `style` 时，旧样式也得符合新类别的规则 |
 | `GET /admin/shop/purchases?user_id=&item_id=&limit&offset` | 购买记录。每项带 `expires_at`、`duration_days`（含义同 3.5）、`superseded_at`（被续期接替的时间，当前的那一条为 null）、`from_user`（`source = gift` 时是谁送的：`{ id, username, nickname, avatar_url }`）。按 `user_id` 筛出来的就是这个人的拥有列表：没被收回、`expires_at` 为 null 或者还没到的那几条是现在拥有的 |
-| `GET /admin/shop/accounts?q=&mismatch=&limit&offset` | 每个用户的累计投币、已花、送礼花掉的（`gift_spent`）、红包收支（`red_packet_sent` / `red_packet_received` / `red_packet_refunded`）、余额、上次核实时间；`mismatch=true` 只看**余额为负**的（每项的 `mismatch` 也是这个口径）。抢到过红包的人也在这个列表里 |
+| `GET /admin/shop/accounts?q=&mismatch=&limit&offset` | 每个用户的累计投币、已花、送礼花掉的（`gift_spent`）、群升级花掉的（`group_plus_spent`）、后台赠送的净额（`granted`）、红包收支（`red_packet_sent` / `red_packet_received` / `red_packet_refunded`）、余额、上次核实时间；`mismatch=true` 只看**余额为负**的（每项的 `mismatch` 也是这个口径）。抢到过红包的人也在这个列表里 |
 | `POST /admin/shop/reconcile` | 向余额来源拉一次完整的投币名单，更新所有已绑定用户的累计投币，返回 `{ donors, matched, updated, mismatched: [...], red_packets: {...}, gifts: {...} }`（`gifts` 是送礼的账的守恒检查，见 [`gifts.md`](gifts.md) 5.1）。拉不到完整名单时 503，什么都不改。有了红包之后「花的比投的多」不再必然是异常（抢到的币也能花），所以查的是：`mismatched` 余额为负的账户，和 `red_packets` 全站红包账的守恒（`{ total_sent, total_claimed, total_refunded, outstanding, balanced, problems }`，见 [`red-packets.md`](red-packets.md) 5.1） |
+| `GET /admin/shop/grants?user_id=&admin_id=&direction=&limit&offset` | 后台赠送 / 扣除金币的记录，新的在前。见 5.2 |
+| `POST /admin/shop/grants` | `{ user_id, amount, reason }` 给用户加（正数）/ 扣（负数）金币。见 5.2 |
 | `POST /admin/shop/users/{user_id}/grant` | `{ item_id, note, duration_days }` 赠送。`duration_days` 不传 = 按商品的设置；正整数（≤ 3650）= 这一份只给这么多天；`0` = 送成永久。给已经拥有这件**限时**商品的人再送 = 续期（在原到期时间上加）；已经永久拥有是 409 `already_owned`。范围不对是 422 `invalid_duration` |
 | `POST /admin/shop/users/{user_id}/revoke` | `{ item_id, note, refund }` 收回（同时卸下）。收回的是当前的那一条记录；`refund` 为 true 时只退那一条的钱 |
 | `GET /admin/shop/settings` | 官方作品、各项阈值，以及样式里能用的名字：`categories`、`tags`、气泡的 `animations` / `patterns` / `ornaments`、头像框的 `frame_animations` / `frame_ornaments` / `frame_positions`，还有 `price_max`、`unlock_level_max`、`duration_max`（只读） |
 
 审计日志：赠送仍是 `shop.grant`（`details` 多了 `duration_days`：这一份给了多少天，永久为 null），改商品仍是 `shop.item.update`。限时商品到期是系统行为，不写审计日志。
+赠送 / 扣除金币是 `shop.coins.grant`（`target_type = "user"`，`details`：`{ grant_id, amount, reason, balance_before, balance_after }`）。
 
 ### 5.1 限时商品的实现细节
 
 - `shop_purchases` 每一行多了 `expires_at`、`duration_days`、`superseded_at`、`from_user_id`、`gift_record_id` 和两个「已通知」时间。「当前的那一行」= 没被收回、没被接替；唯一索引（`uq_shop_purchases_live`）只管它，所以一个人一件商品同时只有一行当前记录。「现在拥有」= 当前的那一行没到期。
 - **续期**是把当前的那一行标成被接替、再写一行新的（带累加之后的到期时间），所以每次花的钱、得到的天数各有一行，换绑防刷的口径（按记录上的 CCW 账号求和）不用变。
 - **并发续期不丢天数**：接替是一条带条件的 UPDATE（那一行必须还是当前记录），抢不到的事务整个回滚、按对方提交之后的到期时间重来；两个事务同时写第一行，后提交的撞唯一索引，同样重来。花币的路径上扣款那条 UPDATE 在前，事务从那里起就拿着数据库的写锁，后一个事务读到的一定是前一个提交之后的到期时间。
+
+### 5.2 后台赠送 / 扣除金币
+
+表 `coin_grants`（只增不改）：`id, user_id, amount, reason, admin_id, created_at`。`amount` 正数是赠送、负数是扣除；余额公式直接对它求和（`balance.granted`），没有另外的余额列。
+
+`POST /admin/shop/grants`
+
+```jsonc
+// 请求
+{ "user_id": 12, "amount": 500, "reason": "活动奖励" }
+// 200
+{ "grant": { "id": 3, "user_id": 12, "user": { "id": 12, "username": "…", "nickname": "…", "avatar_url": null },
+             "amount": 500, "reason": "活动奖励", "admin_id": 1, "admin": { /* 同 user */ }, "created_at": "…" },
+  "balance_before": 60,
+  "balance": { /* 这个用户写入之后的完整 balance 对象（3.1），含 granted */ } }
+```
+
+| HTTP | `detail.code` | 含义 |
+| --- | --- | --- |
+| 422 | `invalid_amount` | `amount` 不是整数、是 0，或者绝对值超过 1,000,000（`detail.field = "amount"`） |
+| 422 | `invalid_reason` | `reason` 为空或超过 200 字（`detail.field = "reason"`）。首尾空白会去掉 |
+| 404 | `user_not_found` | 用户不存在 |
+| 409 | `insufficient_balance` | 扣除之后余额（按第 1 节完整公式算）会变成负数。带 `balance`（现在的余额）、`amount`。什么都不写 |
+
+- 没有账户的人（没投过币、没核实过）赠送时会建一行账户，之后出现在 `GET /admin/shop/accounts` 里。
+- 写入和余额检查在同一个写事务里（先过 `_write_lock`，事务第一条语句就拿写锁），扣除不会和同时进行的花币交错成负数。
+- 成功后给本人发 `shop.balance.changed`（`reason = "coin_grant"`），并在通知中心出现一条 `system` 类别的通知（`type = "coin_grant"`，标题「后台赠送了你 N 金币」/「后台扣除了你 N 金币」，正文是 `reason`；保留 30 天）——所以 `reason` 要写成可以给用户看的话。
+
+`GET /admin/shop/grants?user_id=&admin_id=&direction=grant|deduct&limit=50&offset=0` → `{ items: [同上 grant], total, summary: { granted, deducted, net } }`（`summary` 是筛选范围内的合计）。
+
+服务器上也可以用命令行做，见 [`group-plus.md`](group-plus.md) 9.3 的 `--grant-coins`。

@@ -203,6 +203,8 @@ class ConversationRead(BaseModel):
     # 群升级（docs/group-plus.md）：有效档位 free / pro / pro_plus / max；到期时间免费时为 null
     plus_tier: str = "free"
     plus_expires_at: datetime | None = None
+    # 永久档位（后台给的；plus_expires_at 是 2999 年的哨兵值）。客户端看到 true 显示「永久」，不显示日期 / 剩余天数
+    plus_permanent: bool = False
     # 群文件默认保留多少小时
     file_default_ttl_hours: int = 24
     # 群待办：{ message_id, message_exists, summary, snapshot, set_by, set_at … }，没有为 null
@@ -226,6 +228,7 @@ class GroupDiscoveryRead(BaseModel):
     member_count: int
     plus_tier: str = "free"
     plus_expires_at: datetime | None = None
+    plus_permanent: bool = False
     joined: bool
     join_request_status: GroupJoinRequestStatus | None = None
 

@@ -37,6 +37,13 @@ TIERS: dict[str, dict[str, Any]] = {
 # 月价默认值（金币），后台可改
 DEFAULT_PRICES: dict[str, int] = {"pro": 80, "pro_plus": 200, "max": 500}
 PRICE_MAX = 1_000_000
+# 永久档位（只有后台能给）：到期时间写成这个远期的哨兵值，到期判断、修剪、群文件宽限这些现有逻辑不用改。
+# 判断「是不是永久」一律用 is_permanent（到期年份 >= 2999），不要和这个值做相等比较
+PERMANENT_EXPIRES_AT = datetime(2999, 12, 31, tzinfo=UTC)
+PERMANENT_YEAR = 2999
+# 每个群单独的人数上限（conversations.member_limit_override）：空 = 跟随档位，0 = 不限，正数 = 就是这个上限
+MEMBER_LIMIT_UNLIMITED = 0
+MEMBER_LIMIT_OVERRIDE_MAX = 100_000
 
 
 def _now() -> datetime:
@@ -49,6 +56,25 @@ def aware(value: datetime | None) -> datetime | None:
     if value is None:
         return None
     return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
+def is_permanent(expires_at: datetime | None) -> bool:
+    """到期时间是不是永久的哨兵值（年份 >= 2999）。"""
+    expires = aware(expires_at)
+    return expires is not None and expires.year >= PERMANENT_YEAR
+
+
+def conversation_permanent(conversation: Any, now: datetime | None = None) -> bool:
+    """这个群现在的有效档位是不是永久的（免费档恒为 False）。"""
+    return conversation_tier(conversation, now) != FREE and is_permanent(getattr(conversation, "plus_expires_at", None))
+
+
+def member_limit_of(conversation: Any, now: datetime | None = None) -> int | None:
+    """这个群现在的人数上限：先看后台单独设的 member_limit_override（0 = 不限，返回 None），没设就按有效档位。"""
+    override = getattr(conversation, "member_limit_override", None)
+    if override is not None:
+        return None if override == MEMBER_LIMIT_UNLIMITED else int(override)
+    return TIERS[conversation_tier(conversation, now)]["member_limit"]
 
 
 def rank(tier: str) -> int:

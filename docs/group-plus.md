@@ -22,6 +22,7 @@
   - **买同档位 = 续期**：在原到期时间上加（`action = "renew"`）。
   - **买更高的档位 = 立即升级**：新到期 = 现在 + 购买时长；**原档位剩余时间作废**（`action = "upgrade"`，quote 里带 `forfeited_seconds` / `forfeited_days`）。升级且有剩余时间时，购买接口必须带 `confirm_forfeit: true`，否则 409 `forfeit_not_confirmed`（带 quote，客户端弹确认框再提交）。
   - **买更低的档位**：当前档位到期前不允许，422 `downgrade_not_allowed`。过期之后随便买。
+  - **永久档位**（只有后台能给，见 9.2）：不能再买任何档位（续期没意义，升级 / 降级都只会让它变成有期限的），报价和购买都是 409 `already_permanent`。后台取消（`tier = free`）之后恢复正常。
 - 到期降回免费：
   - 已有成员不踢，但**满员后不能再加人**（人数 >= 当前上限时加人返回 409 `group_full`）。
   - 云端消息超出免费条数的，在后续发消息时被逐步修剪（每次发消息最多修剪 25 条，精华 / 群待办有独立快照，不受影响）。
@@ -32,8 +33,10 @@
 - 用户的余额公式新增一项：
 
 ```
-余额 = CCW 核实的累计投币 − 商店花掉的 − 送礼花掉的 − 群升级花掉的 − 发出的红包总额 + 抢到的 + 退回的
+余额 = CCW 核实的累计投币 − 商店花掉的 − 送礼花掉的 − 群升级花掉的 − 发出的红包总额 + 抢到的 + 退回的 + 后台赠送的
 ```
+
+  「后台赠送的」（`balance.granted`）见 [`shop.md`](shop.md) 5.2。
 
   `balance` 对象多一项 `group_plus_spent`（我买群升级一共花掉的币），`balance.balance` 已经按上面的公式算好。`balance.spent` 里包含这个 CCW 账号在**别的** KukeChat 账号上买群升级花掉的部分（和商店 / 红包 / 礼物同一条换绑规则）。群升级不退款；后台手动赠送不收费、不进余额公式。
 - 每个群的当前档位是**有效档位**：记录的档位已过期就是 `free`。所有对外接口给的 `plus_tier` 都是有效档位，`plus_expires_at` 在免费时为 `null`。
@@ -43,9 +46,12 @@
 `ConversationRead`（会话列表、会话详情等所有返回会话的接口）、`GroupDiscoveryRead`（群搜索 / 推荐）、聊天记录搜索结果里的会话摘要新增：
 
 ```jsonc
-"plus_tier": "max",                       // free / pro / pro_plus / max，有效档位
-"plus_expires_at": "2026-12-01T00:00:00Z" // 免费时为 null
+"plus_tier": "max",                        // free / pro / pro_plus / max，有效档位
+"plus_expires_at": "2026-12-01T00:00:00Z", // 免费时为 null
+"plus_permanent": false                    // 永久档位（后台给的）
 ```
+
+**永久档位**：`plus_permanent: true`，`plus_expires_at` 是哨兵值 `2999-12-31T00:00:00Z`（所以只看到期时间的旧客户端也不会把它当成过期）。客户端看到 `plus_permanent: true` 显示「永久」，不显示日期 / 剩余天数；没有这个字段的旧数据按「到期年份 >= 2999」判断。
 
 客户端用它画群头像右下角的角标：MAX 是专属标志，Pro / Pro+ 可以画不同的角标，free 不画。私聊的 `plus_tier` 恒为 `free`。旧客户端不认识这两个字段，忽略即可。
 
@@ -90,7 +96,11 @@
 ```jsonc
 { "conversation_id": 7,
   "tier": "pro_plus", "tier_name": "Pro+", "expires_at": "…",     // 免费时 expires_at 为 null
-  "limits": { "member_limit": 1000, "message_limit": 20000, "file_enabled": true,
+  "permanent": false,                                               // 永久档位（见第 2 节）：不能再购买
+  "limits": { "member_limit": 1000,                // 这个群现在的人数上限；null = 不限
+              "member_limit_unlimited": false,     // 人数不限（后台给这个群单独设的，见 9.2）
+              "member_limit_override": null,       // 后台单独设的值：null 跟随档位 / 0 不限 / 正数
+              "message_limit": 20000, "file_enabled": true,
               "file_quota_bytes": 209715200, "file_temp_max_bytes": 31457280, "featured_limit": 800 },
   "usage": { "member_count": 312, "featured_count": 12,
              "file_bytes_used": 1048576,   // 只算空间文件，不含临时文件
@@ -149,6 +159,7 @@
 | 403 | `not_group_staff` | 不是群主 / 管理员 |
 | 422 | `invalid_tier` | tier 不是 pro / pro_plus / max |
 | 422 | `invalid_period` | period 不是 month / year |
+| 409 | `already_permanent` | 这个群是永久档位，不能再买（报价也是这个错误）。带 `current_tier` |
 | 422 | `downgrade_not_allowed` | 当前档位还没到期，不能买更低的档位。带 `current_tier`、`current_expires_at` |
 | 409 | `forfeit_not_confirmed` | 升级会作废剩余时间，需要 `confirm_forfeit: true`。带 quote 的全部字段 |
 | 409 | `price_changed` | `expected_price` 不等于现价。带 `price` |
@@ -170,6 +181,7 @@
   "days": 365, "amount": 20000,                          // 花掉的币；赠送 / 取消为 0
   "prev_tier": "pro", "prev_expires_at": "…",
   "new_tier": "max", "new_expires_at": "…",
+  "permanent": false,                                    // 这条记录给出的是永久档位（后台赠送）
   "forfeited_days": 12,
   "user": { /* UserPublic，购买人；后台赠送时为 null */ },
   "note": null, "created_at": "…" }
@@ -179,7 +191,7 @@
 
 | 事件 | data | 发给 |
 | --- | --- | --- |
-| `group.plus.updated` | `{ conversation_id, plus_tier, plus_expires_at, reason }`，`reason`：`purchase` / `grant` / `revoke` | 群里的在线成员。到期降级**没有事件**，客户端按 `plus_expires_at` 自己判断 |
+| `group.plus.updated` | `{ conversation_id, plus_tier, plus_expires_at, plus_permanent, reason }`，`reason`：`purchase` / `grant` / `revoke` / `member_limit`（后台改了人数上限，档位没变；需要的话重拉 `GET /conversations/{cid}/plus`）。不认识的 `reason` 照样按里面的档位字段更新 | 群里的在线成员。到期降级**没有事件**，客户端按 `plus_expires_at` 自己判断 |
 | `shop.balance.changed` | `{ reason: "group_plus", change: "group_plus.purchased", balance, conversation_id }` | 只发给购买人 |
 | `group.todo.updated` | 见第 6 节 | 群里的在线成员 |
 | `group.file.updated` | `{ conversation_id, action, file_id }`，`action`：`uploaded` / `deleted` / `updated`（转永久 / 转限时） | 群里的在线成员 |
@@ -439,8 +451,10 @@
 | --- | --- |
 | `GET /admin/group-plus/settings` | `{ enabled, prices: { pro, pro_plus, max }, year_months_paid, defaults: { pro, pro_plus, max }, tiers: [同 /group-plus/plans 的 tiers，只读] , file_max_bytes, file_grace_days }`（`file_max_bytes` 同 3.1，是旧字段）。`prices` 是每月价格 |
 | `PUT /admin/group-plus/settings` | body 可以只传要改的：`{ enabled?, price_pro?, price_pro_plus?, price_max? }`。返回完整设置。不合法 422 `invalid_settings`（`detail.field`）。有变化才写审计日志 `group_plus.settings.update` |
-| `GET /admin/group-plus/groups?tier=&expiring_within_days=&q=&limit=&offset=` | 有档位的群（还没到期的；`include_expired=true` 连已过期的也列）。`tier` 筛选档位；`expiring_within_days` 只看 N 天内到期的；`q` 按群名 / 群 id。返回 `{ items, total }`，每项 `{ conversation_id, title, avatar_url, member_count, owner: {id, display_name} \| null, tier, expires_at, days_left, expired, files_state, featured_count }`。**不含任何消息内容** |
-| `POST /admin/group-plus/grant` | body `{ conversation_id, tier, days, note? }`：赠送。`tier` 为 `pro` / `pro_plus` / `max`，`days` 1–3650。同档位在原到期时间上加；不同档位直接替换成新档位（后台可以降档），到期 = 现在 + days。`tier = "free"` 表示**取消**（`days` 不用传）：立即降回免费，文件进入 30 天宽限。写 `group_plus_records`（`source = grant` / `revoke`，不收费），广播 `group.plus.updated` |
+| `GET /admin/group-plus/groups?tier=&expiring_within_days=&q=&include_expired=&include_free=&limit=&offset=` | 有档位的群（还没到期的；`include_expired=true` 连已过期的也列；`include_free=true` 列所有群，含免费群，按群 id 排序 —— 找群设人数上限用）。`tier` 筛选档位；`expiring_within_days` 只看 N 天内到期的；`q` 按群名 / 群 id。返回 `{ items, total }`，每项 `{ conversation_id, title, avatar_url, member_count, owner: {id, display_name} \| null, tier, recorded_tier, expires_at, days_left, expired, permanent, member_limit, member_limit_unlimited, member_limit_override, files_state, featured_count }`（`member_limit` 为 null 表示不限）。永久档位的 `days_left` 是到 2999 年的天数，界面应显示「永久」。**不含任何消息内容** |
+| `GET /admin/group-plus/groups/{cid}` | 任意一个群（含免费群）的同一个对象。不是群 404 `group_not_found` |
+| `PUT /admin/group-plus/groups/{cid}/member-limit` | body `{ member_limit_override }`：`null` 跟随档位 / `0` 不限 / `1–100000` 自定义。返回 `{ group: 同上, conversation: { conversation_id, plus_tier, plus_expires_at, plus_permanent }, changed, previous }`。见 9.2 |
+| `POST /admin/group-plus/grant` | body `{ conversation_id, tier, days, permanent?, note? }`：赠送。`tier` 为 `pro` / `pro_plus` / `max`，`days` 1–3650；`permanent: true` 是送成**永久**（`days` 不用传，见 9.2）。同档位在原到期时间上加；不同档位直接替换成新档位（后台可以降档），到期 = 现在 + days。`tier = "free"` 表示**取消**（`days` 不用传）：立即降回免费，文件进入 30 天宽限。写 `group_plus_records`（`source = grant` / `revoke`，不收费），广播 `group.plus.updated` |
 | `GET /admin/group-plus/records?conversation_id=&user_id=&source=&limit=&offset=` | 全站流水，新的在前：`{ items: [GroupPlusRecord + { conversation_title }], total, summary: { total_amount, total_count } }`（summary 是全站累计，不随筛选变） |
 
 审计日志（`admin_audit_logs`）：
@@ -448,8 +462,9 @@
 | `action` | `target_type` / `target_id` | `details` |
 | --- | --- | --- |
 | `group_plus.settings.update` | `system_setting` / 空 | `{ 改了的项: { old, new } }` |
-| `group_plus.grant` | `conversation` / 群 id | `{ tier, days, prev_tier, new_expires_at, note }` |
+| `group_plus.grant` | `conversation` / 群 id | `{ tier, days, permanent, prev_tier, new_expires_at, note }` |
 | `group_plus.revoke` | `conversation` / 群 id | `{ prev_tier, prev_expires_at, note }` |
+| `group_plus.member_limit` | `conversation` / 群 id | `{ old, new }`（`member_limit_override` 改前 / 改后；没变化不写） |
 
 ### 9.1 对账
 
@@ -464,9 +479,38 @@
 
 `GET /admin/shop/accounts` 的每一项多了 `group_plus_spent`，`balance` 按新公式算；`shared_spent` 里包含这个 CCW 账号在别的账号上买群升级花掉的。
 
+### 9.2 永久档位与人数上限
+
+**永久档位**：`POST /admin/group-plus/grant` 带 `permanent: true`。到期时间写成哨兵值 `2999-12-31T00:00:00Z`，所以现有的到期判断、消息修剪、群文件宽限都不用改；判断「是不是永久」一律看到期年份 >= 2999（服务端 `core/group_plus_tiers.is_permanent`），不要和这个值做相等比较。记录里 `days = 0`、`permanent = true`。
+
+- 永久的群：购买 / 报价 409 `already_permanent`（第 1 节、3.4）。
+- 给已经是永久的**同档位**再送天数：保持永久，不变；送**不同档位**的天数：按原规则直接替换成「现在 + days」（永久没了，后台可以降档）。
+- 取消（`tier = free`）照常，取消之后可以正常购买。
+- 对外：会话对象 `plus_permanent`、`GET /conversations/{cid}/plus` 的 `permanent`、`GroupPlusRecord.permanent`、后台群列表的 `permanent`、`group.plus.updated` 的 `plus_permanent`。
+
+**人数上限单独设置**：`conversations.member_limit_override`（INTEGER，可空）。`null` 跟随档位（默认，老群都是 null）；`0` 不限；正数就是这个上限（1–100000，可以比档位的大或小）。
+
+- 所有加人的入口（加群、邀请、拉人、审批入群申请、邀请链接、机器人、游戏模式）都经过同一个检查，满了是 409 `group_full`（`detail.limit` 是这个群现在的上限）；不限时不检查。已有成员不踢：自定义的上限比现有人数小，只是不能再加。
+- `GET /conversations/{cid}/plus` 的 `limits.member_limit` 按它算；不限时 `member_limit: null` + `member_limit_unlimited: true`。旧客户端：web 端把 null 当 0、安卓端把 null 当默认值 200，显示的上限会不对但不会崩；新客户端显示「不限」。
+- `GET /group-plus/plans` 里各档位的 `member_limit` 是档位本身的规格，不受它影响。
+- 改了之后广播 `group.plus.updated`（`reason = "member_limit"`）。
+
+### 9.3 服务器上的运维命令
+
+`python -m app.cli.admin_group_tools`（`scripts/admin_group_tools.py` 是同一个东西的外壳；发布只带 `app/`，服务器上用 `-m` 的写法）。在后端的 `WorkingDirectory` 里、用和服务一样的用户和 Python 跑（`.env` 在当前目录）。**默认只预览，加 `--apply` 才写库**；写操作要 `--admin <用户名>`（必须是平台管理员），审计日志和记录都记在他名下。
+
+| 参数 | 做什么 | 走的服务函数 |
+| --- | --- | --- |
+| `--find "<群名片段>"` | 列出群名包含它的群：id、人数、档位、人数上限（最多 50 个，只读） | — |
+| `--permanent-max <群 id>` | 设为永久 MAX | `group_plus.admin_grant`（`permanent: true`） |
+| `--unlimited <群 id>` | 人数上限设为不限（`member_limit_override = 0`） | `group_plus.admin_set_member_limit` |
+| `--grant-coins <用户 id 或用户名> <金额> --reason "…"` | 加 / 扣金币（负数是扣） | `shop.admin_grant_coins` |
+
+新列 / 新表要等新版本的后端启动过一次（启动时自动迁移）才有；没有时命令直接报错退出，不写任何东西。实时事件尽力而为：配了 `REDIS_URL` 时经 Redis 转给在线的人；没配时这个进程推不到在线用户，客户端刷新 / 重连后看到新状态。
+
 ## 10. 实现要点
 
-- **表**：`group_plus_records`（每次购买 / 赠送 / 取消一行，带购买时绑定的 CCW 账号）、`group_files`（`temporary` 列：临时文件）、`group_file_uploads`（直传的上传单，complete 或过期后删除）、`group_todos`（每群一行，`conversation_id` 唯一）、`featured_messages`（重建：`message_id` 可空、无外键，加快照列）、`message_search_index` / `message_search_fts`；`conversations` 新增列 `plus_tier`、`plus_expires_at`、`plus_files_tier`、`plus_files_until`、`file_default_ttl_hours`。启动时自动迁移（`featured_messages` 重建并回填快照）；稳妥起见上线前先单进程启动一次。
+- **表**：`group_plus_records`（每次购买 / 赠送 / 取消一行，带购买时绑定的 CCW 账号）、`group_files`（`temporary` 列：临时文件）、`group_file_uploads`（直传的上传单，complete 或过期后删除）、`group_todos`（每群一行，`conversation_id` 唯一）、`featured_messages`（重建：`message_id` 可空、无外键，加快照列）、`message_search_index` / `message_search_fts`；`conversations` 新增列 `plus_tier`、`plus_expires_at`、`plus_files_tier`、`plus_files_until`、`file_default_ttl_hours`、`member_limit_override`（9.2）。启动时自动迁移（`featured_messages` 重建并回填快照）；稳妥起见上线前先单进程启动一次。
 - **并发**：写事务第一条语句是带条件的 `UPDATE shop_accounts`（余额够才往下写，和礼物 / 红包用同一个余额表达式），之后在同一个事务里写记录、改群、提交；写事务先过 `shop._write_lock()`。同一个 CCW 账号换绑后不能再花一遍（记录上有 `ccw_oid`）。
 - **存储**：群文件放在 `group-files/{群 id}/{随机名}`。本地存储时 `/uploads/group-files/...` 直链返回 404；S3 存储时桶里这个前缀**不要**开公开读（下载接口用服务端凭据读取再转发）；配了 `S3_PRIVATE_BUCKET` 时这个前缀整个放私有桶，直传直下见 5.4。
 - **旧客户端**：精华列表仍是数组、字段只增不减；文件消息、群待办提醒都是普通文本消息；`plus_tier` 等新字段旧客户端忽略；旧的会话内搜索 `GET /conversations/{id}/messages/search` 不变。

@@ -39,12 +39,17 @@ class PlansRead(BaseModel):
 
 
 class PlusLimits(BaseModel):
-    member_limit: int
+    # 这个群现在的人数上限；null = 不限（后台设的，见 member_limit_unlimited）
+    member_limit: int | None = None
     message_limit: int
     file_enabled: bool
     file_quota_bytes: int | None = None
     file_temp_max_bytes: int | None = None
     featured_limit: int
+    # 人数不限（后台给这个群单独设的）；为 true 时 member_limit 是 null
+    member_limit_unlimited: bool = False
+    # 后台单独设的人数上限：null 跟随档位 / 0 不限 / 正数
+    member_limit_override: int | None = None
 
 
 class PlusUsage(BaseModel):
@@ -75,6 +80,8 @@ class PlusRead(BaseModel):
     tier: str
     tier_name: str
     expires_at: datetime | None = None
+    # 永久档位（后台给的，expires_at 是 2999 年的哨兵值）：不能再购买
+    permanent: bool = False
     limits: PlusLimits
     usage: PlusUsage
     files: FileQuota
@@ -125,6 +132,8 @@ class GroupPlusRecordRead(BaseModel):
     prev_expires_at: datetime | None = None
     new_tier: str = "free"
     new_expires_at: datetime | None = None
+    # 这条记录给出的是永久档位
+    permanent: bool = False
     forfeited_days: int = 0
     user: UserPublic | None = None
     note: str | None = None
@@ -137,6 +146,7 @@ class PlusStateRead(BaseModel):
     conversation_id: int
     plus_tier: str
     plus_expires_at: datetime | None = None
+    plus_permanent: bool = False
 
 
 class PlusPurchaseResult(BaseModel):
@@ -270,6 +280,7 @@ class SearchConversation(BaseModel):
     avatar_url: str | None = None
     plus_tier: str = "free"
     plus_expires_at: datetime | None = None
+    plus_permanent: bool = False
     direct_user: UserPublic | None = None
 
 
@@ -330,6 +341,8 @@ class AdminGroupPlusGrant(BaseModel):
     conversation_id: Any = None
     tier: Any = None
     days: Any = None
+    # true = 送成永久（days 不用传）；tier = free 时忽略
+    permanent: Any = None
     note: str | None = Field(default=None, max_length=500)
 
 
@@ -350,6 +363,11 @@ class AdminGroupPlusGroup(BaseModel):
     expires_at: datetime | None = None
     days_left: int = 0
     expired: bool = False
+    permanent: bool = False
+    # 现在的人数上限（null = 不限）、是否不限、后台单独设的值（null 跟随档位 / 0 不限 / 正数）
+    member_limit: int | None = None
+    member_limit_unlimited: bool = False
+    member_limit_override: int | None = None
     files_state: str = "locked"
     featured_count: int = 0
 
@@ -357,6 +375,19 @@ class AdminGroupPlusGroup(BaseModel):
 class AdminGroupPlusGroupPage(BaseModel):
     items: list[AdminGroupPlusGroup] = Field(default_factory=list)
     total: int = 0
+
+
+class AdminGroupMemberLimitWrite(BaseModel):
+    """null = 跟随档位，0 = 不限，1–100000 = 自定义。取值在服务层校验（422 invalid_member_limit）。"""
+
+    member_limit_override: Any = None
+
+
+class AdminGroupMemberLimitResult(BaseModel):
+    group: AdminGroupPlusGroup
+    conversation: PlusStateRead
+    changed: bool = False
+    previous: int | None = None
 
 
 class AdminGroupPlusRecordPage(BaseModel):

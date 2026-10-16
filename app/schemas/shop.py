@@ -58,7 +58,7 @@ class ShopBalance(BaseModel):
     # 服务端核实到的累计投币
     donated: int = 0
     spent: int = 0
-    # donated − spent − gift_spent − group_plus_spent − red_packet_sent + red_packet_received + red_packet_refunded；换绑过 CCW 账号的人可能是负数
+    # donated − spent − gift_spent − group_plus_spent − red_packet_sent + red_packet_received + red_packet_refunded + granted；换绑过 CCW 账号的人可能是负数
     balance: int = 0
     # 上次向 CCW 核实成功的时间；从没核实过为 null
     verified_at: datetime | None = None
@@ -72,6 +72,8 @@ class ShopBalance(BaseModel):
     gift_spent: int = 0
     # 买群升级花掉的币（docs/group-plus.md）：不退款
     group_plus_spent: int = 0
+    # 后台赠送的金币净额（赠送 − 扣除，docs/shop.md 5.2）
+    granted: int = 0
 
 
 class ShopOverview(BaseModel):
@@ -223,6 +225,8 @@ class AdminShopAccountRead(BaseModel):
     gift_spent: int = 0
     # 买群升级花掉的币
     group_plus_spent: int = 0
+    # 后台赠送的金币净额（赠送 − 扣除）
+    granted: int = 0
 
 
 class AdminShopAccountPage(BaseModel):
@@ -252,6 +256,41 @@ class AdminShopGrant(BaseModel):
     note: str | None = Field(default=None, max_length=500)
     # 不传按商品的设置；正整数 = 这一份只给这么多天；0 = 送成永久。范围在服务层校验
     duration_days: int | None = None
+
+
+class AdminCoinGrantCreate(BaseModel):
+    """后台赠送 / 扣除金币。取值在服务层校验（422 invalid_amount / invalid_reason，带 field）。"""
+
+    user_id: int
+    # 正数赠送、负数扣除；不能是 0，绝对值不超过 1,000,000
+    amount: Any = None
+    # 必填，最多 200 字；会展示给用户（通知里）
+    reason: Any = None
+
+
+class AdminCoinGrantRead(BaseModel):
+    id: int
+    user_id: int
+    user: AdminShopUser | None = None
+    amount: int
+    reason: str
+    admin_id: int | None = None
+    admin: AdminShopUser | None = None
+    created_at: datetime | None = None
+
+
+class AdminCoinGrantResult(BaseModel):
+    grant: AdminCoinGrantRead
+    balance_before: int = 0
+    # 这个用户写入之后的完整 balance 对象
+    balance: ShopBalance
+
+
+class AdminCoinGrantPage(BaseModel):
+    items: list[AdminCoinGrantRead] = Field(default_factory=list)
+    total: int = 0
+    # 筛选范围内的合计：{ granted, deducted, net }
+    summary: dict[str, int] = Field(default_factory=dict)
 
 
 class AdminShopRevoke(BaseModel):

@@ -259,6 +259,7 @@ async def _conversation_summaries(db: AsyncSession, user_id: int, conversation_i
             "avatar_url": conversation.avatar_url if is_group else (peer.avatar_url if peer is not None else None),
             "plus_tier": tier,
             "plus_expires_at": tiers.aware(conversation.plus_expires_at) if tier != tiers.FREE else None,
+            "plus_permanent": tier != tiers.FREE and tiers.is_permanent(conversation.plus_expires_at),
             "direct_user": UserPublic.model_validate(peer) if peer is not None else None,
         }
     return summaries

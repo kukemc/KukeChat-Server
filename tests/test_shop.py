@@ -46,7 +46,7 @@ from integration_fakes import TOPUP_URL, FakeCoinLedger
 
 TABLES = [
     Base.metadata.tables[name]
-    for name in ("users", "shop_items", "shop_purchases", "shop_accounts", "admin_audit_logs", "red_packets", "red_packet_shares", "gifts", "gift_records", "group_plus_records", "conversations")
+    for name in ("users", "shop_items", "shop_purchases", "shop_accounts", "admin_audit_logs", "red_packets", "red_packet_shares", "gifts", "gift_records", "group_plus_records", "coin_grants", "conversations")
 ]
 CREATION = "c0ffee" * 4
 OID_A, OID_B, OID_D, OID_X = "a" * 24, "b" * 24, "d" * 24, "e" * 24
@@ -91,7 +91,7 @@ PLAIN_FRAME: dict[str, Any] = {"version": 1, "ring": RING}
 FRAME_ORNAMENT = {"key": "halo", "position": "top", "color": "#ffcc00", "size": 16}
 # 没发过也没抢过红包的人，balance 对象里红包那三项都是 0；全站一个红包都没有时对账结果里的红包账
 # 没有红包、也没送过礼时 balance 对象里的那几项
-NO_PACKETS = {"red_packet_sent": 0, "red_packet_received": 0, "red_packet_refunded": 0, "gift_spent": 0, "group_plus_spent": 0}
+NO_PACKETS = {"red_packet_sent": 0, "red_packet_received": 0, "red_packet_refunded": 0, "gift_spent": 0, "group_plus_spent": 0, "granted": 0}
 NO_PACKET_LEDGER = {"total_sent": 0, "total_claimed": 0, "total_refunded": 0, "outstanding": 0, "balanced": True, "problems": []}
 NO_PLUS_LEDGER = {"total_amount": 0, "total_count": 0, "granted_count": 0, "revoked_count": 0, "balanced": True, "problems": []}
 NO_GIFT_LEDGER = {"total_amount": 0, "total_count": 0, "total_charm": 0, "total_received": 0, "balanced": True, "problems": []}

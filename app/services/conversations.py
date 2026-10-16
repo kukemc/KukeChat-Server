@@ -1229,12 +1229,12 @@ async def build_group_join_request_read(
 
 
 def _plus_fields(conversation: Conversation) -> dict:
-    """会话对象上的群升级字段（docs/group-plus.md 第 2 节）：有效档位和到期时间。"""
+    """会话对象上的群升级字段（docs/group-plus.md 第 2 节）：有效档位、到期时间、是不是永久档位。"""
     from app.core import group_plus_tiers
 
     tier = group_plus_tiers.conversation_tier(conversation)
     expires = group_plus_tiers.aware(conversation.plus_expires_at) if tier != group_plus_tiers.FREE else None
-    return {"plus_tier": tier, "plus_expires_at": expires}
+    return {"plus_tier": tier, "plus_expires_at": expires, "plus_permanent": group_plus_tiers.is_permanent(expires)}
 
 
 async def _group_todo_views(db: AsyncSession, conversations: list[Conversation]) -> dict[int, dict]:

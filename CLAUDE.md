@@ -88,10 +88,13 @@ deploy_start.py Gunicorn + Uvicorn Worker 生产启动
 **群升级、群文件、精华、群待办、聊天记录搜索**：契约在 `docs/group-plus.md`。要点：
 
 - 群的档位在 `conversations.plus_tier` / `plus_expires_at`，有效档位一律用 `core/group_plus_tiers.conversation_tier()` 现场判断，不要直接读列。人数上限、消息保留条数、精华上限、群文件空间都按它取。
-- 买群升级花的币进 `group_plus_records`，和礼物 / 红包一样并入余额公式（`services/shop.py` 的 `available_expression` / `_balance`）；改余额公式要把这一项一起算。
+  例外两个：永久档位（后台给的）是到期时间 2999-12-31 的哨兵值，判断用 `is_permanent()`；人数上限还要看后台单独设的 `conversations.member_limit_override`（空跟随档位 / 0 不限），一律用 `member_limit_of()` 取。
+- 买群升级花的币进 `group_plus_records`，和礼物 / 红包一样并入余额公式（`services/shop.py` 的 `available_expression` / `_balance`）；改余额公式要把这一项一起算。后台赠送 / 扣除的金币（`coin_grants`，`docs/shop.md` 5.2）也在这个公式里。
 - 精华和群待办是**快照**（`featured_messages` / `group_todos` 的 `snap_*` 列），`message_id` 不建外键，修剪不能连带删它们。撤回时的清理在 SQLite 触发器里（`services/schema_extras.py`）。
 - 聊天记录搜索（`GET /search/messages`）只搜用户**自己的**会话和自己可见的消息，索引靠触发器同步；**不要**给它加管理员 / 全站 / 按用户的入口（见第 1 条）。
 - 群文件下载只走带鉴权的接口；`/uploads` 的静态挂载要继续拦 `group-files/`（`main.py` 的 `CachedUploadFiles`）。
+
+**发版服务**（应用版本、安装包、检查更新）：契约在 `docs/releases.md`。安装包放主桶 `releases/` 前缀（公开读，下载不经过后端）；`/desktop-update.json` 和 `/download` 页优先取发版服务里已发布的 stable 版本，没有才用后台「下载配置」手填的值。后台接口除了管理员登录令牌，还认只能管发版的 `X-Kuke-Release-Token`（`kcr_…`，库里只存 sha256）。
 
 ## 已知问题
 

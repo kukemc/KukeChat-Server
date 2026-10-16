@@ -140,6 +140,7 @@ async def group_plus_purchase(
             "conversation_id": conversation_id,
             "plus_tier": result["conversation"]["plus_tier"],
             "plus_expires_at": result["conversation"]["plus_expires_at"],
+            "plus_permanent": False,
             "reason": "purchase",
         },
     )

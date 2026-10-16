@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -14,6 +14,9 @@ from app.core.database import get_db
 from app.core.dependencies import get_current_admin
 from app.models.user import User
 from app.schemas.shop import (
+    AdminCoinGrantCreate,
+    AdminCoinGrantPage,
+    AdminCoinGrantResult,
     AdminShopAccountPage,
     AdminShopGrant,
     AdminShopItemPage,
@@ -100,6 +103,35 @@ async def admin_reconcile_shop(
 @router.get("/shop/settings", response_model=AdminShopSettings)
 async def admin_shop_settings(_admin: Annotated[User, Depends(get_current_admin)]) -> AdminShopSettings:
     return AdminShopSettings(**shop_service.admin_settings())
+
+
+# ---------------------------------------------------------------- 赠送 / 扣除金币
+
+
+@router.get("/shop/grants", response_model=AdminCoinGrantPage)
+async def admin_list_coin_grants(
+    _admin: Annotated[User, Depends(get_current_admin)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    user_id: int | None = Query(default=None, ge=1),
+    admin_id: int | None = Query(default=None, ge=1),
+    # grant 只看赠送 / deduct 只看扣除；不传是全部
+    direction: Literal["grant", "deduct"] | None = None,
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> AdminCoinGrantPage:
+    return AdminCoinGrantPage(
+        **await shop_service.admin_list_coin_grants(db, user_id=user_id, admin_id=admin_id, direction=direction, limit=limit, offset=offset)
+    )
+
+
+@router.post("/shop/grants", response_model=AdminCoinGrantResult)
+async def admin_create_coin_grant(
+    payload: AdminCoinGrantCreate,
+    admin: Annotated[User, Depends(get_current_admin)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> AdminCoinGrantResult:
+    """amount 正数赠送、负数扣除（扣完余额不能为负，否则 409 insufficient_balance）。写审计日志 shop.coins.grant，给本人发 shop.balance.changed。"""
+    return AdminCoinGrantResult(**await shop_service.admin_grant_coins(db, admin, payload.user_id, payload.amount, payload.reason))
 
 
 # ---------------------------------------------------------------- 赠送与收回

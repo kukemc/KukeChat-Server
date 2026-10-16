@@ -200,8 +200,8 @@ async def realtime_health() -> dict[str, int | str | bool]:
 
 
 @app.get("/download", include_in_schema=False)
-async def download_page(db: AsyncSession = Depends(get_db)) -> Response:
-    download_settings = await get_public_download_settings(db)
+async def download_page(request: Request, db: AsyncSession = Depends(get_db)) -> Response:
+    download_settings = await get_public_download_settings(db, request)
     pc_url = _html_attr(download_settings.pc_url)
     android_url = _html_attr(download_settings.android_url)
     scratch_url = _html_attr(download_settings.scratch_url)
@@ -322,8 +322,9 @@ async def download_page(db: AsyncSession = Depends(get_db)) -> Response:
 
 
 @app.get("/desktop-update.json", include_in_schema=False)
-async def desktop_update_metadata(db: AsyncSession = Depends(get_db)) -> dict[str, str | bool | None]:
-    return await export_public_download_metadata(db)
+async def desktop_update_metadata(request: Request, db: AsyncSession = Depends(get_db)) -> dict[str, str | bool | None]:
+    # 旧版桌面端 / 安卓检查更新用的元数据。发版服务里有已发布版本时优先用它（docs/releases.md 1.3）
+    return await export_public_download_metadata(db, request)
 
 
 @app.get("/login", response_class=HTMLResponse, include_in_schema=False)
