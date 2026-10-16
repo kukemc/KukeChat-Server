@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from app.api.v1 import admin, announcements, chat_extras, auth, bot_api, bots, ccw, conversations, friends, game, home, invites, jury, moderation, notifications, posts, reports, stickers, task, teamup, uploads, users
+from app.api.v1 import admin, announcements, chat_extras, auth, bot_api, bots, ccw, conversations, friends, game, home, invites, jury, link_preview, moderation, notifications, posts, reports, stickers, task, teamup, uploads, users
 
 
 api_router = APIRouter(prefix="/api/v1")
@@ -26,6 +26,7 @@ from app.api.v1 import jury_senior  # noqa: E402
 
 api_router.include_router(jury_senior.router, prefix="/jury", tags=["jury"])
 api_router.include_router(ccw.router, prefix="/ccw", tags=["ccw"])
+api_router.include_router(link_preview.router, prefix="/link-preview", tags=["link-preview"])
 api_router.include_router(teamup.router, prefix="/teamup", tags=["teamup"])
 api_router.include_router(task.router, prefix="/tasks", tags=["tasks"])
 api_router.include_router(announcements.router, prefix="/announcements", tags=["announcements"])
