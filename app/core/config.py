@@ -193,6 +193,10 @@ class Settings(BaseSettings):
     jury_demote_min_votes: int = Field(default=15, ge=1, le=10000)
     # 入门考试
     jury_exam_total: int = Field(default=10, ge=1, le=100)
+    # 机器人开放接口（/bot-api）每把密钥的频率限制：每个 worker 一个令牌桶，平均每秒 rate 次、最多攒 burst 次。
+    # 2026-10-16 有个机器人每秒 20 次轮询 35 个群的成员列表，把数据库连接池占满、整个服务挂了一次
+    bot_api_rate_per_second: float = Field(default=5.0, gt=0, le=1000)
+    bot_api_burst: int = Field(default=30, ge=1, le=10000)
     jury_exam_pass_score: int = Field(default=8, ge=1, le=100)
     jury_exam_time_limit_minutes: int = Field(default=60, ge=1, le=24 * 60)
     # 浏览器会把后台标签页的定时器降到每分钟一次，宽限太短的话自动交卷会错过

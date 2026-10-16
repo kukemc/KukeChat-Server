@@ -6,6 +6,7 @@ from fastapi import Depends, Header, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import bot_rate_limit
 from app.core.database import get_db
 from app.core.security import decode_access_token
 from app.models.enums import PlatformRole
@@ -75,7 +76,7 @@ async def get_current_bot(
 ) -> BotContext:
     key = (x_kuke_bot_key or "").strip()
     if key:
-        return await authenticate_bot_key(db, key)
+        return await _authenticate_bot_limited(db, key)
 
     scheme = ""
     credentials = ""
@@ -93,4 +94,15 @@ async def get_current_bot(
             detail="Bot authorization required. Use Authorization: Bot <key>.",
             headers={"WWW-Authenticate": "Bot"},
         )
-    return await authenticate_bot_key(db, credentials.strip())
+    return await _authenticate_bot_limited(db, credentials.strip())
+
+
+async def _authenticate_bot_limited(db: AsyncSession, raw_key: str) -> BotContext:
+    # 频率限制和认证失败缓存都在查库之前（app/core/bot_rate_limit.py）
+    digest = bot_rate_limit.key_digest(raw_key)
+    bot_rate_limit.check(digest)
+    try:
+        return await authenticate_bot_key(db, raw_key)
+    except HTTPException as error:
+        bot_rate_limit.remember_failure(digest, error)
+        raise
