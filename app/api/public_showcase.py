@@ -69,7 +69,8 @@ async def _releases(db: AsyncSession, request: Request) -> dict[str, Any]:
 
 
 async def _build(db: AsyncSession, request: Request) -> dict[str, Any]:
-    home = await home_service.get_home(db, 0, 0, group_limit=6, creator_limit=8)
+    # 创作者全部给出（几十位），作品页默认只露前 8 位、可以展开
+    home = await home_service.get_home(db, 0, 0, group_limit=6, creator_limit=200)
     try:
         online = await manager.online_count_global()
     except Exception:
@@ -88,14 +89,19 @@ async def _build(db: AsyncSession, request: Request) -> dict[str, Any]:
             }
             for group in home.groups
         ],
+        # 大佬用 CCW 上的资料（头像、名字、简介、粉丝 / 获赞 / 作品），按粉丝数从高到低
         "creators": [
             {
-                "nickname": creator.nickname or creator.username,
-                "avatar_url": _absolute(creator.avatar_url, request),
-                "ccw_name": creator.ccw_name,
-                "title": creator.profile_title,
+                "nickname": creator.ccw_name or creator.nickname or creator.username,
+                "avatar_url": _absolute(creator.ccw_avatar_url or creator.avatar_url, request),
+                "bio": _short(creator.ccw_bio, 40),
+                "followers": creator.ccw_follower_count or 0,
+                "likes": creator.ccw_like_count or 0,
+                "works": creator.ccw_creation_count or 0,
+                "views": creator.ccw_view_count or 0,
+                "ccw_url": f"https://www.ccw.site/student/{creator.ccw_student_oid}" if creator.ccw_student_oid else None,
             }
-            for creator in home.creators
+            for creator in sorted(home.creators, key=lambda item: item.ccw_follower_count or 0, reverse=True)
         ],
         "creator_total": home.creator_total,
         "releases": await _releases(db, request),
