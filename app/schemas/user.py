@@ -1,18 +1,35 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
+from app.core import localtime
 from app.models.enums import PlatformRole, PresenceStatus, UserStatus
 
 
-def parse_cosmetics(value: Any) -> dict[str, Any]:
-    """users.cosmetics 那一列（JSON 文本）-> { 槽位: { sku, style } }。空的、解析不了的、形状不对的一律给 {}。
+def _cosmetic_expired(entry: dict[str, Any], now: datetime) -> bool:
+    """这一件是限时商品而且已经到期了。到期时间写不对的当成没有到期时间（永久）。"""
+    raw = entry.get("expires_at")
+    if not isinstance(raw, str) or not raw:
+        return False
+    try:
+        until = datetime.fromisoformat(raw)
+    except ValueError:
+        return False
+    if until.tzinfo is None:
+        until = until.replace(tzinfo=timezone.utc)
+    return until <= now
 
-    只解析这一列本身，不查库：用户对象在消息发送等热路径上。
+
+def load_cosmetics(value: Any, now: datetime | None = None) -> dict[str, Any]:
+    """users.cosmetics 那一列（JSON 文本）-> { 槽位: { sku, style[, expires_at] } }，已经到期的限时商品不在里面。
+
+    限时商品的到期时间和样式一起冗余在这一列里（expires_at，ISO 时间），所以「到期了就不算装备着」是读的时候现场判断的，
+    不依赖定时清扫，也不用查 shop_purchases。空的、解析不了的、形状不对的一律给 {}。
+    给 services/shop.py 改这一列时用；对外展示用下面的 parse_cosmetics（不带 expires_at）。
     """
     if not value:
         return {}
@@ -23,11 +40,32 @@ def parse_cosmetics(value: Any) -> dict[str, Any]:
             return {}
     if not isinstance(value, dict):
         return {}
-    return {
-        slot: {"sku": entry["sku"], "style": entry["style"]}
-        for slot, entry in value.items()
-        if isinstance(slot, str) and isinstance(entry, dict) and isinstance(entry.get("sku"), str) and isinstance(entry.get("style"), dict)
-    }
+    now = now or localtime._now()
+    loaded: dict[str, Any] = {}
+    for slot, entry in value.items():
+        if not (isinstance(slot, str) and isinstance(entry, dict) and isinstance(entry.get("sku"), str) and isinstance(entry.get("style"), dict)):
+            continue
+        if _cosmetic_expired(entry, now):
+            continue
+        loaded[slot] = {"sku": entry["sku"], "style": entry["style"]}
+        if isinstance(entry.get("expires_at"), str) and entry["expires_at"]:
+            loaded[slot]["expires_at"] = entry["expires_at"]
+    return loaded
+
+
+def parse_cosmetics(value: Any) -> dict[str, Any]:
+    """users.cosmetics 那一列（JSON 文本）-> { 槽位: { sku, style } }。空的、解析不了的、形状不对的一律给 {}。
+
+    只解析这一列本身，不查库：用户对象在消息发送等热路径上。已经到期的限时商品不出现（见 load_cosmetics）。
+    """
+    return {slot: {"sku": entry["sku"], "style": entry["style"]} for slot, entry in load_cosmetics(value).items()}
+
+
+class UserBirthday(BaseModel):
+    month: int
+    day: int
+    # 只有本人选择公开年份时才有
+    year: int | None = None
 
 
 class UserPublic(BaseModel):
@@ -80,6 +118,12 @@ class UserPublic(BaseModel):
     cosmetics: dict[str, Any] = Field(default_factory=dict)
     # 资料累计收到的赞，见 docs/chat-features.md 第 6 节。直接读 users.profile_like_count 这一列
     profile_like_count: int = 0
+    # 心意值：收到的礼物花了送礼人多少币，见 docs/gifts.md。直接读 users.charm 这一列
+    charm: int = 0
+    # 生日（docs/chat-features.md 第 8 节）：没设置为 null；year 只有本人选择公开时才给。
+    # is_birthday_today 按 UTC+8 判断，2 月 29 日出生的人在平年按 2 月 28 日过。两项都只读用户这一行上的列
+    birthday: UserBirthday | None = None
+    is_birthday_today: bool = False
     created_at: datetime
 
     @field_validator("cosmetics", mode="before")

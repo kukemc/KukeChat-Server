@@ -43,6 +43,16 @@ class Conversation(Base):
     level_titles: Mapped[str | None] = mapped_column(Text, nullable=True)
     task_creation_permission: Mapped[str] = mapped_column(String(20), default="members", server_default="members")
     direct_key: Mapped[str | None] = mapped_column(String(80), unique=True, nullable=True, index=True)
+    # 最近一条 @全体成员 的消息（docs/chat-features.md 第 7 节）。不建外键：只拿来和成员的已读位置比大小
+    last_mention_all_message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # 群升级（docs/group-plus.md）：记录的档位和到期时间。有效档位要看到期时间（core/group_plus_tiers.conversation_tier）
+    plus_tier: Mapped[str] = mapped_column(String(12), default="free", server_default="free")
+    plus_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 群文件空间：最近一次解锁文件的档位，和宽限到期时间（档位到期后 30 天内可读不可传）
+    plus_files_tier: Mapped[str | None] = mapped_column(String(12), nullable=True)
+    plus_files_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 群文件默认保留多少小时：24 / 168 / 720
+    file_default_ttl_hours: Mapped[int] = mapped_column(Integer, default=24, server_default="24")
     is_temporary: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
     temporary_initiator_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
     temporary_target_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
@@ -84,6 +94,8 @@ class ConversationMember(Base):
     do_not_disturb: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
     message_setting: Mapped[str] = mapped_column(String(20), default="notify", server_default="notify")
     cleared_before_message_id: Mapped[int | None] = mapped_column(ForeignKey("messages.id", ondelete="SET NULL"), nullable=True)
+    # 最近一条点名 @这个成员 的消息（docs/chat-features.md 第 7 节）。比已读位置新就是「有人@我」
+    last_mention_message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     title: Mapped[str | None] = mapped_column(String(40), nullable=True)
     level: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
     level_exp: Mapped[int] = mapped_column(Integer, default=0, server_default="0")

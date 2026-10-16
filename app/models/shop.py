@@ -45,30 +45,38 @@ class ShopItem(Base):
     sort: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     # 限时商品到这个时间自动停售
     available_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 买一次拥有多少天；为空是永久。改它只影响之后的购买 / 赠送，已有的拥有记录不动
+    duration_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
 class ShopPurchase(Base):
-    """一条获得记录：买的、等级解锁的、后台赠送的。没被收回的那一行就代表「拥有」。
+    """一条获得记录：买的、等级解锁的、后台赠送的、别人送的。
 
-    记录只增不删：收回是写上 revoked_at。唯一索引只管没被收回的行，
-    所以同一件商品同时只能拥有一份（并发重复购买会撞上它），收回之后还能再得到。
+    「现在拥有」= 这个人这件商品**当前的那一行**（没被收回、也没被后来的记录接替），而且它没到期
+    （expires_at 为空是永久；到期是读的时候现场比较时间，不依赖清扫）。
+
+    记录只增不删：收回是写上 revoked_at；续期（或者到期之后再买）是写一行新的，把原来那一行标上 superseded_at，
+    新的一行带着累加之后的到期时间 —— 所以每一次花的币、得到的天数都各有一行。
+    唯一索引只管「当前的那一行」，所以同一件商品同时只有一行当前记录（并发的重复购买 / 续期会撞上它，或者抢不到接替的那条 UPDATE）。
     """
 
     __tablename__ = "shop_purchases"
     __table_args__ = (
         Index(
-            "uq_shop_purchases_owner",
+            "uq_shop_purchases_live",
             "user_id",
             "item_id",
             unique=True,
-            sqlite_where=text("revoked_at IS NULL"),
-            postgresql_where=text("revoked_at IS NULL"),
+            sqlite_where=text("revoked_at IS NULL AND superseded_at IS NULL"),
+            postgresql_where=text("revoked_at IS NULL AND superseded_at IS NULL"),
         ),
         Index("ix_shop_purchases_user_created", "user_id", "created_at"),
         Index("ix_shop_purchases_item", "item_id"),
         Index("ix_shop_purchases_ccw_oid", "ccw_oid"),
+        # 到期清扫按它找「快到期 / 已到期」的行
+        Index("ix_shop_purchases_expires", "expires_at"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -76,7 +84,7 @@ class ShopPurchase(Base):
     item_id: Mapped[int] = mapped_column(ForeignKey("shop_items.id", ondelete="CASCADE"))
     # 实际扣了多少金币；等级解锁和赠送是 0
     price: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
-    # purchase 买的 / level 等级解锁 / grant 赠送
+    # purchase 买的 / level 等级解锁 / grant 后台赠送 / gift 别的用户花币送的（docs/gifts.md，price 为 0，币记在送礼记录上）
     source: Mapped[str] = mapped_column(String(12))
     # 付款时绑定的 CCW 账号（只有 purchase 有）。同一个 CCW 账号的币不管换到哪个 KukeChat 账号上都只能花一次，靠它算
     ccw_oid: Mapped[str | None] = mapped_column(String(24), nullable=True)
@@ -89,6 +97,18 @@ class ShopPurchase(Base):
     revoke_note: Mapped[str | None] = mapped_column(Text, nullable=True)
     # 收回时把金币退了：这一行不再计入已花
     refunded: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    # 限时商品：这一行到什么时候为止算拥有（已经把续期前剩下的时间加进去了）；永久的为空
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 这一次得到了多少天；永久的为空
+    duration_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # 被后来的记录接替的时间（续期、到期之后再买、限时的换成了永久的）。接替之后这一行只是历史
+    superseded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # source = gift 时是谁送的、对应哪条送礼记录
+    from_user_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    gift_record_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # 到期提醒（shop.item.expiring）和到期处理（卸下 + shop.item.expired）各只做一次：做的那个进程用带条件的 UPDATE 把时间写在这里
+    expiring_notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    expired_notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class ShopAccount(Base):

@@ -34,6 +34,15 @@ class UnifiedNotificationRead(BaseModel):
 
 class UnifiedNotificationListRead(BaseModel):
     items: list[UnifiedNotificationRead] = Field(default_factory=list)
+    # 和 new_count 相同，留着兼容旧客户端
     unread_count: int = 0
     pending_count: int = 0
     counts: dict[str, int] = Field(default_factory=dict)
+    # 上次打开通知中心的时间（POST /notifications/seen），从没打开过为 null
+    seen_at: datetime | None = None
+    # 角标该显示的数：seen_at 之后来的非动态通知 + 未读的动态通知
+    new_count: int = 0
+
+
+class NotificationSeenRead(BaseModel):
+    seen_at: datetime

@@ -36,9 +36,19 @@ class Settings(BaseSettings):
     s3_secret_access_key: str | None = None
     s3_region: str | None = None
     s3_public_url: str | None = None
+    # 群文件（group-files/ 前缀）单独放的私有桶，和主桶共用 endpoint / 凭据。配了它（且 storage_backend = s3）群文件就走
+    # 预签名 URL 直传直下，不经过后端（docs/group-plus.md 第 5 节）；不配就和以前一样存主桶、由后端转发。
+    s3_private_bucket: str | None = None
     image_quality: int = Field(default=82, ge=1, le=95)
     image_max_dimension: int = Field(default=2048, ge=128, le=8192)
     image_thumbnail_max_dimension: int = Field(default=360, ge=64, le=2048)
+    # 公告长图（信息图、更新日志整图）单独放宽：其它上传路径（头像、聊天图、
+    # 作品图、组队图、资料背景、表情包）仍然走上面三个值。放宽的只有
+    # announcements/ 一个目录，见 services/storage.py 的 _IMAGE_UPLOAD_FOLDER_LIMITS。
+    image_announcement_max_bytes: int = Field(default=20 * 1024 * 1024, ge=3 * 1024 * 1024, le=64 * 1024 * 1024)
+    image_announcement_max_dimension: int = Field(default=8192, ge=2048, le=8192)
+    image_announcement_max_pixels: int = Field(default=40_000_000, ge=12_000_000, le=100_000_000)
+    image_announcement_quality: int = Field(default=90, ge=1, le=95)
     # 内容自动审核依赖一个外部审核服务，本项目不提供该服务。
     # 默认关闭；启用时必须同时提供 CONTENT_MODERATION_URL。
     content_moderation_enabled: bool = False
@@ -81,6 +91,17 @@ class Settings(BaseSettings):
     shop_changed_interval_seconds: int = Field(default=30, ge=0, le=3600)
     # user.cosmetics.updated 同一个用户多少秒内最多发一次（间隔内的变化并成一次，发最后的状态）
     shop_cosmetics_event_interval_seconds: int = Field(default=5, ge=0, le=3600)
+    # —— 红包（docs/red-packets.md）——
+    # 开关和各项限制存在数据库里（后台可改），这里只有清扫的间隔：多久把过期没领完的红包退回一次。
+    # 领取时会现场判断过期，所以这个间隔只影响「钱多久退回到账」，不影响对错
+    red_packet_sweep_interval_seconds: int = Field(default=60, ge=5, le=3600)
+    # —— 限时商品（docs/shop.md 2.5）——
+    # 多久清扫一次到期的限时商品（卸下、发 shop.item.expired）和快到期的（发 shop.item.expiring）。
+    # 「是否拥有 / 是否装备着」读的时候现场判断到期，这个间隔只影响事件晚多久发，不影响对错
+    shop_expiry_sweep_interval_seconds: int = Field(default=60, ge=5, le=3600)
+    # —— 礼物（docs/gifts.md）——
+    # 开关和限制存在数据库里（后台可改）。心意榜的结果在进程内缓存多少秒
+    gift_leaderboard_cache_seconds: int = Field(default=60, ge=0, le=3600)
     # 邀请链接的落地页。用户打开它即可加入群聊 / 添加好友，
     # 通常指向你部署了 KukeChat 客户端的页面。
     invite_base_url: str = "http://localhost:5173"

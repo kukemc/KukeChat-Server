@@ -105,6 +105,29 @@ async def reject_request(
     return request
 
 
+@router.post("/requests/ignore-all")
+async def ignore_all_requests(
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> dict[str, int]:
+    ids = await friend_service.ignore_all_friend_requests(db, current_user.id)
+    if ids:
+        # 只推给自己（其他设备刷新列表 / 角标），不告诉申请方
+        await manager.send_to_user(current_user.id, "friend.request.ignored", {"id": None, "ids": ids})
+    return {"ignored": len(ids)}
+
+
+@router.post("/requests/{request_id}/ignore", status_code=status.HTTP_204_NO_CONTENT)
+async def ignore_request(
+    request_id: int,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> Response:
+    request = await friend_service.ignore_friend_request(db, request_id, current_user.id)
+    await manager.send_to_user(current_user.id, "friend.request.ignored", {"id": request.id, "ids": [request.id]})
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
 @router.get("", response_model=list[FriendRead])
 async def friends(
     request: Request,

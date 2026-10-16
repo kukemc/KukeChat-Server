@@ -57,7 +57,15 @@ async def init_db() -> None:
     import app.models  # noqa: F401
 
     async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+        # 线上是两个 worker 一起启动：create_all 是「先看有没有、没有再建」，两边可能都看到新表（或它的索引）不存在、都去建，
+        # 后到的那个会撞上 already exists。那就再来一遍 —— 这时别人已经建好的会被跳过，只补还缺的。
+        for attempt in range(5):
+            try:
+                await conn.run_sync(Base.metadata.create_all)
+                break
+            except Exception as exc:
+                if "already exists" not in str(exc).lower() or attempt == 4:
+                    raise
         if conn.dialect.name == "sqlite":
             columns = await conn.execute(text("PRAGMA table_info(users)"))
             user_columns = {row[1]: row for row in columns}
@@ -244,6 +252,23 @@ async def init_db() -> None:
                 if column_name not in existing_columns:
                     await conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_sql}"))
 
+            # 会话列表上的「有人@我 / @全体成员」（docs/chat-features.md 第 7 节）：只是两个可空的整数列，不用回填、不用索引。
+            # 线上是两个 worker 一起启动，可能都看到列不存在、都去 ALTER：后到的那个会撞上 duplicate column name，
+            # 这里把它当成「别人已经加好了」。稳妥起见上线前仍然先单进程跑一遍迁移。
+            for table_name, column_name, column_sql in (
+                ("conversations", "last_mention_all_message_id", "last_mention_all_message_id INTEGER"),
+                ("conversation_members", "last_mention_message_id", "last_mention_message_id INTEGER"),
+            ):
+                if table_name not in table_names:
+                    continue
+                columns = await conn.execute(text(f"PRAGMA table_info({table_name})"))
+                if column_name not in {row[1] for row in columns}:
+                    try:
+                        await conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_sql}"))
+                    except Exception as exc:
+                        if "duplicate column name" not in str(exc).lower():
+                            raise
+
             # 账号等级（docs/account-level.md）。新表 account_level_days / account_level_notifications 由上面的 create_all 建；
             # 老用户的折算不在这里做，见 services/account_levels.py 的 backfill_legacy（后台循环启动时跑一次）。
             for table_name, column_name, column_sql in (
@@ -252,6 +277,14 @@ async def init_db() -> None:
                 ("users", "account_streak_days", "account_streak_days INTEGER NOT NULL DEFAULT 0"),
                 ("users", "account_streak_day", "account_streak_day DATE"),
             ):
+                if table_name not in table_names:
+                    continue
+                columns = await conn.execute(text(f"PRAGMA table_info({table_name})"))
+                if column_name not in {row[1] for row in columns}:
+                    await conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_sql}"))
+
+            # 好友亲密度（docs/intimacy.md）。friend_bonds 是新表；这一列是表建好之后才加的
+            for table_name, column_name, column_sql in (("friend_bonds", "sunmoon_days", "sunmoon_days INTEGER NOT NULL DEFAULT 0"),):
                 if table_name not in table_names:
                     continue
                 columns = await conn.execute(text(f"PRAGMA table_info({table_name})"))
@@ -629,7 +662,9 @@ async def init_db() -> None:
 
             featured_indexes = await conn.execute(text("PRAGMA index_list(featured_messages)"))
             featured_index_names = {row[1] for row in featured_indexes}
-            if "uq_featured_message" not in featured_index_names:
+            featured_columns = {row[1] for row in await conn.execute(text("PRAGMA table_info(featured_messages)"))}
+            # 快照版的精华表（message_id 可空、没有外键）自带唯一约束，不需要下面这个旧库的补丁
+            if "uq_featured_message" not in featured_index_names and "snap_type" not in featured_columns:
                 duplicate_featured = await conn.execute(
                     text(
                         """
@@ -676,3 +711,100 @@ async def init_db() -> None:
                 columns = await conn.execute(text(f"PRAGMA table_info({table_name})"))
                 if column_name not in {row[1] for row in columns}:
                     await conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_sql}"))
+
+            # 限时商品、礼物、生日（docs/shop.md 2.5、docs/gifts.md、docs/chat-features.md 第 8 节）。
+            # 新表 gifts / gift_records 由上面的 create_all 建，这里补已有表的列和索引。都是可空列或带默认值的列，不用回填。
+            # 线上是两个 worker 一起启动，可能都看到列 / 索引不存在、都去加：后到的那个撞上 duplicate column name / already exists，
+            # 当成「别人已经加好了」。稳妥起见上线前仍然先单进程跑一遍迁移。
+            table_names = {row[0] for row in await conn.execute(text("SELECT name FROM sqlite_master WHERE type='table'"))}
+            for table_name, column_name, column_sql in (
+                ("users", "charm", "charm INTEGER NOT NULL DEFAULT 0"),
+                ("users", "birthday_year", "birthday_year INTEGER"),
+                ("users", "birthday_month", "birthday_month INTEGER"),
+                ("users", "birthday_day", "birthday_day INTEGER"),
+                ("users", "birthday_show_year", "birthday_show_year BOOLEAN NOT NULL DEFAULT 0"),
+                ("users", "birthday_set_at", "birthday_set_at DATETIME"),
+                ("users", "birthday_changed_at", "birthday_changed_at DATETIME"),
+                ("users", "birthday_celebrated_year", "birthday_celebrated_year INTEGER"),
+                ("shop_items", "duration_days", "duration_days INTEGER"),
+                ("shop_purchases", "expires_at", "expires_at DATETIME"),
+                ("shop_purchases", "duration_days", "duration_days INTEGER"),
+                ("shop_purchases", "superseded_at", "superseded_at DATETIME"),
+                ("shop_purchases", "from_user_id", "from_user_id INTEGER"),
+                ("shop_purchases", "gift_record_id", "gift_record_id INTEGER"),
+                ("shop_purchases", "expiring_notified_at", "expiring_notified_at DATETIME"),
+                ("shop_purchases", "expired_notified_at", "expired_notified_at DATETIME"),
+            ):
+                if table_name not in table_names:
+                    continue
+                columns = await conn.execute(text(f"PRAGMA table_info({table_name})"))
+                if column_name not in {row[1] for row in columns}:
+                    try:
+                        await conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_sql}"))
+                    except Exception as exc:
+                        if "duplicate column name" not in str(exc).lower():
+                            raise
+            # 索引。shop_purchases 的唯一索引换了条件（续期之后被接替的行不再算「当前拥有」）：先建新的再删旧的，
+            # 中间任何时刻都至少有一个唯一索引管着，不会出现「一件商品两行当前记录」。
+            for table_name, index_sql in (
+                ("users", "CREATE INDEX IF NOT EXISTS ix_users_charm ON users (charm)"),
+                ("shop_purchases", "CREATE INDEX IF NOT EXISTS ix_shop_purchases_expires ON shop_purchases (expires_at)"),
+                (
+                    "shop_purchases",
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_shop_purchases_live ON shop_purchases (user_id, item_id) "
+                    "WHERE revoked_at IS NULL AND superseded_at IS NULL",
+                ),
+                ("shop_purchases", "DROP INDEX IF EXISTS uq_shop_purchases_owner"),
+            ):
+                if table_name not in table_names:
+                    continue
+                try:
+                    await conn.execute(text(index_sql))
+                except Exception as exc:
+                    if "already exists" not in str(exc).lower() and "no such index" not in str(exc).lower():
+                        raise
+
+            # 群升级、群文件、群待办（docs/group-plus.md）。新表 group_plus_records / group_files / group_todos 由上面的 create_all 建；
+            # 精华表重建成快照版、聊天记录搜索索引和触发器由 create_all 的 after_create（services/schema_extras.py）负责。
+            # 这里补 conversations / group_files 上的列：都是可空列或带默认值的列，不用回填。
+            # 稳妥起见上线前先单进程启动一次（搜索索引的首次回填可能要几秒到几十秒）。
+            table_names = {row[0] for row in await conn.execute(text("SELECT name FROM sqlite_master WHERE type='table'"))}
+            for table_name, column_name, column_sql in (
+                ("conversations", "plus_tier", "plus_tier VARCHAR(12) NOT NULL DEFAULT 'free'"),
+                ("conversations", "plus_expires_at", "plus_expires_at DATETIME"),
+                ("conversations", "plus_files_tier", "plus_files_tier VARCHAR(12)"),
+                ("conversations", "plus_files_until", "plus_files_until DATETIME"),
+                ("conversations", "file_default_ttl_hours", "file_default_ttl_hours INTEGER NOT NULL DEFAULT 24"),
+                # 临时文件（空间放不下时传的 24 小时文件，不占配额）；老文件都是空间文件
+                ("group_files", "temporary", "temporary BOOLEAN NOT NULL DEFAULT 0"),
+            ):
+                if table_name not in table_names:
+                    continue
+                columns = await conn.execute(text(f"PRAGMA table_info({table_name})"))
+                if column_name not in {row[1] for row in columns}:
+                    try:
+                        await conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_sql}"))
+                    except Exception as exc:
+                        if "duplicate column name" not in str(exc).lower():
+                            raise
+            for index_sql in (
+                "CREATE INDEX IF NOT EXISTS ix_conversations_plus_expires ON conversations (plus_expires_at)",
+            ):
+                await conn.execute(text(index_sql))
+
+            # 好友申请「忽略」、通知只提醒一次（docs/chat-features.md 第 10 节）。两个可空列，不用回填：
+            # 老申请都算没忽略；notifications_seen_at 为空就是「全部算新的」，用户第一次打开通知中心后就有值了。
+            # 两个 worker 一起启动时后到的会撞上 duplicate column name，当成别人已经加好了
+            for table_name, column_name, column_sql in (
+                ("friend_requests", "ignored_at", "ignored_at DATETIME"),
+                ("users", "notifications_seen_at", "notifications_seen_at DATETIME"),
+            ):
+                if table_name not in table_names:
+                    continue
+                columns = await conn.execute(text(f"PRAGMA table_info({table_name})"))
+                if column_name not in {row[1] for row in columns}:
+                    try:
+                        await conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_sql}"))
+                    except Exception as exc:
+                        if "duplicate column name" not in str(exc).lower():
+                            raise

@@ -43,9 +43,37 @@ from app.api.v1 import admin_shop, shop  # noqa: E402
 api_router.include_router(shop.router, prefix="/shop", tags=["shop"])
 api_router.include_router(admin_shop.router, prefix="/admin", tags=["admin"])
 
+# 红包（docs/red-packets.md）：用户侧 /red-packets/...，后台 /admin/red-packets/...
+from app.api.v1 import admin_red_packets, red_packets  # noqa: E402
+
+api_router.include_router(red_packets.router, prefix="/red-packets", tags=["red-packets"])
+api_router.include_router(admin_red_packets.router, prefix="/admin", tags=["admin"])
+
+# 礼物（docs/gifts.md）：用户侧 /gifts/...、/users/{id}/gifts...，后台 /admin/gifts/...。生日（docs/chat-features.md 第 8 节）：/users/me/birthday
+from app.api.v1 import admin_gifts, birthday, gifts  # noqa: E402
+
+api_router.include_router(gifts.router, prefix="/gifts", tags=["gifts"])
+api_router.include_router(gifts.users_router, prefix="/users", tags=["gifts"])
+api_router.include_router(admin_gifts.router, prefix="/admin", tags=["admin"])
+api_router.include_router(birthday.router, prefix="/users", tags=["users"])
+
 # 账号等级（docs/account-level.md）。/users/{user_id}/level 那一条用单独的 router 再挂到 /users 下
 from app.api.v1 import admin_levels, levels  # noqa: E402
 
 api_router.include_router(levels.router, prefix="/levels", tags=["levels"])
 api_router.include_router(levels.users_router, prefix="/users", tags=["levels"])
 api_router.include_router(admin_levels.router, prefix="/admin", tags=["admin"])
+
+# 好友亲密度与好友成就（docs/intimacy.md）：用户侧 /intimacy/...，后台 /admin/intimacy/...
+from app.api.v1 import admin_intimacy, intimacy  # noqa: E402
+
+api_router.include_router(intimacy.router, prefix="/intimacy", tags=["intimacy"])
+api_router.include_router(admin_intimacy.router, prefix="/admin", tags=["admin"])
+
+# 群升级、群文件、群待办、聊天记录搜索（docs/group-plus.md）。conversation_router 和 conversations 用同一个前缀
+from app.api.v1 import admin_group_plus, group_plus  # noqa: E402
+
+api_router.include_router(group_plus.plans_router, prefix="/group-plus", tags=["group-plus"])
+api_router.include_router(group_plus.conversation_router, prefix="/conversations", tags=["group-plus"])
+api_router.include_router(group_plus.search_router, prefix="/search", tags=["search"])
+api_router.include_router(admin_group_plus.router, prefix="/admin", tags=["admin"])

@@ -8,6 +8,7 @@ from sqlalchemy import Date, DateTime, Enum as SAEnum, ForeignKey, Integer, Stri
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
+from app.models.group_plus import MessageSnapshotMixin
 from app.models.enums import MessageType
 
 
@@ -35,7 +36,6 @@ class Message(Base):
     reactions: Mapped[list["MessageReaction"]] = relationship(back_populates="message", cascade="all, delete-orphan")
     visibility_entries: Mapped[list["MessageVisibility"]] = relationship(back_populates="message", cascade="all, delete-orphan")
     bookmarks: Mapped[list["MessageBookmark"]] = relationship(back_populates="message", cascade="all, delete-orphan")
-    featured_entry: Mapped["FeaturedMessage | None"] = relationship(back_populates="message", cascade="all, delete-orphan")
 
 
 class MessageReaction(Base):
@@ -78,17 +78,21 @@ class MessageBookmark(Base):
     user: Mapped["User"] = relationship()
 
 
-class FeaturedMessage(Base):
+class FeaturedMessage(MessageSnapshotMixin, Base):
+    """群精华（docs/group-plus.md 第 6 节）。设为精华时把消息固化成快照（snap_*），之后消息被修剪、被撤回都不影响。
+
+    message_id 不建外键（原消息被修剪后只是一个不再指向任何行的数字），也可以为空（回填时原消息已经不在了）。
+    """
+
     __tablename__ = "featured_messages"
     __table_args__ = (UniqueConstraint("message_id", name="uq_featured_message"),)
 
     id: Mapped[int] = mapped_column(primary_key=True, index=True)
-    message_id: Mapped[int] = mapped_column(ForeignKey("messages.id", ondelete="CASCADE"), index=True)
+    message_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     conversation_id: Mapped[int] = mapped_column(ForeignKey("conversations.id", ondelete="CASCADE"), index=True)
     set_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
 
-    message: Mapped[Message] = relationship(back_populates="featured_entry")
     conversation: Mapped["Conversation"] = relationship()
     set_by: Mapped["User | None"] = relationship(foreign_keys=[set_by_id])
 

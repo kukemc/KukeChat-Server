@@ -672,6 +672,9 @@ async def install_bot(db: AsyncSession, bot_id: int, actor: User, payload: BotIn
         )
     )
     if member_result.scalar_one_or_none() is None:
+        from app.services.conversations import ensure_capacity
+
+        await ensure_capacity(db, conversation, 1)
         db.add(
             ConversationMember(
                 conversation_id=payload.conversation_id,

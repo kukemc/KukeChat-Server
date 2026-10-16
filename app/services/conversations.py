@@ -256,6 +256,14 @@ async def create_group_conversation(
     missing_ids = sorted(set(unique_ids) - existing_ids)
     if missing_ids:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Users not found: {missing_ids}")
+    from app.core import group_plus_tiers
+
+    free_limit = group_plus_tiers.TIERS[group_plus_tiers.FREE]["member_limit"]
+    if len(unique_ids) > free_limit:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "group_full", "message": f"新建的群最多 {free_limit} 人", "limit": free_limit, "member_count": 0, "tier": "free"},
+        )
 
     conversation = Conversation(
         type=ConversationType.GROUP,
@@ -352,6 +360,7 @@ async def _build_group_discovery_read(
         member_count=member_count,
         joined=joined,
         join_request_status=join_request_status,
+        **_plus_fields(conversation),
     )
 
 
@@ -405,6 +414,13 @@ async def recommended_public_groups(db: AsyncSession, current_user_id: int, limi
     ]
 
 
+async def ensure_capacity(db: AsyncSession, conversation: Conversation, adding: int) -> None:
+    """加人之前检查群人数上限（按群档位，docs/group-plus.md 第 1 节）。已有成员不踢，满员后不能再加。"""
+    from app.services import group_plus as group_plus_service
+
+    await group_plus_service.ensure_member_capacity(db, conversation, adding)
+
+
 async def join_group(db: AsyncSession, conversation_id: int, user_id: int) -> tuple[Conversation, bool]:
     conversation = await require_group_conversation(db, conversation_id)
     existing = await db.execute(
@@ -419,6 +435,7 @@ async def join_group(db: AsyncSession, conversation_id: int, user_id: int) -> tu
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Group is invite only")
     if conversation.join_mode in {"approval", "question"} and not conversation.auto_approve:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Group requires approval")
+    await ensure_capacity(db, conversation, 1)
 
     db.add(ConversationMember(conversation_id=conversation_id, user_id=user_id, role=MemberRole.MEMBER))
     conversation.updated_at = datetime.now(UTC)
@@ -605,6 +622,7 @@ async def invite_members(db: AsyncSession, conversation_id: int, inviter_id: int
     )
     already_member_ids = set(existing_members.scalars().all())
     new_ids = [user_id for user_id in unique_ids if user_id not in already_member_ids]
+    await ensure_capacity(db, conversation, len(new_ids))
     for user_id in new_ids:
         db.add(ConversationMember(conversation_id=conversation_id, user_id=user_id, role=MemberRole.MEMBER))
     conversation.updated_at = datetime.now(UTC)
@@ -686,6 +704,18 @@ async def update_group_settings(
         titles = normalize_level_titles(updates["level_titles"] or [])
         await _ensure_level_titles_allowed(db, actor_id, conversation, titles)
         updates["level_titles"] = json.dumps(titles, ensure_ascii=False, separators=(",", ":")) if titles else None
+    if "file_default_ttl_hours" in updates:
+        from app.core import group_plus_tiers
+
+        if updates["file_default_ttl_hours"] not in group_plus_tiers.FILE_TTL_OPTIONS_HOURS:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "code": "invalid_file_ttl",
+                    "message": "群文件默认保留时长只能是 1 天、7 天或 30 天",
+                    "options": list(group_plus_tiers.FILE_TTL_OPTIONS_HOURS),
+                },
+            )
     for field, value in updates.items():
         setattr(conversation, field, value)
     if updates:
@@ -1139,6 +1169,7 @@ async def review_group_join_request(
 
     added = False
     if approved and not already_joined:
+        await ensure_capacity(db, await require_group_conversation(db, join_request.conversation_id), 1)
         db.add(
             ConversationMember(
                 conversation_id=join_request.conversation_id,
@@ -1195,6 +1226,43 @@ async def build_group_join_request_read(
         requester=UserPublic.model_validate(join_request.requester) if join_request.requester is not None else None,
         reviewer=UserPublic.model_validate(join_request.reviewer) if join_request.reviewer is not None else None,
     )
+
+
+def _plus_fields(conversation: Conversation) -> dict:
+    """会话对象上的群升级字段（docs/group-plus.md 第 2 节）：有效档位和到期时间。"""
+    from app.core import group_plus_tiers
+
+    tier = group_plus_tiers.conversation_tier(conversation)
+    expires = group_plus_tiers.aware(conversation.plus_expires_at) if tier != group_plus_tiers.FREE else None
+    return {"plus_tier": tier, "plus_expires_at": expires}
+
+
+async def _group_todo_views(db: AsyncSession, conversations: list[Conversation]) -> dict[int, dict]:
+    from app.services import group_todos
+
+    ids = [conversation.id for conversation in conversations if conversation.type == ConversationType.GROUP]
+    return await group_todos.views_for(db, ids)
+
+
+def mention_pending(conversation: Conversation, membership: ConversationMember) -> str | None:
+    """会话对象的 mention_pending：这个成员的未读消息里有没有提到他。不查库，只比较已经加载好的三个数。
+
+    发消息时把「最近一条点名 @某人的消息」记在那个人的成员行上、「最近一条 @全体成员 的消息」记在会话上
+    （messages._record_mentions），这里拿它们和这个成员的已读位置比：比已读位置新就是还没读到。
+    自己发的不算 —— 点名自己不会记；自己发 @全体 时，发消息的同时已读位置就已经推进到那条消息了。
+    """
+    floor = max(membership.last_read_message_id or 0, membership.cleared_before_message_id or 0)
+    if (membership.last_mention_message_id or 0) > floor:
+        return "me"
+    if (conversation.last_mention_all_message_id or 0) > floor:
+        return "all"
+    return None
+
+
+async def _red_packet_pending_ids(db: AsyncSession, user_id: int) -> set[int]:
+    from app.services import red_packets as red_packet_service
+
+    return await red_packet_service.pending_conversation_ids(db, user_id)
 
 
 async def build_conversation_read(db: AsyncSession, conversation: Conversation, current_user_id: int) -> ConversationRead:
@@ -1304,6 +1372,11 @@ async def build_conversation_read(db: AsyncSession, conversation: Conversation, 
         my_do_not_disturb=membership.do_not_disturb,
         my_message_setting=membership.message_setting,
         pending_join_request_count=pending_join_request_count,
+        red_packet_pending=conversation.id in await _red_packet_pending_ids(db, current_user_id),
+        mention_pending=mention_pending(conversation, membership),
+        file_default_ttl_hours=int(conversation.file_default_ttl_hours or 24),
+        group_todo=(await _group_todo_views(db, [conversation])).get(conversation.id),
+        **_plus_fields(conversation),
     )
 
 
@@ -1451,6 +1524,11 @@ async def build_conversation_reads(db: AsyncSession, conversations: list[Convers
         for message_read in await message_service.build_message_reads(db, messages_to_build, current_user_id):
             last_message_reads[message_read.conversation_id] = message_read
 
+    # 一条查询算出「哪些会话里有我还能领的红包」；全站没有进行中的红包时不查库
+    red_packet_pending_ids = await _red_packet_pending_ids(db, current_user_id)
+
+    group_todos = await _group_todo_views(db, conversations)
+
     reads: list[ConversationRead] = []
     for conversation in conversations:
         membership = memberships[conversation.id]
@@ -1496,6 +1574,11 @@ async def build_conversation_reads(db: AsyncSession, conversations: list[Convers
                 my_do_not_disturb=membership.do_not_disturb,
                 my_message_setting=membership.message_setting,
                 pending_join_request_count=pending_join_request_counts.get(conversation.id, 0),
+                red_packet_pending=conversation.id in red_packet_pending_ids,
+                mention_pending=mention_pending(conversation, membership),
+                file_default_ttl_hours=int(conversation.file_default_ttl_hours or 24),
+                group_todo=group_todos.get(conversation.id),
+                **_plus_fields(conversation),
             )
         )
 

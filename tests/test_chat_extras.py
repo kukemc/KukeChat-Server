@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import unittest
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
@@ -298,6 +299,143 @@ class GroupEmojiTests(ChatExtrasBase):
                     await emoji_service.create_emoji(db, self.group_id, owner, "第二个", "/uploads/messages/b.png")
                 self.assertEqual(caught.exception.detail["code"], "emoji_limit_reached")
                 self.assertEqual(len((await db.execute(select(GroupEmoji))).scalars().all()), 1)
+
+
+class MentionPendingTests(ChatExtrasBase):
+    """会话对象的 mention_pending（docs/chat-features.md 第 7 节）。"""
+
+    async def asyncSetUp(self) -> None:
+        # 调试模式下的事件循环每一步都要记调用栈，这组用例查询多，会慢上几十倍
+        asyncio.get_running_loop().set_debug(False)
+        await super().asyncSetUp()
+
+    async def _send(self, sender: str, content: str = "hi", conversation_id: int | None = None, **metadata) -> int:
+        async with self.sessions() as db:
+            message = await message_service.send_message(
+                db, conversation_id or self.group_id, await self._user(db, sender), content, MessageType.TEXT, metadata or None
+            )
+            return message.id
+
+    async def _pending(self, name: str, conversation_id: int | None = None) -> str | None:
+        from app.services import conversations as conversation_service
+
+        async with self.sessions() as db:
+            conversation = await db.get(Conversation, conversation_id or self.group_id)
+            single = await conversation_service.build_conversation_read(db, conversation, self.ids[name])
+            items = await conversation_service.list_user_conversations(db, self.ids[name])
+            listed = {read.id: read for read in await conversation_service.build_conversation_reads(db, items, self.ids[name])}
+            # 单个会话和会话列表给出的一样
+            self.assertEqual(listed[conversation.id].mention_pending, single.mention_pending)
+            return single.mention_pending
+
+    async def _read(self, name: str, message_id: int | None = None, conversation_id: int | None = None):
+        async with self.sessions() as db:
+            return await message_service.mark_conversation_read(db, conversation_id or self.group_id, self.ids[name], message_id)
+
+    def _at(self, *names: str) -> list[dict]:
+        return [{"user_id": self.ids[name], "name": name} for name in names]
+
+    async def test_mentions_of_me_and_everyone(self) -> None:
+        self.assertEqual([await self._pending(name) for name in ("owner", "alice", "bob")], [None, None, None])
+        await self._send("alice", "没有提到谁")
+        self.assertEqual([await self._pending(name) for name in ("owner", "alice", "bob")], [None, None, None])
+        # 点名：只有被点名的人
+        await self._send("alice", "@bob 在吗", mentions=self._at("bob"))
+        self.assertEqual([await self._pending(name) for name in ("owner", "alice", "bob")], [None, None, "me"])
+        # @全体：没被点名的人是 all；两者都有的人取 me；自己发的不算
+        await self._send("owner", "@全体成员 开会", mention_all=True)
+        self.assertEqual([await self._pending(name) for name in ("owner", "alice", "bob")], [None, "all", "me"])
+        # 读到之后清除
+        receipt = await self._read("bob")
+        self.assertIsNone(receipt.mention_pending)
+        self.assertEqual([await self._pending(name) for name in ("alice", "bob")], ["all", None])
+        await self._read("alice")
+        self.assertIsNone(await self._pending("alice"))
+        # 读过之后的普通消息不会把提示带回来
+        await self._send("owner", "散会")
+        self.assertEqual([await self._pending(name) for name in ("alice", "bob")], [None, None])
+
+    async def test_read_position_decides(self) -> None:
+        first = await self._send("alice", "@bob 一", mentions=self._at("bob"))
+        middle = await self._send("alice", "路过")
+        second = await self._send("owner", "@全体成员 二", mention_all=True)
+        # 只读到点名的那条：@我 清了，后面那条 @全体 还在
+        receipt = await self._read("bob", first)
+        self.assertEqual((receipt.last_read_message_id, receipt.mention_pending, await self._pending("bob")), (first, "all", "all"))
+        self.assertEqual((await self._read("bob", middle)).mention_pending, "all")
+        self.assertEqual(((await self._read("bob", second)).mention_pending, await self._pending("bob")), (None, None))
+        # 已读位置退回去（客户端传了更早的消息）：又成了未读，提示跟着回来
+        self.assertEqual((await self._read("bob", first)).mention_pending, "all")
+        # 清空聊天记录等于都读过了
+        async with self.sessions() as db:
+            member = (await db.execute(select(ConversationMember).where(ConversationMember.conversation_id == self.group_id, ConversationMember.user_id == self.ids["bob"]))).scalar_one()
+            member.last_read_message_id = None
+            member.cleared_before_message_id = second
+            await db.commit()
+        self.assertIsNone(await self._pending("bob"))
+
+    async def test_own_and_outside_mentions_do_not_count(self) -> None:
+        # 点名自己、点名不在会话里的人、乱七八糟的格式：都不记，也不报错
+        await self._send("alice", "@我自己", mentions=[*self._at("alice", "outsider"), {"user_id": "x"}, {"name": "没有 id"}, None, True, 0, -3])
+        self.assertEqual([await self._pending(name) for name in ("alice", "bob", "owner")], [None, None, None])
+        async with self.sessions() as db:
+            rows = (await db.execute(select(ConversationMember.user_id, ConversationMember.last_mention_message_id))).all()
+            self.assertTrue(all(marker is None for _user_id, marker in rows))
+        # 裸的 id、字符串形式的 id 也认；私聊里也能点名
+        message_id = await self._send("alice", "@bob", self.direct_id, mentions=[str(self.ids["bob"])])
+        self.assertEqual((await self._pending("bob", self.direct_id), await self._pending("alice", self.direct_id), await self._pending("bob")), ("me", None, None))
+        self.assertEqual((await self._read("bob", message_id, self.direct_id)).mention_pending, None)
+        # 普通成员不能 @全体（原有规则），也就不会留下记号
+        with self.assertRaises(HTTPException):
+            await self._send("alice", "@全体成员", mention_all=True)
+        async with self.sessions() as db:
+            self.assertIsNone((await db.get(Conversation, self.group_id)).last_mention_all_message_id)
+
+    async def test_only_the_mentioned_rows_are_written(self) -> None:
+        """@全体不逐个成员写：成员行上的记号只属于被点名的人。"""
+        await self._send("owner", "@全体成员 @alice", mention_all=True, mentions=self._at("alice"))
+        async with self.sessions() as db:
+            rows = dict((await db.execute(select(ConversationMember.user_id, ConversationMember.last_mention_message_id).where(ConversationMember.conversation_id == self.group_id))).all())
+            conversation = await db.get(Conversation, self.group_id)
+            self.assertEqual({user_id for user_id, marker in rows.items() if marker is not None}, {self.ids["alice"]})
+            self.assertEqual(rows[self.ids["alice"]], conversation.last_mention_all_message_id)
+        self.assertEqual([await self._pending(name) for name in ("owner", "alice", "bob")], [None, "me", "all"])
+
+    async def test_recalled_mentions_stop_prompting(self) -> None:
+        mention = await self._send("alice", "@bob 说错了", mentions=self._at("bob"))
+        everyone = await self._send("owner", "@全体成员 说错了", mention_all=True)
+        self.assertEqual([await self._pending(name) for name in ("alice", "bob")], ["all", "me"])
+        async with self.sessions() as db:
+            await message_service.recall_message(db, self.group_id, self.ids["alice"], mention)
+        self.assertEqual([await self._pending(name) for name in ("alice", "bob")], ["all", "all"])
+        async with self.sessions() as db:
+            await message_service.admin_recall_message(db, self.ids["owner"], everyone)
+        self.assertEqual([await self._pending(name) for name in ("alice", "bob")], [None, None])
+        # 撤回的不是记着的那一条：不动
+        older = await self._send("alice", "@bob 一", mentions=self._at("bob"))
+        await self._send("alice", "@bob 二", mentions=self._at("bob"))
+        async with self.sessions() as db:
+            await message_service.recall_message(db, self.group_id, self.ids["alice"], older)
+        self.assertEqual(await self._pending("bob"), "me")
+
+    async def test_bot_mentions(self) -> None:
+        """机器人接口把 at / at_all 元素解析成同样的 metadata，再走同一个发消息函数。"""
+        from app.api.v1 import bot_api
+
+        mentions, mention_all = bot_api._markdown_mentions(f'<at id="{self.ids["bob"]}" name="bob"/> 看这里 <at_all/>')
+        self.assertEqual((mentions, mention_all), ([{"user_id": self.ids["bob"], "name": "bob"}], True))
+        await self._send("owner", "看这里", mentions=mentions, mention_all=mention_all)
+        self.assertEqual([await self._pending(name) for name in ("owner", "alice", "bob")], [None, "all", "me"])
+
+    async def test_system_and_forwarded_messages_do_not_mention(self) -> None:
+        source = await self._send("owner", "@全体成员 @bob", mention_all=True, mentions=self._at("bob"))
+        await self._read("alice")
+        await self._read("bob")
+        async with self.sessions() as db:
+            # 合并转发里夹着的提及不算提及
+            await message_service.create_forward_bundle(db, self.group_id, await self._user(db, "owner"), self.group_id, [source])
+            await message_service.create_system_message(db, self.group_id, self.ids["owner"], "系统消息", {"mentions": self._at("bob"), "mention_all": True})
+        self.assertEqual([await self._pending(name) for name in ("alice", "bob")], [None, None])
 
 
 if __name__ == "__main__":

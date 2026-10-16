@@ -4,7 +4,7 @@ import asyncio
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path, PurePosixPath
-from typing import BinaryIO
+from typing import BinaryIO, Callable
 from urllib.parse import quote, unquote, urlsplit
 
 import boto3
@@ -46,6 +46,39 @@ MAX_AUDIO_UPLOAD_BYTES = 2 * 1024 * 1024
 # old local files; Pillow's default decompression warning is not a hard limit.
 MAX_IMAGE_PIXELS = 12_000_000
 MAX_LEGACY_IMAGE_BYTES = 12 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class ImageUploadLimits:
+    """一条上传路径的图片限制：字节数、最长边、解码像素上限、JPEG 质量。
+
+    默认值就是原来的全局常量，所以除了显式指定的目录，其它路径的行为与
+    放宽之前逐字节一致（见 _IMAGE_UPLOAD_LIMITS / image_upload_limits）。
+    """
+
+    max_bytes: int = MAX_IMAGE_UPLOAD_BYTES
+    max_dimension: int | None = None
+    max_pixels: int = MAX_IMAGE_PIXELS
+    quality: int | None = None
+
+
+DEFAULT_IMAGE_UPLOAD_LIMITS = ImageUploadLimits()
+
+
+def _announcement_image_limits() -> ImageUploadLimits:
+    return ImageUploadLimits(
+        max_bytes=settings.image_announcement_max_bytes,
+        max_dimension=settings.image_announcement_max_dimension,
+        max_pixels=settings.image_announcement_max_pixels,
+        quality=settings.image_announcement_quality,
+    )
+
+
+# 只有公告图放宽（长图缩到 2048 会把字糊掉）；其余目录一律回落默认限制。
+_IMAGE_UPLOAD_FOLDER_LIMITS: dict[str, Callable[[], ImageUploadLimits]] = {
+    "announcements": _announcement_image_limits,
+}
+
 # A worker retains at most one decoded image at a time. Threads already running
 # remain counted if their awaiting request is cancelled.
 IMAGE_WORKERS = asyncio.Semaphore(2)
@@ -57,6 +90,10 @@ _PUBLIC_IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".png", ".webp", ".gif"})
 _PUBLIC_AUDIO_SUFFIXES = frozenset({".webm", ".ogg", ".mp3", ".m4a", ".aac", ".wav"})
 _PUBLIC_CACHE_CONTROL = "public, max-age=3600"
 _S3_CLIENT = None
+_S3_PRESIGN_CLIENT = None
+# 群文件（docs/group-plus.md 第 5 节）：配了 S3_PRIVATE_BUCKET 时这个前缀下的对象放私有桶，其余照旧放主桶（主桶开着公开读）
+PRIVATE_PREFIX = "group-files/"
+OCTET_STREAM = "application/octet-stream"
 
 
 @dataclass(frozen=True)
@@ -93,6 +130,16 @@ def _normalize_key(key: str) -> str:
 
 def _join_key(*parts: str) -> str:
     return PurePosixPath(*parts).as_posix().strip("/")
+
+
+def image_upload_limits(folder: str) -> ImageUploadLimits:
+    """按目标目录取图片限制。未知目录拿到的就是原来的全局默认值。"""
+    try:
+        normalized = _normalize_key(folder)
+    except ValueError:
+        return DEFAULT_IMAGE_UPLOAD_LIMITS
+    provider = _IMAGE_UPLOAD_FOLDER_LIMITS.get(normalized)
+    return provider() if provider is not None else DEFAULT_IMAGE_UPLOAD_LIMITS
 
 
 def _storage_error(detail: str = "Storage operation failed") -> HTTPException:
@@ -175,6 +222,61 @@ def _s3_client():
     return _S3_CLIENT
 
 
+def _bucket_for(normalized: str) -> str | None:
+    """这个 key 放哪个桶：群文件前缀且配了私有桶 → 私有桶；否则主桶。凭据、endpoint 两个桶共用。"""
+    if settings.s3_private_bucket and normalized.startswith(PRIVATE_PREFIX):
+        return settings.s3_private_bucket
+    return settings.s3_bucket
+
+
+def direct_transfer_enabled() -> bool:
+    """群文件直传：S3 存储且配了私有桶时打开，客户端用预签名 URL 直接和桶传输，不经过后端。"""
+    return settings.storage_backend == "s3" and bool(settings.s3_private_bucket)
+
+
+def _s3_presign_client():
+    """预签名专用的客户端：固定 SigV4（不指定时 boto3 对自定义 endpoint 可能签成 V2，V2 不签 Content-Length）。"""
+    global _S3_PRESIGN_CLIENT
+    _s3_client()  # 复用缺配置的检查
+    if _S3_PRESIGN_CLIENT is None:
+        _S3_PRESIGN_CLIENT = boto3.client(
+            "s3",
+            endpoint_url=settings.s3_endpoint_url,
+            aws_access_key_id=settings.s3_access_key_id,
+            aws_secret_access_key=settings.s3_secret_access_key,
+            region_name=settings.s3_region,
+            config=S3_CONFIG.merge(Config(signature_version="s3v4")),
+        )
+    return _S3_PRESIGN_CLIENT
+
+
+def presign_put(key: str, size: int, expires_in: int = 900) -> tuple[str, dict[str, str]]:
+    """直传用的预签名 PUT。签名里带 Content-Type 和 Content-Length，长度不对的请求桶会拒（取决于服务商，见 scripts/check_s3_direct.py）。
+    返回 (url, 客户端必须带上的请求头)；Content-Length 由客户端的 HTTP 库按请求体自己填。"""
+    normalized = _normalize_key(key)
+    try:
+        url = _s3_presign_client().generate_presigned_url(
+            "put_object",
+            Params={"Bucket": _bucket_for(normalized), "Key": normalized, "ContentType": OCTET_STREAM, "ContentLength": int(size)},
+            ExpiresIn=expires_in,
+        )
+    except (BotoCoreError, ClientError) as exc:
+        raise _storage_error() from exc
+    return url, {"Content-Type": OCTET_STREAM}
+
+
+def presign_get(key: str, expires_in: int = 300, content_disposition: str | None = None) -> str:
+    """直连下载用的预签名 GET：响应头强制 application/octet-stream 和给定的 Content-Disposition。"""
+    normalized = _normalize_key(key)
+    params = {"Bucket": _bucket_for(normalized), "Key": normalized, "ResponseContentType": OCTET_STREAM}
+    if content_disposition:
+        params["ResponseContentDisposition"] = content_disposition
+    try:
+        return _s3_presign_client().generate_presigned_url("get_object", Params=params, ExpiresIn=expires_in)
+    except (BotoCoreError, ClientError) as exc:
+        raise _storage_error() from exc
+
+
 def _is_public_media_key(key: str) -> bool:
     parts = PurePosixPath(key).parts
     if len(parts) == 2:
@@ -199,7 +301,7 @@ def put_object(key: str, data: bytes | BinaryIO, content_type: str) -> str:
         try:
             _s3_client().upload_fileobj(
                 body,
-                settings.s3_bucket,
+                _bucket_for(normalized),
                 normalized,
                 ExtraArgs=extra_args,
             )
@@ -213,7 +315,13 @@ def put_object(key: str, data: bytes | BinaryIO, content_type: str) -> str:
         raise _storage_error("Invalid local upload path")
     file_path.parent.mkdir(parents=True, exist_ok=True)
     if hasattr(data, "read"):
-        file_path.write_bytes(data.read())
+        # 大文件（群文件可能有几百 MB）分块拷，不一次读进内存
+        with file_path.open("wb") as target:
+            while True:
+                chunk = data.read(1024 * 1024)
+                if not chunk:
+                    break
+                target.write(chunk)
     else:
         file_path.write_bytes(data)
     return normalized
@@ -223,7 +331,7 @@ def get_object(key: str, max_bytes: int | None = None) -> StoredObject:
     normalized = _normalize_key(key)
     if settings.storage_backend == "s3":
         try:
-            response = _s3_client().get_object(Bucket=settings.s3_bucket, Key=normalized)
+            response = _s3_client().get_object(Bucket=_bucket_for(normalized), Key=normalized)
             stream = response["Body"]
             try:
                 if max_bytes is not None and (response.get("ContentLength") or 0) > max_bytes:
@@ -265,13 +373,19 @@ def delete_objects(keys: list[str]) -> None:
         return
 
     if settings.storage_backend == "s3":
-        try:
-            _s3_client().delete_objects(
-                Bucket=settings.s3_bucket,
-                Delete={"Objects": [{"Key": key} for key in normalized_keys], "Quiet": True},
-            )
-        except (BotoCoreError, ClientError):
-            pass
+        by_bucket: dict[str | None, list[str]] = {}
+        for key in normalized_keys:
+            by_bucket.setdefault(_bucket_for(key), []).append(key)
+        for bucket, bucket_keys in by_bucket.items():
+            # 一次最多 1000 个（S3 的上限）
+            for start in range(0, len(bucket_keys), 1000):
+                try:
+                    _s3_client().delete_objects(
+                        Bucket=bucket,
+                        Delete={"Objects": [{"Key": key} for key in bucket_keys[start : start + 1000]], "Quiet": True},
+                    )
+                except (BotoCoreError, ClientError):
+                    pass
 
     for key in normalized_keys:
         file_path = local_path_for_key(key)
@@ -355,29 +469,38 @@ def _content_type_for_key(key: str) -> str:
 
 
 def object_exists(key: str) -> bool:
+    return object_size(key) is not None
+
+
+def object_size(key: str) -> int | None:
+    """对象的字节数；不存在返回 None（S3 走 head_object）。"""
     normalized = _normalize_key(key)
     if settings.storage_backend == "s3":
         try:
-            _s3_client().head_object(Bucket=settings.s3_bucket, Key=normalized)
-            return True
+            response = _s3_client().head_object(Bucket=_bucket_for(normalized), Key=normalized)
+            return int(response.get("ContentLength") or 0)
         except ClientError as exc:
             code = str(exc.response.get("Error", {}).get("Code", ""))
             if code in {"404", "NoSuchKey", "NotFound"}:
-                return False
+                return None
             raise _storage_error() from exc
         except BotoCoreError as exc:
             raise _storage_error() from exc
-    return local_path_for_key(normalized) is not None
+    path = local_path_for_key(normalized)
+    return path.stat().st_size if path is not None else None
 
 
-def _check_image_pixels(image: Image.Image) -> None:
+def _check_image_pixels(image: Image.Image, max_pixels: int = MAX_IMAGE_PIXELS) -> None:
     width, height = image.size
-    if width * height > MAX_IMAGE_PIXELS:
-        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="Image pixel count exceeds 12 million")
+    if width * height > max_pixels:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"Image pixel count exceeds {max_pixels // 1_000_000} million",
+        )
 
 
-def _prepare_image_for_jpeg(image: Image.Image, max_dimension: int) -> Image.Image:
-    _check_image_pixels(image)
+def _prepare_image_for_jpeg(image: Image.Image, max_dimension: int, max_pixels: int = MAX_IMAGE_PIXELS) -> Image.Image:
+    _check_image_pixels(image, max_pixels)
     # JPEG draft decoding reduces the intermediate raster for large JPEGs.
     if image.format == "JPEG":
         image.draft("RGB", (max_dimension, max_dimension))
@@ -392,9 +515,9 @@ def _prepare_image_for_jpeg(image: Image.Image, max_dimension: int) -> Image.Ima
     return image.convert("RGB")
 
 
-def _encode_jpeg(image: Image.Image, max_dimension: int, *, quality: int | None = None) -> bytes:
+def _encode_jpeg(image: Image.Image, max_dimension: int, *, quality: int | None = None, max_pixels: int = MAX_IMAGE_PIXELS) -> bytes:
     output = BytesIO()
-    _prepare_image_for_jpeg(image, max_dimension).save(
+    _prepare_image_for_jpeg(image, max_dimension, max_pixels).save(
         output,
         format="JPEG",
         quality=quality if quality is not None else settings.image_quality,
@@ -428,10 +551,10 @@ async def run_image_worker(function, *args):
     return await asyncio.shield(worker)
 
 
-def _verified_image(content: bytes) -> tuple[str, str]:
+def _verified_image(content: bytes, max_pixels: int = MAX_IMAGE_PIXELS) -> tuple[str, str]:
     try:
         with Image.open(BytesIO(content)) as image:
-            _check_image_pixels(image)
+            _check_image_pixels(image, max_pixels)
             image.verify()
             image_format = image.format or ""
     except HTTPException:
@@ -447,31 +570,60 @@ def _verified_image(content: bytes) -> tuple[str, str]:
     return image_format.upper(), content_type
 
 
-def process_image_upload(content: bytes, folder: str, object_id: str) -> ProcessedImageUpload:
+def _format_size_mb(value: int) -> str:
+    megabytes = value / (1024 * 1024)
+    return str(int(megabytes)) if megabytes == int(megabytes) else f"{megabytes:g}"
+
+
+def process_image_upload(content: bytes, folder: str, object_id: str, limits: ImageUploadLimits | None = None) -> ProcessedImageUpload:
+    """limits=None 表示按目录取限制；只有 announcements/ 与默认不同。
+
+    未传 limits 时以目录为准；显式传入时以传入的为准（老调用点和测试都走
+    None 这条路，除了 announcements/ 之外拿到的就是原来的全局常量）。
+    """
+    active = limits if limits is not None else image_upload_limits(folder)
     if not content:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Uploaded file is empty")
-    if len(content) > MAX_IMAGE_UPLOAD_BYTES:
-        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="Image size must not exceed 3MB")
+    if len(content) > active.max_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"Image size must not exceed {_format_size_mb(active.max_bytes)}MB",
+        )
 
-    return _process_verified_image(content, folder, object_id)
+    return _process_verified_image(content, folder, object_id, active)
 
 
-def _process_verified_image(content: bytes, folder: str, object_id: str) -> ProcessedImageUpload:
-    image_format, _detected_content_type = _verified_image(content)
+def _process_verified_image(content: bytes, folder: str, object_id: str, limits: ImageUploadLimits | None = None) -> ProcessedImageUpload:
+    active = limits if limits is not None else DEFAULT_IMAGE_UPLOAD_LIMITS
+    image_format, _detected_content_type = _verified_image(content, active.max_pixels)
     folder = _normalize_key(folder)
     key = _join_key(folder, f"{object_id}.gif" if image_format == "GIF" else f"{object_id}.jpg")
+    max_dimension = active.max_dimension if active.max_dimension is not None else settings.image_max_dimension
+    base_quality = active.quality if active.quality is not None else settings.image_quality
     try:
         with Image.open(BytesIO(content)) as image:
-            _check_image_pixels(image)
+            _check_image_pixels(image, active.max_pixels)
             # Preserve every GIF frame; only the first frame is decoded for its thumbnail.
             if image_format == "GIF":
                 data = content
                 content_type = "image/gif"
             else:
-                data = _encode_jpeg(image, settings.image_max_dimension, quality=min(settings.image_quality, 78))
+                # 默认（quality=None）走 min(settings.image_quality, 78)，与放宽前一致；
+                # 公告图用自己的质量，见 config.image_announcement_quality。
+                data = _encode_jpeg(
+                    image,
+                    max_dimension,
+                    quality=min(base_quality, 78) if active.quality is None else base_quality,
+                    max_pixels=active.max_pixels,
+                )
                 content_type = JPEG_CONTENT_TYPE
         with Image.open(BytesIO(content)) as image:
-            thumbnail_data = _encode_jpeg(image, settings.image_thumbnail_max_dimension, quality=min(settings.image_quality, 65))
+            thumbnail_data = _encode_jpeg(
+                image,
+                settings.image_thumbnail_max_dimension,
+                quality=min(settings.image_quality, 65),
+                max_pixels=active.max_pixels,
+            )
     except HTTPException:
         raise
     except Exception as exc:
@@ -494,7 +646,8 @@ def process_legacy_image(content: bytes, folder: str, object_id: str) -> Process
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Uploaded file is empty")
     if len(content) > MAX_LEGACY_IMAGE_BYTES:
         raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="Legacy image exceeds 12MB")
-    return _process_verified_image(content, folder, object_id)
+    # 老图迁移一律按默认限制走，不受公告放宽影响。
+    return _process_verified_image(content, folder, object_id, DEFAULT_IMAGE_UPLOAD_LIMITS)
 
 
 def store_processed_image(image: ProcessedImageUpload) -> None:

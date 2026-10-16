@@ -85,6 +85,14 @@ deploy_start.py Gunicorn + Uvicorn Worker 生产启动
 
 **举报证据在提交时固化**进 `target_snapshot`，不是实时查库。改动快照结构要小心，它是申诉与追溯的依据。
 
+**群升级、群文件、精华、群待办、聊天记录搜索**：契约在 `docs/group-plus.md`。要点：
+
+- 群的档位在 `conversations.plus_tier` / `plus_expires_at`，有效档位一律用 `core/group_plus_tiers.conversation_tier()` 现场判断，不要直接读列。人数上限、消息保留条数、精华上限、群文件空间都按它取。
+- 买群升级花的币进 `group_plus_records`，和礼物 / 红包一样并入余额公式（`services/shop.py` 的 `available_expression` / `_balance`）；改余额公式要把这一项一起算。
+- 精华和群待办是**快照**（`featured_messages` / `group_todos` 的 `snap_*` 列），`message_id` 不建外键，修剪不能连带删它们。撤回时的清理在 SQLite 触发器里（`services/schema_extras.py`）。
+- 聊天记录搜索（`GET /search/messages`）只搜用户**自己的**会话和自己可见的消息，索引靠触发器同步；**不要**给它加管理员 / 全站 / 按用户的入口（见第 1 条）。
+- 群文件下载只走带鉴权的接口；`/uploads` 的静态挂载要继续拦 `group-files/`（`main.py` 的 `CachedUploadFiles`）。
+
 ## 已知问题
 
 `_message_report_snapshot` 加载 `ConversationMember` 时没有 `joinedload(user)`，随后同步访问 `member.user`。生产环境靠 identity map 侥幸成立，跨 session 的隔离测试会抛 `MissingGreenlet`。属于潜在脆弱点，动它会碰到举报证据逻辑，目前未修。

@@ -9,7 +9,7 @@ from pydantic import BaseModel
 
 from app.core.dependencies import get_current_user
 from app.models.user import User
-from app.services.storage import MAX_AUDIO_UPLOAD_BYTES, MAX_IMAGE_UPLOAD_BYTES, process_audio_upload, process_image_upload, public_url_for_key, run_image_worker, store_processed_audio, store_processed_image
+from app.services.storage import MAX_AUDIO_UPLOAD_BYTES, image_upload_limits, process_audio_upload, process_image_upload, public_url_for_key, run_image_worker, store_processed_audio, store_processed_image
 
 
 router = APIRouter()
@@ -25,21 +25,24 @@ class UploadRead(BaseModel):
     content_type: str
 
 
-def _process_and_store_image(content: bytes, folder: str, object_id: str):
-    processed = process_image_upload(content, folder, object_id)
+def _process_and_store_image(content: bytes, folder: str, object_id: str, limits):
+    processed = process_image_upload(content, folder, object_id, limits)
     store_processed_image(processed)
     return processed
 
 
 async def save_image_upload(file: UploadFile, folder: str, request: Request) -> UploadRead:
+    """按目录取限制：announcements/ 走公告长图那一组，其余目录与以前完全一致。"""
+    limits = image_upload_limits(folder)
     async with _IMAGE_READ_SLOTS:
-        content = await file.read(MAX_IMAGE_UPLOAD_BYTES + 1)
-        if len(content) > MAX_IMAGE_UPLOAD_BYTES:
-            raise HTTPException(status_code=413, detail="Image size must not exceed 3MB")
+        # 读上界跟着这个目录的字节上限走，多读 1 字节用来判断「超了」
+        content = await file.read(limits.max_bytes + 1)
+        if len(content) > limits.max_bytes:
+            raise HTTPException(status_code=413, detail=f"Image size must not exceed {limits.max_bytes // (1024 * 1024)}MB")
         try:
             # One slot covers decode AND synchronous local/S3 writes. Cancellation
             # leaves the worker slot occupied until the thread exits.
-            processed = await run_image_worker(_process_and_store_image, content, folder, uuid4().hex)
+            processed = await run_image_worker(_process_and_store_image, content, folder, uuid4().hex, limits)
         except HTTPException:
             raise
         except OSError as exc:

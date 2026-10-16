@@ -61,6 +61,8 @@ class GroupSettingsUpdate(BaseModel):
     tasks_enabled: bool | None = None
     task_creation_permission: Literal["members", "admins"] | None = None
     level_titles_enabled: bool | None = None
+    # 群文件默认保留多少小时：24 / 168 / 720（docs/group-plus.md 第 2 节；取值在服务层校验，返回 422 invalid_file_ttl）
+    file_default_ttl_hours: int | None = None
     # 整体替换；传 [] 恢复默认分档
     level_titles: list[LevelTitle] | None = None
 
@@ -194,6 +196,17 @@ class ConversationRead(BaseModel):
     my_do_not_disturb: bool = False
     my_message_setting: Literal["notify", "silent", "ignore"] = "notify"
     pending_join_request_count: int = 0
+    # 这个会话里有我还能领的红包（docs/red-packets.md 第 7 节），会话列表据此显示「[有红包]」
+    red_packet_pending: bool = False
+    # 我的未读消息里有没有提到我（docs/chat-features.md 第 7 节）：me 有人点名 @我 / all 只有 @全体成员 / null 都没有
+    mention_pending: Literal["me", "all"] | None = None
+    # 群升级（docs/group-plus.md）：有效档位 free / pro / pro_plus / max；到期时间免费时为 null
+    plus_tier: str = "free"
+    plus_expires_at: datetime | None = None
+    # 群文件默认保留多少小时
+    file_default_ttl_hours: int = 24
+    # 群待办：{ message_id, message_exists, summary, snapshot, set_by, set_at … }，没有为 null
+    group_todo: dict | None = None
 
 
 class GroupDiscoveryRead(BaseModel):
@@ -211,6 +224,8 @@ class GroupDiscoveryRead(BaseModel):
     created_at: datetime
     updated_at: datetime
     member_count: int
+    plus_tier: str = "free"
+    plus_expires_at: datetime | None = None
     joined: bool
     join_request_status: GroupJoinRequestStatus | None = None
 

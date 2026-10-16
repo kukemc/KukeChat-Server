@@ -112,7 +112,8 @@ async def admin_grant_shop_item(
     admin: Annotated[User, Depends(get_current_admin)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> AdminShopPurchaseRead:
-    return AdminShopPurchaseRead(**await shop_service.admin_grant(db, admin, user_id, payload.item_id, payload.note))
+    """限时商品按 duration_days 计期（请求里另传 duration_days 可以覆盖：正整数是天数，0 是永久）；对方已经有这件限时商品是续期。"""
+    return AdminShopPurchaseRead(**await shop_service.admin_grant(db, admin, user_id, payload.item_id, payload.note, payload.duration_days))
 
 
 @router.post("/shop/users/{user_id}/revoke", response_model=AdminShopPurchaseRead)

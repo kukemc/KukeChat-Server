@@ -26,6 +26,10 @@ class FriendRequest(Base):
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+    # 接收方「忽略」的时间：只对接收方生效，状态仍是 pending，申请方看不出区别（他那边照旧显示「等待验证」）。
+    # 被忽略的申请不进接收方的申请列表和通知中心。写这一列时要连带把 updated_at 原样写回，别让 onupdate 改掉它 ——
+    # 申请方的通知按 updated_at 排序 / 判断新旧，变了就等于告诉他「对方动过这条申请」
+    ignored_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     requester: Mapped["User"] = relationship(back_populates="sent_friend_requests", foreign_keys=[requester_id])
     receiver: Mapped["User"] = relationship(back_populates="received_friend_requests", foreign_keys=[receiver_id])

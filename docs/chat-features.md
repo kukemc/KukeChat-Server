@@ -1,4 +1,4 @@
-# 投票、正在输入、群表情、戳一戳、公告回应、资料点赞
+# 投票、正在输入、群表情、戳一戳、公告回应、资料点赞、会话列表上的提及提示
 
 路径前缀 `/api/v1`。带 `code` 的错误，`detail` 是 `{ code, message }`，`message` 是可直接展示的中文。
 
@@ -237,7 +237,8 @@
 - 和其它系统消息同一个口径：**计入未读数、会成为会话列表的最后一条预览**；不计发言限频、不加群等级经验、不走机器审核（后缀在保存时已经审过）。要不要响提示音由客户端决定。
 - 撤回沿用现有规则：发起人可以撤回，群主 / 管理员可以撤回别人的；每个人也可以对自己隐藏。
 - **不能被举报，也不能选作证据消息**（对所有系统消息生效）：`POST /reports` 返回 422 `not_reportable`。这行字的后缀是被戳的人写的，算到发起人头上就罚错了人，被戳的人甚至可以先改好后缀再去举报对方。有人用戳一戳骚扰，或者后缀本身违规，都走「举报用户」，写明情况或附截图。客户端在系统消息上不要出举报入口，选证据时也别让选。
-- 每个会话只保留最近 1000 条消息，戳一戳也占名额，所以上面的频率限制比较紧。
+- 每个会话只保留最近 1000 条消息（私聊和免费群；付费群按档位 5000 / 20000 / 50000，见 [`group-plus.md`](group-plus.md)），戳一戳也占名额，所以上面的频率限制比较紧。
+  被修剪掉的消息不会连带删掉精华和群待办：它们设置时就固化了消息快照。
 
 ### 4.4 实时事件
 
@@ -312,6 +313,21 @@
 
 `GET /admin/announcements` 的每一项同样带 `reactions`（`reacted_by_me` 恒为 false）。
 
+### 5.5 公告长图上传
+
+公告正文里的图走 `POST /uploads/announcement-image`（发布公告用的编辑器上传，和聊天图片分开）。更新日志、信息图这类长图是一整张 1000+ × 7000+ 的图，按普通图片的规矩缩到 2048 高会把字压糊，所以**只有这一条路径**放宽：
+
+| 限制 | 普通上传（头像 / 聊天图 / 作品图 / 组队图 / 资料背景 / 表情包） | `announcement-image` |
+| --- | --- | --- |
+| 字节上限 | 3 MB | 20 MB（`IMAGE_ANNOUNCEMENT_MAX_BYTES`） |
+| 最长边 | 2048（`IMAGE_MAX_DIMENSION`） | 8192（`IMAGE_ANNOUNCEMENT_MAX_DIMENSION`），等于不缩 |
+| 解码像素上限 | 1200 万（`MAX_IMAGE_PIXELS`） | 4000 万（`IMAGE_ANNOUNCEMENT_MAX_PIXELS`） |
+| 重编码质量 | `IMAGE_QUALITY`（82） | `IMAGE_ANNOUNCEMENT_QUALITY`（90） |
+
+其它路径的限制一个字没动。实现上是按目标目录取一组限制（`app/services/storage.py` 的 `image_upload_limits()`），非 `announcements` 目录拿到的就是原来那组全局常量；老图迁移、表情包压缩等内部路径固定按默认限制走。
+
+`thumbnail_url` 仍然是小图（`IMAGE_THUMBNAIL_MAX_DIMENSION`，360），后台列表用它当预览；正文里渲染的是 `url` 原图。因为存的是高清长图，客户端展示时不要给它套固定高度。
+
 ## 6. 资料点赞
 
 给别人的个人空间 / 资料卡点赞，赞数累计，参照 QQ 的名片赞。
@@ -367,3 +383,115 @@
 ### 6.4 实时事件
 
 `user.profile.liked`：`{ "from_user": { /* UserPublic */ }, "like_count": 6025, "today_count": 13 }`，发给被赞的人本人。不写通知中心（太频繁）；同一个被赞者 3 秒内的多次点赞合并成一次事件，`from_user` 是最后一个。
+
+## 7. 会话列表上的「[有人@我]」/「[@全体成员]」
+
+会话对象（`GET /conversations` 的每一项，以及所有返回单个会话的接口）新增：
+
+```jsonc
+"mention_pending": "me"     // "me" | "all" | null
+```
+
+- 看的是我在这个会话里的**未读**消息：有点名 @我 的 → `"me"`；没有 @我 但有 @全体成员 → `"all"`；都没有 → `null`。两种都有时是 `"me"`。
+- 自己发的不算（点名自己、自己发的 @全体）。
+- 「未读」和未读数是同一个口径：已读位置（`last_read_message_id`）之后的消息。已读位置越过那条消息就自动变回 `null`；清空聊天记录等于都读过了。
+- 哪些算提及：
+  - 普通发消息：`metadata.mentions`（`[{ user_id, name }]`）点名了我；`metadata.mention_all`（或者 `mentions` 里有 `all`）是 @全体，仍然只有群主 / 管理员能发、每天有次数上限（原有规则）。
+  - 机器人接口：`at` / `mention` 元素（或 markdown 里的 `<at id="…"/>`）算点名，`at_all` / `mention_all` 算 @全体——它们被解析成同样的 `metadata`，走的是同一条路径。
+  - 不算的：引用回复、合并转发里夹着的提及、系统消息。
+- 一条消息最多给 50 个人记「有人@我」。
+- 旧客户端不认识这个字段，不受影响。
+
+实时：没有新事件。
+
+- 置上：`message.created` 里带着消息的 `metadata`，客户端看到点名了自己 / @全体（且不是自己发的、会话不在前台）就在本地置上。
+- 清掉：标记已读之后清。`POST /conversations/{id}/read` 的返回（`ReadReceipt`）新增 `mention_pending`，就是读到这里之后这个会话的值（一般是 `null`；只读到一半时可能还是 `"me"` / `"all"`）。同一个人的其它设备会收到 `conversation.updated`，其中带 `mention_pending`。广播给全会话的 `conversation.read` 事件里**不带**这一项。
+- 撤回：被撤回的消息不再触发提示（用户撤回、群管理撤回、后台按消息撤回、机器审核、案件结案都一样）。没有专门的事件，客户端收到 `message.recalled` 时如果那条正是本地记着的提及，就重拉这个会话（或者整个列表）。
+
+实现上的细节：
+
+- 不扫消息。发消息时把「最近一条点名 @某人的消息 id」记在那个人的成员行上（`conversation_members.last_mention_message_id`，只更新被点名的那几行，一条语句），把「最近一条 @全体 的消息 id」记在会话上（`conversations.last_mention_all_message_id`，不逐个成员写）。读会话时拿这两个数和我的已读位置比大小，都在本来就要加载的行上，**不多任何查询**。
+- 所以它只记得「最近一条」：撤回时如果被撤回的正是记着的那一条，就把记号清掉，而不是退回到更早的一条——更早的那条提及如果也还没读，提示会跟着消失。案件改判把消息恢复之后，提示不会恢复。
+- 已读位置是客户端报上来的，可以往回退；退回去之后那条提及又成了未读，提示会跟着回来。
+- 刚进群、还没读过任何消息的人，进群之前的 @全体 也算未读（和未读数一致）。
+- 这两列是加在已有的表上的：启动时自动 `ALTER TABLE … ADD COLUMN`（可空整数，不回填、不建索引）。两个进程同时启动、都去加同一列时，后到的那个会把「列已存在」当成成功；稳妥起见上线前仍然先单进程启动一次。
+
+## 8. 生日
+
+用户可以填自己的生日。公开资料上只显示月日，年份要本人选择公开才给；生日当天别人能看到「今天生日」。「今天」一律按 UTC+8。
+
+### 8.1 用户对象
+
+`UserPublic` 新增两个字段（旧客户端不认识，忽略即可）：
+
+```jsonc
+"birthday": { "month": 10, "day": 12, "year": null },   // 没设置为 null；year 只有本人选择公开年份时才给
+"is_birthday_today": true                                // 今天（UTC+8）是不是这个人的生日
+```
+
+- 2 月 29 日出生的人在平年按 2 月 28 日过（闰年只有 29 日那天算）。
+- 这两个字段出现在所有带用户对象的地方（消息的发送者、成员列表、搜索、好友……），都只读用户这一行上的列，不多查任何表。服务端按当前时间现算，所以零点一过就变；没有专门的实时事件，客户端按拿到用户对象时的值显示即可（会话列表、在线名单这些有几秒缓存的接口会晚几秒）。
+- 生日当天收到的礼物，记录上 `on_birthday = true`（[`gifts.md`](gifts.md)）。
+
+### 8.2 接口
+
+都只动自己的，路径在 `/users/me/birthday` 下。
+
+| 接口 | 说明 |
+| --- | --- |
+| `GET /users/me/birthday` | `{ birthday: { year, month, day } \| null, show_year, next_change_at, celebrate_today }`。本人看自己总是带年份 |
+| `PUT /users/me/birthday` | body `{ year, month, day, show_year }`。返回和 GET **同样的形状** |
+| `DELETE /users/me/birthday` | 清空。返回和 GET 同样的形状（`birthday` 为 null） |
+| `POST /users/me/birthday/celebrated` | 标记今年的庆生动画已经播过。返回和 GET 同样的形状（`celebrate_today` 变成 false）。今天不是生日时什么都不改 |
+
+- `celebrate_today`：今天是我的生日，而且今年（UTC+8 的年份）还没标记过「播过了」。到了明年生日又是 true。
+- `next_change_at`：**已废弃，恒为 null**。以前用来表示「下次允许改日期的时间」；改日期的限制取消后只为兼容旧客户端保留，新代码不要读它。
+- **改日期不受限制**：随时可以设置、修改、清空，次数不限，不会再返回 409 `birthday_locked`（以前的「365 天只能改一次」已取消）。`show_year` 不传就保持原样。
+- 庆生按年记：改日期、清空都不会重置「今年已经播过」。所以把生日改成今天，今年还没播过就会 `celebrate_today = true`；今年已经播过（哪怕是按改之前的日期播的），反复改日期也不会再播。
+- 日期不合法（不存在的日子、2 月 29 日配了平年）、在未来（按 UTC+8 的今天算）、早于 1900 年、或者不是整数：422 `invalid_birthday`。
+
+### 8.3 后台
+
+`GET /admin/users` / `GET /admin/users/{id}` 的用户对象里，`birthday` **总是带完整生日（含年份）**，不管本人选没选公开；另有 `is_birthday_today` 和 `charm`。后台不提供修改生日的入口，改生日也不写审计日志（是用户自己的操作）。
+
+### 8.4 实现上的细节
+
+- 生日存在 `users` 表自己身上：`birthday_year` / `birthday_month` / `birthday_day` / `birthday_show_year`，加上 `birthday_celebrated_year`（哪一年的庆生动画播过了）。`birthday_set_at` / `birthday_changed_at` 是以前「365 天只能改一次」用的两列，限制取消后不再读写，列保留在表里（不删列、不改迁移）。启动时自动 `ALTER TABLE … ADD COLUMN`（都是可空列或带默认值，不回填）。
+- 两个进程同时启动、都去加同一列时，后到的那个会把「列已经有了」当成正常情况；稳妥起见上线前仍然先单进程启动一次。
+
+## 9. 群升级、群文件、永久精华、群待办、聊天记录搜索
+
+见 [`group-plus.md`](group-plus.md)。和本文件有关的变化：
+
+- 精华不再随消息被修剪而消失（设置时固化快照），数量有上限（按群档位）；`GET .../featured-messages` 仍返回数组，分页信息在响应头。
+- 群待办的提醒走第 7 节的 @全体成员 链路，但不占 @全体成员 的每日次数。
+- 文件消息（`metadata.file`）和群待办提醒（`metadata.group_todo`）都是普通文本消息，只能由各自的接口创建。
+
+
+## 10. 好友申请「忽略」、通知只提醒一次
+
+### 10.1 忽略好友申请
+
+| 接口 | 说明 |
+| --- | --- |
+| `POST /friends/requests/{id}/ignore` | 204。只有接收方能调（申请方 403，无关的人 404），申请必须还是 pending（否则 409）。重复忽略无害 |
+| `POST /friends/requests/ignore-all` | `{ "ignored": <int> }`：把自己收到的、还没忽略的 pending 申请全部忽略，返回这次忽略了几条 |
+
+- 忽略只在接收方这边生效：`friend_requests.ignored_at` 有值，**状态仍是 `pending`**，`updated_at` 不动。申请方看到的一切照旧（仍显示「等待验证」），不给他推任何事件。
+- 被忽略的申请不出现在接收方的 `GET /friends/requests/incoming` 和 `GET /notifications` 里。`FriendRequestRead` 不带 `ignored_at`。
+- 申请方再发一次：已有 pending 申请时照旧 409，那条申请继续保持忽略，不会重新冒出来。接收方自己反过来加对方，照旧直接成为好友。
+- 实时事件只推给接收方自己（其他设备刷新列表 / 角标）：`friend.request.ignored`，`{ id, ids }`。单条忽略 `id` 是那条申请、`ids` 是 `[id]`；全部忽略 `id` 为 null、`ids` 是这次忽略的全部（一条都没有就不推）。
+
+### 10.2 通知只提醒一次
+
+`users.notifications_seen_at` 记「上次打开通知中心」的时间。
+
+| 接口 | 说明 |
+| --- | --- |
+| `POST /notifications/seen` | `{ "seen_at": "<iso>" }`，seen_at = 服务器当前时间（UTC）。同时给本人所有连接推 `notification.seen`（同样的 body），其他设备据此清角标 |
+| `GET /notifications` | 新增 `seen_at`（从没打开过为 null）和 `new_count` |
+
+- 除动态（`category = "post"`，仍按各自的已读标记）以外，每条的 `unread = time > seen_at`（seen_at 为 null 时全部算新）。`pending` 和这个无关：看过但没处理的申请仍是 `pending = true`，只是不再算新。
+- 例外：自己刚处理掉的申请（收到的好友申请已通过 / 已拒绝，自己审核的入群申请）虽然 `updated_at` 变新了，也不算新通知。
+- `new_count` = `unread` 为 true 的条数，客户端角标用它。`unread_count` 与 `new_count` 相同，留着兼容旧客户端；`pending_count`、`counts` 不变。
+- 两列都是启动时 `ALTER TABLE … ADD COLUMN` 补的可空列，不回填。

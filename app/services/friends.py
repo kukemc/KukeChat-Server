@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi import HTTPException, status
-from sqlalchemy import and_, delete, or_, select
+from sqlalchemy import and_, delete, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
@@ -56,7 +56,7 @@ async def list_incoming_requests(db: AsyncSession, user_id: int) -> list[FriendR
     result = await db.execute(
         select(FriendRequest)
         .options(joinedload(FriendRequest.requester), joinedload(FriendRequest.receiver))
-        .where(FriendRequest.receiver_id == user_id)
+        .where(FriendRequest.receiver_id == user_id, FriendRequest.ignored_at.is_(None))
         .order_by(FriendRequest.created_at.desc())
     )
     return list(result.scalars().all())
@@ -135,6 +135,45 @@ async def reject_friend_request(db: AsyncSession, request_id: int, user_id: int)
     request.status = FriendRequestStatus.REJECTED
     await db.commit()
     return await get_friend_request_for_user(db, request.id, user_id)
+
+
+async def ignore_friend_request(db: AsyncSession, request_id: int, user_id: int) -> FriendRequest:
+    """接收方忽略一条待处理的申请。状态仍是 pending，申请方那边什么都不变，也不通知他。"""
+    request = await get_friend_request_for_user(db, request_id, user_id)
+    if request.receiver_id != user_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only the receiver can ignore this request")
+    if request.status != FriendRequestStatus.PENDING:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Friend request has already been processed")
+    if request.ignored_at is None:
+        await _mark_ignored(db, FriendRequest.id == request.id)
+        await db.commit()
+    return request
+
+
+async def ignore_all_friend_requests(db: AsyncSession, user_id: int) -> list[int]:
+    """忽略接收方全部待处理、还没忽略过的申请，返回这次被忽略的申请 id。"""
+    result = await db.execute(
+        select(FriendRequest.id).where(
+            FriendRequest.receiver_id == user_id,
+            FriendRequest.status == FriendRequestStatus.PENDING,
+            FriendRequest.ignored_at.is_(None),
+        )
+    )
+    ids = list(result.scalars().all())
+    if ids:
+        await _mark_ignored(db, FriendRequest.id.in_(ids))
+        await db.commit()
+    return ids
+
+
+async def _mark_ignored(db: AsyncSession, condition) -> None:
+    # updated_at 原样写回：显式给了值，onupdate 就不会生效。申请方的通知靠 updated_at 判断新旧，不能被「忽略」动到
+    await db.execute(
+        update(FriendRequest)
+        .where(condition)
+        .values(ignored_at=datetime.now(timezone.utc), updated_at=FriendRequest.updated_at)
+        .execution_options(synchronize_session=False)
+    )
 
 
 async def list_friends(db: AsyncSession, user_id: int) -> list[tuple[User, datetime]]:

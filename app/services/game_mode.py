@@ -186,6 +186,9 @@ async def send_game_message(
     """
     joined = False
     if not await _is_member(db, conversation.id, sender.id):
+        from app.services.conversations import ensure_capacity
+
+        await ensure_capacity(db, conversation, 1)
         db.add(
             ConversationMember(
                 conversation_id=conversation.id,

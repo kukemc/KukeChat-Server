@@ -4,7 +4,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
@@ -18,6 +18,7 @@ from app.models.message import Message
 from app.models.penalty import UserViolation
 from app.models.post import PostNotification
 from app.models.teamup import TeamupComment, TeamupProfile
+from app.models.user import User
 from app.schemas.notification import UnifiedNotificationListRead, UnifiedNotificationRead
 from app.schemas.user import UserPublic
 from app.services import cases as case_service
@@ -69,7 +70,13 @@ async def _friend_request_notifications(db: AsyncSession, user_id: int) -> list[
     result = await db.execute(
         select(FriendRequest)
         .options(joinedload(FriendRequest.requester), joinedload(FriendRequest.receiver))
-        .where(or_(FriendRequest.receiver_id == user_id, FriendRequest.requester_id == user_id))
+        .where(
+            or_(
+                # 自己忽略掉的申请不再出现；申请方那边照旧（ignored_at 只对接收方生效）
+                and_(FriendRequest.receiver_id == user_id, FriendRequest.ignored_at.is_(None)),
+                FriendRequest.requester_id == user_id,
+            )
+        )
         .order_by(FriendRequest.updated_at.desc(), FriendRequest.id.desc())
         .limit(80)
     )
@@ -93,7 +100,8 @@ async def _friend_request_notifications(db: AsyncSession, user_id: int) -> list[
                 actor=UserPublic.model_validate(actor) if actor is not None else None,
                 friend_request_id=request.id,
                 action="friend_request" if pending else "none",
-                payload={"status": request.status.value, "incoming": incoming},
+                # 收到的申请处理完了 = 是我自己处理的，不算新通知
+                payload={"status": request.status.value, "incoming": incoming, "self_handled": incoming and not pending},
             )
         )
     return items
@@ -136,7 +144,11 @@ async def _group_join_notifications(db: AsyncSession, user_id: int) -> list[Unif
                 conversation_avatar_url=conversation.avatar_url if conversation is not None else None,
                 group_join_request_id=request.id,
                 action="group_join_request" if pending else "open_conversation",
-                payload={"status": request.status.value, "incoming": incoming},
+                payload={
+                    "status": request.status.value,
+                    "incoming": incoming,
+                    "self_handled": incoming and not pending and request.reviewer_id == user_id,
+                },
             )
         )
     return items
@@ -376,6 +388,26 @@ async def _jury_notifications(db: AsyncSession, user_id: int) -> list[UnifiedNot
     ]
 
 
+def _as_utc(value: datetime | None) -> datetime | None:
+    # SQLite 读回来的时间不带时区；库里存的都是 UTC
+    if value is None:
+        return None
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
+async def get_seen_at(db: AsyncSession, user_id: int) -> datetime | None:
+    result = await db.execute(select(User.notifications_seen_at).where(User.id == user_id))
+    return _as_utc(result.scalar_one_or_none())
+
+
+async def mark_seen(db: AsyncSession, user_id: int) -> datetime:
+    """通知中心「看过了」：之后来的通知才算新的。"""
+    now = datetime.now(UTC)
+    await db.execute(update(User).where(User.id == user_id).values(notifications_seen_at=now).execution_options(synchronize_session=False))
+    await db.commit()
+    return now
+
+
 async def list_unified_notifications(db: AsyncSession, user_id: int, limit: int = 100) -> UnifiedNotificationListRead:
     groups = await _group_join_notifications(db, user_id)
     friends = await _friend_request_notifications(db, user_id)
@@ -392,12 +424,21 @@ async def list_unified_notifications(db: AsyncSession, user_id: int, limit: int 
     items.extend(await account_level_service.notification_items(db, user_id))
     items.sort(key=lambda item: item.time, reverse=True)
     items = items[:limit]
+    # 只提醒一次：动态类通知仍按各自的已读标记；其余类别一律按「上次打开通知中心」之后来的才算新（pending 和这个无关）
+    seen_at = await get_seen_at(db, user_id)
+    for item in items:
+        if item.category != "post":
+            # 自己刚处理掉的申请（updated_at 因此变新）不该再给自己算一条新通知
+            item.unread = not item.payload.get("self_handled") and (seen_at is None or _as_utc(item.time) > seen_at)
+    new_count = sum(1 for item in items if item.unread)
     counts = {"all": len(items), "friend": 0, "group": 0, "post": 0, "interact": 0, "system": 0}
     for item in items:
         counts[item.category] = counts.get(item.category, 0) + 1
     return UnifiedNotificationListRead(
         items=items,
-        unread_count=sum(1 for item in items if item.unread),
+        unread_count=new_count,
+        new_count=new_count,
+        seen_at=seen_at,
         pending_count=sum(1 for item in items if item.pending),
         counts=counts,
     )

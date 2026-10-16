@@ -11,8 +11,11 @@
 指到那里、清掉外部环境带进来的同名变量，再 import app.*，所以不会连到任何真实
 数据库或外部服务。说明见 docs/jury-demo.md。
 
-假数据按期分函数（seed_base、seed_phase1、seed_phase2、seed_phase3）。以后再加数据往 PHASES 里追加
+假数据按期分函数（seed_base、seed_phase1、seed_phase2、seed_phase3、seed_red_packets、seed_gifts）。以后再加数据往 PHASES 里追加
 新函数即可：已经灌过的期不会重跑。
+
+红包（docs/red-packets.md）也顺手开着：演示实例没有真的余额来源，这里注入一个只存在于本脚本里的假账本（DemoCoinLedger），
+绑定了 CCW 的演示账号各有 1000 金币。礼物（docs/gifts.md）同样开着，另外有一个今天过生日的账号、一件快到期的限时头像框。
 """
 
 from __future__ import annotations
@@ -493,7 +496,13 @@ def _bind_app_modules() -> None:
     from app.services import jury_reviews as review_service
     from app.services import jury_settings
     from app.services import penalties as penalty_service
+    from app.models.gift import GiftRecord
+    from app.models.shop import ShopItem, ShopPurchase
+    from app.services import birthdays as birthday_service
+    from app.services import gifts as gift_service
+    from app.services import red_packets as red_packet_service
     from app.services import reports as report_service
+    from app.services import shop as shop_service
 
     globals().update({name: value for name, value in locals().items() if not name.startswith("_")})
 
@@ -2862,8 +2871,149 @@ async def seed_phase3(s: Seeder) -> None:
     await db.commit()
 
 
+# ====================================================================== 红包（docs/red-packets.md）
+
+# 假账本给每个绑定了 CCW 的演示账号记多少累计投币
+DEMO_COINS = 1000
+
+
+def install_demo_ledger() -> None:
+    """给演示实例一个假的余额来源：凡是演示账号的 CCW 标识（demo 开头）都算累计投了 DEMO_COINS 个币。
+
+    只在这个脚本的进程里生效（integrations.set_coin_ledger），不发任何外部请求；灌数据和之后起的服务是同一个进程，所以都用它。
+    """
+    from app import integrations
+    from app.integrations import CoinLedger, LedgerSource
+
+    class DemoCoinLedger(CoinLedger):
+        def configured(self) -> bool:
+            return True
+
+        def source(self) -> LedgerSource:
+            return LedgerSource(id="jury-demo", setting=None)
+
+        def topup_url(self) -> str | None:
+            return None
+
+        async def credited_to(self, account_id: str) -> int:
+            return DEMO_COINS if account_id.startswith("demo") else 0
+
+        async def recent_credits(self, limit: int | None = None) -> dict[str, int]:
+            credits = await self.all_credits()
+            return dict(list(credits.items())[:limit]) if limit is not None else credits
+
+        async def all_credits(self, *, fresh: bool = False) -> dict[str, int]:
+            async with AsyncSessionLocal() as db:
+                rows = await db.execute(select(User.ccw_student_oid).where(User.ccw_student_oid.like("demo%")))
+                return {oid.strip().lower(): DEMO_COINS for oid in rows.scalars().all()}
+
+    integrations.set_coin_ledger(DemoCoinLedger())
+
+
+async def seed_red_packets(s: Seeder) -> None:
+    """打开红包开关，在「深夜灌水小分队」里放三个红包：一个进行中的拼手气（被抢了 3 份）、一个已抢完的拼手气、一个没人动过的普通红包。
+
+    都走服务层（扣款、分份、落消息、领取），所以余额、明细、手气最佳都是真的。时间就是灌数据的时刻，24 小时后过期。
+    """
+    db = s.db
+    await s.load()
+    db.add(SystemSetting(key="red_packet.enabled", value="1"))
+    await db.commit()
+    red_packet_service.reset_cache()
+    lounge = s.conversation_ids["lounge"]
+
+    async def send(sender: str, kind: str, amount: int, count: int, greeting: str) -> int:
+        result, _message = await red_packet_service.send_red_packet(
+            db, await s.user(sender), {"conversation_id": lounge, "kind": kind, "amount": amount, "count": count, "greeting": greeting}
+        )
+        return result["red_packet"]["id"]
+
+    async def claim(packet_id: int, *usernames: str) -> None:
+        for username in usernames:
+            await red_packet_service.claim(db, await s.user(username), packet_id)
+
+    finished = await send("senior1", "lucky", 60, 5, "开工大吉")
+    await claim(finished, "juror", "trainee1", "trainee2", "regular2", "senior2")
+    active = await send("juror", "lucky", 88, 8, "周末愉快，手快有")
+    await claim(active, "trainee1", "senior1", "regular2")
+    untouched = await send("senior2", "normal", 5, 6, "恭喜发财")
+    db.add(SystemSetting(key="jury_demo.red_packets", value=json.dumps({"finished": finished, "active": active, "untouched": untouched})))
+    await db.commit()
+    # 灌数据时攒下的实时推送（没人在线，发不到哪儿去）在这个事件循环里跑完，别带到服务的事件循环里
+    await shop_service.drain()
+
+
+# ====================================================================== 礼物、生日、限时商品（docs/gifts.md、docs/shop.md 2.5）
+
+
+async def seed_gifts(s: Seeder) -> None:
+    """打开礼物开关，灌四条送礼记录；trainee1 今天过生日；juror 戴着一件两天后到期的限时头像框。
+
+    都走服务层（扣款、记录、心意值、对方的拥有记录、落消息），所以余额、心意榜、礼物墙都是真的。时间就是灌数据的时刻：
+    「今天生日」只在灌数据的那一天（UTC+8）成立，放久了要 --reset。
+    """
+    db = s.db
+    await s.load()
+    # 商品和礼物目录平时是服务启动时播种的；灌数据在那之前，这里先播一遍（幂等）
+    await shop_service.ensure_default_items(db)
+    await gift_service.ensure_default_gifts(db)
+    db.add(SystemSetting(key="gifts.enabled", value="1"))
+    await db.commit()
+    gift_service.reset_cache()
+    lounge = s.conversation_ids["lounge"]
+
+    # 今天（UTC+8）过生日的账号。年份用闰年，哪一天灌数据日期都合法
+    today = datetime.now(UTC).astimezone(timezone(timedelta(hours=8))).date()
+    await birthday_service.set_birthday(db, await s.user("trainee1"), {"year": 2008, "month": today.month, "day": today.day, "show_year": False})
+    # 另一个设了生日、公开年份、但不是今天的
+    other = today - timedelta(days=40)
+    await birthday_service.set_birthday(db, await s.user("senior1"), {"year": 2006, "month": other.month, "day": other.day, "show_year": True})
+
+    async def send(sender: str, to: str, conversation_id: int | None, **extra: Any) -> int:
+        payload = {"to_user_id": s.uid(to), "conversation_id": conversation_id, "kind": "gift", "count": 1, "message": None, **extra}
+        result, _message = await gift_service.send_gift(db, await s.user(sender), payload)
+        return result["record"]["id"]
+
+    records = {
+        # 生日当天、带留言、在群里（on_birthday = true，群成员都看得到卡片上的留言）
+        "birthday": await send("juror", "trainee1", lounge, gift_key="cake", count=3, message="生日快乐！今天你最大"),
+        # 送一件头像框（限时 30 天）
+        "frame": await send("senior1", "trainee1", lounge, kind="item", item_sku="frame.angel", message="戴上试试"),
+        # 从个人空间送的：不落消息，留言只有双方看得到
+        "profile": await send("senior2", "juror", None, gift_key="flower", count=9, message="谢谢你上次帮忙看案子"),
+        # 全屏动效的那一档，不带留言
+        "rocket": await send("regular2", "senior1", lounge, gift_key="rocket"),
+    }
+
+    # juror：一件快到期的限时头像框，戴着。先按 30 天送，再把到期时间改到两天后 —— 清扫会发一次 shop.item.expiring，
+    # 两天后到期：自动卸下、发 shop.item.expired
+    devil = (await db.execute(select(ShopItem).where(ShopItem.sku == "frame.devil"))).scalar_one()
+    await shop_service.admin_grant(db, await s.user("admin"), s.uid("juror"), devil.id, "演示：快到期的限时头像框")
+    expires_at = datetime.now(UTC) + timedelta(days=2)
+    await db.execute(
+        update(ShopPurchase)
+        .where(ShopPurchase.user_id == s.uid("juror"), ShopPurchase.item_id == devil.id, ShopPurchase.superseded_at.is_(None))
+        .values(expires_at=expires_at, expiring_notified_at=None)
+    )
+    await db.commit()
+    await shop_service.set_equipped(db, await s.user("juror"), "frame", "frame.devil")
+    db.add(SystemSetting(key="jury_demo.gifts", value=json.dumps({**records, "birthday_user": s.uid("trainee1"), "expiring_user": s.uid("juror")})))
+    await db.commit()
+    await s.stamp_new(s.now)
+    await db.commit()
+    # 灌数据时攒下的实时推送（没人在线，发不到哪儿去）在这个事件循环里跑完，别带到服务的事件循环里
+    await shop_service.drain()
+
+
 # 以后再加数据往这里追加（名字, 函数）。已经灌过的期不会重跑。
-PHASES: list[tuple[str, Any]] = [("base", seed_base), ("phase1", seed_phase1), ("phase2", seed_phase2), ("phase3", seed_phase3)]
+PHASES: list[tuple[str, Any]] = [
+    ("base", seed_base),
+    ("phase1", seed_phase1),
+    ("phase2", seed_phase2),
+    ("phase3", seed_phase3),
+    ("red_packets", seed_red_packets),
+    ("gifts", seed_gifts),
+]
 
 
 # ====================================================================== 建库与自检
@@ -2922,6 +3072,9 @@ async def prepare_database() -> None:
     overview_service.reset_overview_cache()
     points_service.reset_leaderboard_cache()
     jury_settings.reset_cache()
+    shop_service.reset_runtime_state()
+    red_packet_service.reset_runtime_state()
+    gift_service.reset_runtime_state()
     # 两者也不在同一个事件循环里：把连接池清掉，服务启动时重新连
     await engine.dispose()
 
@@ -3212,6 +3365,8 @@ def main() -> None:
         reset_demo_files()
     _bind_app_modules()
     verify_settings()
+    # 红包要有余额才能发：演示实例用假账本（只在这个进程里）
+    install_demo_ledger()
     asyncio.run(prepare_database())
     print_accounts(args.host, args.port)
     if args.seed_only:

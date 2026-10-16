@@ -22,6 +22,7 @@ from app.models.report import AdminAuditLog, ContentModerationRecord, PasswordRe
 from app.models.user import AuthSession, User
 from app.schemas.report import AdminBanPage, AdminBanRead, AdminConversationRead, AdminConversationUpdate, AdminPasswordResetReview, AdminUserCreate, AdminUserPasswordReset, AdminUserRead, BanEvidence, ReportConversationContext, ReportCreate, ReportRead, ReportReview, ReportTargetContext
 from app.schemas.user import UserPublic
+from app.services.birthdays import admin_birthday
 from app.services.messages import admin_recall_message, get_visible_message_for_user
 from app.services.upload_paths import require_message_image_upload_url
 from app.services import cases as case_service
@@ -1357,8 +1358,10 @@ async def _list_admin_users(db: AsyncSession, limit: int = 100, offset: int = 0,
     )
     moderation_latest = await _latest_moderation_by_user(db, user_ids)
 
+    # 先铺一层公开资料（CCW 绑定、账号等级、装扮……都是用户这一行上的列），再叠后台专有的字段。
+    # 以前是逐个字段手写的，UserPublic 上后来加的字段到不了后台：已绑定的用户在后台显示成「未绑定」、等级恒为 0
     return [
-        AdminUserRead(
+        AdminUserRead(**{**UserPublic.model_validate(user).model_dump(), **dict(
             id=user.id,
             username=user.username,
             nickname=user.nickname,
@@ -1369,6 +1372,10 @@ async def _list_admin_users(db: AsyncSession, limit: int = 100, offset: int = 0,
             banned_until=user.banned_until,
             ban_reason=user.ban_reason,
             created_at=user.created_at,
+            # 心意值和生日（docs/gifts.md、docs/chat-features.md 第 8 节）。后台总是带完整生日（含年份），不管本人选没选公开
+            charm=user.charm or 0,
+            birthday=admin_birthday(user),
+            is_birthday_today=user.is_birthday_today,
             email=user.email,
             updated_at=user.updated_at,
             content_moderation_whitelisted=user.content_moderation_whitelisted,
@@ -1390,7 +1397,7 @@ async def _list_admin_users(db: AsyncSession, limit: int = 100, offset: int = 0,
             active_session_count=active_sessions.get(user.id, {}).get("count", 0),
             last_session_ip=active_sessions.get(user.id, {}).get("ip"),
             last_session_at=active_sessions.get(user.id, {}).get("at"),
-        )
+        )})
         for user in users
     ]
 

@@ -30,13 +30,23 @@ from app.models.shop import ShopAccount, ShopItem, ShopPurchase
 from app.models.user import User
 from app.schemas.user import UserPublic, parse_cosmetics
 from app.services import shop as shop_service
-from app.services.shop_style import ANIMATIONS, ORNAMENTS, PATTERNS, StyleError, validate_bubble_style
+from app.services.shop_style import (
+    ANIMATIONS,
+    FRAME_ANIMATIONS,
+    FRAME_ORNAMENTS,
+    FRAME_POSITIONS,
+    ORNAMENTS,
+    PATTERNS,
+    StyleError,
+    validate_bubble_style,
+    validate_frame_style,
+)
 from app.websocket.manager import manager
 from integration_fakes import TOPUP_URL, FakeCoinLedger
 
 TABLES = [
     Base.metadata.tables[name]
-    for name in ("users", "shop_items", "shop_purchases", "shop_accounts", "admin_audit_logs")
+    for name in ("users", "shop_items", "shop_purchases", "shop_accounts", "admin_audit_logs", "red_packets", "red_packet_shares", "gifts", "gift_records", "group_plus_records", "conversations")
 ]
 CREATION = "c0ffee" * 4
 OID_A, OID_B, OID_D, OID_X = "a" * 24, "b" * 24, "d" * 24, "e" * 24
@@ -67,6 +77,25 @@ STYLE: dict[str, Any] = {
 PLAIN = {"version": 1, "background": "#112233", "text": "#ffffff"}
 PATTERN = {"key": "dots", "color": "#ffffff", "opacity": 0.2}
 ORNAMENT = {"key": "star", "corner": "tr", "color": "#ffcc00", "size": 16}
+# 契约 2.4 里的例子
+FRAME: dict[str, Any] = {
+    "version": 1,
+    "ring": {"background": "conic-gradient(from 0deg, #7F7FD5, #91EAE4, #7F7FD5)", "width": 3, "gap": 1},
+    "glow": {"color": "#7F7FD588", "blur": 8},
+    "animation": "spin",
+    "ornaments": [{"key": "crown", "position": "top", "color": "#ffd76a", "size": 18, "animated": False}],
+    "dark": {"ring": {"background": "#9a9af0"}, "glow": {"color": "#9a9af066", "blur": 10}},
+}
+RING = {"background": "#112233", "width": 3}
+PLAIN_FRAME: dict[str, Any] = {"version": 1, "ring": RING}
+FRAME_ORNAMENT = {"key": "halo", "position": "top", "color": "#ffcc00", "size": 16}
+# 没发过也没抢过红包的人，balance 对象里红包那三项都是 0；全站一个红包都没有时对账结果里的红包账
+# 没有红包、也没送过礼时 balance 对象里的那几项
+NO_PACKETS = {"red_packet_sent": 0, "red_packet_received": 0, "red_packet_refunded": 0, "gift_spent": 0, "group_plus_spent": 0}
+NO_PACKET_LEDGER = {"total_sent": 0, "total_claimed": 0, "total_refunded": 0, "outstanding": 0, "balanced": True, "problems": []}
+NO_PLUS_LEDGER = {"total_amount": 0, "total_count": 0, "granted_count": 0, "revoked_count": 0, "balanced": True, "problems": []}
+NO_GIFT_LEDGER = {"total_amount": 0, "total_count": 0, "total_charm": 0, "total_received": 0, "balanced": True, "problems": []}
+CATEGORIES_VIEW = [{"key": "bubble", "label": "气泡", "slot": "bubble"}, {"key": "frame", "label": "头像框", "slot": "frame"}]
 
 
 class ShopTestCase(unittest.IsolatedAsyncioTestCase):
@@ -148,13 +177,14 @@ class ShopTestCase(unittest.IsolatedAsyncioTestCase):
 
     async def _item(self, sku: str, price: int = 0, unlock_level: int | None = None, style: dict[str, Any] | None = None, **extra: Any) -> int:
         async with self.sessions() as db:
+            category = extra.pop("category", "bubble")
             item = ShopItem(
                 sku=sku,
-                category=extra.pop("category", "bubble"),
+                category=category,
                 name=extra.pop("name", sku),
                 price=price,
                 unlock_level=unlock_level,
-                style=json.dumps(validate_bubble_style(style or STYLE)),
+                style=json.dumps(shop_service.CATEGORIES[category].validate(style or (FRAME if category == "frame" else STYLE))),
                 **extra,
             )
             db.add(item)
@@ -537,6 +567,267 @@ class StyleValidationTests(unittest.TestCase):
         self.assertEqual(source, STYLE)
 
 
+class FrameStyleValidationTests(unittest.TestCase):
+    def _field(self, style: Any) -> str:
+        with self.assertRaises(StyleError) as caught:
+            validate_frame_style(style)
+        return caught.exception.field
+
+    def test_contract_example_is_valid_and_canonical(self) -> None:
+        cleaned = validate_frame_style(FRAME)
+        self.assertEqual(cleaned, FRAME)
+        self.assertEqual(list(cleaned), ["version", "ring", "glow", "animation", "ornaments", "dark"])
+        self.assertEqual((list(cleaned["ring"]), list(cleaned["ornaments"][0])), (["background", "width", "gap"], ["key", "position", "color", "size", "animated"]))
+        # 规范形式再校验一遍还是它自己；入参不被改动
+        self.assertEqual(validate_frame_style(cleaned), cleaned)
+        source = json.loads(json.dumps(FRAME))
+        validate_frame_style(source)
+        self.assertEqual(source, FRAME)
+        # 两个类别的样式互不通用
+        with self.assertRaises(StyleError):
+            validate_bubble_style(FRAME)
+        self.assertEqual(self._field(STYLE), "background")
+
+    def test_accepted_variants(self) -> None:
+        for background in (
+            "#abc",
+            "#A1b2C3",
+            "#a1b2c3d4",
+            "linear-gradient(135deg, #fff 0%, #000 100%)",
+            "radial-gradient(#ffffff 0%, #00000080 100%)",
+            "conic-gradient(#fff, #000)",
+            "conic-gradient(from 0deg, #7F7FD5, #91EAE4, #7F7FD5)",
+            "conic-gradient(from -90deg, #fff 0%, #000 50%, #fff 100%)",
+            "conic-gradient(from 22.5deg, #fff 12.5%, #000)",
+            "conic-gradient(from 360deg, #111, #222, #333, #444, #555, #666, #777, #888)",
+        ):
+            with self.subTest(background=background):
+                cleaned = validate_frame_style({**PLAIN_FRAME, "ring": {**RING, "background": background}, "dark": {"ring": {"background": background}}})
+                self.assertEqual((cleaned["ring"]["background"], cleaned["dark"]["ring"]["background"]), (background, background))
+        for width, gap in ((2, 0), (6, 3), (2.5, 1.5), (4.0, 1.0)):
+            self.assertEqual(validate_frame_style({**PLAIN_FRAME, "ring": {**RING, "width": width, "gap": gap}})["ring"], {**RING, "width": width, "gap": gap})
+        self.assertIs(type(validate_frame_style({**PLAIN_FRAME, "ring": {**RING, "width": 4.0}})["ring"]["width"]), int)
+        for blur in (0, 16, 7.5):
+            self.assertEqual(validate_frame_style({**PLAIN_FRAME, "glow": {"color": "#abc", "blur": blur}})["glow"], {"color": "#abc", "blur": blur})
+        self.assertEqual(FRAME_ANIMATIONS, ("none", "spin", "pulse", "shimmer"))
+        for animation in FRAME_ANIMATIONS:
+            self.assertEqual(validate_frame_style({**PLAIN_FRAME, "animation": animation})["animation"], animation)
+
+    def test_nullable_fields_and_whitespace_are_normalized(self) -> None:
+        cleaned = validate_frame_style(
+            {
+                "version": 1,
+                "ring": {"background": "conic-gradient(  from   0deg ,#fff   0% ,  #000 100%  )", "width": 3.0, "gap": None},
+                "glow": None,
+                "animation": None,
+                "ornaments": None,
+                "dark": {"ring": {"background": None}, "glow": None},
+            }
+        )
+        self.assertEqual(cleaned, {"version": 1, "ring": {"background": "conic-gradient(from 0deg, #fff 0%, #000 100%)", "width": 3}})
+        for empty in ({"ornaments": []}, {"dark": {}}, {"dark": {"ring": None}}, {"dark": {"ring": {}}}):
+            self.assertEqual(validate_frame_style({**PLAIN_FRAME, **empty}), PLAIN_FRAME)
+        # 深色覆盖：环的底色和外发光可以各写各的，顺序规范化
+        dark = {"glow": {"blur": 4, "color": "#fff"}, "ring": {"background": "#000"}}
+        cleaned = validate_frame_style({**PLAIN_FRAME, "dark": dark})["dark"]
+        self.assertEqual((cleaned, list(cleaned), list(cleaned["glow"])), (dark, ["ring", "glow"], ["color", "blur"]))
+        for key, value in dark.items():
+            self.assertEqual(validate_frame_style({**PLAIN_FRAME, "dark": {key: value}})["dark"], {key: value})
+
+    def test_conic_gradient_is_only_for_the_ring(self) -> None:
+        conic = "conic-gradient(from 0deg, #fff, #000)"
+        # 气泡的底色（包括深色覆盖）不放开
+        with self.assertRaises(StyleError) as caught:
+            validate_bubble_style({**PLAIN, "background": conic})
+        self.assertEqual((caught.exception.field, "conic" in caught.exception.message), ("background", False))
+        with self.assertRaises(StyleError) as caught:
+            validate_bubble_style({**PLAIN, "dark": {"background": conic}})
+        self.assertEqual(caught.exception.field, "dark.background")
+        with self.assertRaises(StyleError) as caught:
+            validate_frame_style({**PLAIN_FRAME, "ring": {**RING, "background": "url(x)"}})
+        self.assertIn("conic-gradient", caught.exception.message)
+
+    def test_injection_attempts_are_rejected(self) -> None:
+        for background in (
+            "url(https://evil.example/x.png)",
+            "url('javascript:alert(1)')",
+            "expression(alert(1))",
+            "#fff; position: fixed",
+            "conic-gradient(from 0deg, #fff, #000); color: red",
+            "conic-gradient(from 0deg, #fff, url(x))",
+            "conic-gradient(from 0deg, #fff, #000) , url(x)",
+            "conic-gradient(from 0deg, #fff, #000), conic-gradient(#fff, #000)",
+            "conic-gradient(from 0deg, #fff, var(--x))",
+            "conic-gradient(from 0deg, #fff, rgba(0,0,0,.5))",
+            "conic-gradient(from 0deg, red, blue)",
+            "conic-gradient(from 0deg, #fff)",
+            "conic-gradient(from 0deg, #fff 0%, #000 101%)",
+            "conic-gradient(from 361deg, #fff, #000)",
+            # from 只能在最前面、只能带 deg 角度；at 位置、按角度写的色标、别的单位都不行
+            "conic-gradient(#fff, from 0deg, #000)",
+            "conic-gradient(0deg, #fff, #000)",
+            "conic-gradient(from 0deg at 50% 50%, #fff, #000)",
+            "conic-gradient(at 50% 50%, #fff, #000)",
+            "conic-gradient(from 0.5turn, #fff, #000)",
+            "conic-gradient(from 1rad, #fff, #000)",
+            "conic-gradient(from 0, #fff, #000)",
+            "conic-gradient(from deg, #fff, #000)",
+            "conic-gradient(from 0deg from 90deg, #fff, #000)",
+            "conic-gradient(from 0deg, #fff 0deg, #000 180deg)",
+            "conic-gradient(from 0deg, #fff 10px, #000)",
+            "conic-gradient(from 0deg, #fff, #000",
+            "conic-gradient(from 0deg, #fff, #000))",
+            "conic-gradient(from 0deg, #fff,\n#000)",
+            "conic-gradient(from ０deg, #fff, #000)",
+            "conic-gradient(from 0deg, #fff, #000, #111, #222, #333, #444, #555, #666, #777)",
+            "conic-gradient(from 0deg, #fff, #000) /* x */",
+            "repeating-conic-gradient(#fff, #000)",
+            "CONIC-GRADIENT(#fff, #000)",
+            "linear-gradient(from 0deg, #fff, #000)",
+            "radial-gradient(from 0deg, #fff, #000)",
+            "linear-gradient(to right, #fff, #000)",
+            "red",
+            "transparent",
+            "#ffff",
+            " #fff",
+            "",
+            "#fff" + " " * 300,
+            123,
+            ["#fff"],
+        ):
+            with self.subTest(background=background):
+                self.assertEqual(self._field({**PLAIN_FRAME, "ring": {**RING, "background": background}}), "ring.background")
+                self.assertEqual(self._field({**PLAIN_FRAME, "dark": {"ring": {"background": background}}}), "dark.ring.background")
+
+    def test_bad_fields_are_named(self) -> None:
+        glow = {"color": "#fff", "blur": 4}
+        cases: list[tuple[Any, str]] = [
+            ("not a dict", "style"),
+            (None, "style"),
+            ([PLAIN_FRAME], "style"),
+            ({**PLAIN_FRAME, "version": 2}, "version"),
+            ({**PLAIN_FRAME, "version": "1"}, "version"),
+            ({**PLAIN_FRAME, "version": True}, "version"),
+            ({"ring": RING}, "version"),
+            ({"version": 1}, "ring"),
+            ({"version": 1, "ring": None}, "ring"),
+            ({"version": 1, "ring": "#fff"}, "ring"),
+            ({"version": 1, "ring": {"width": 3}}, "ring.background"),
+            ({"version": 1, "ring": {"background": None, "width": 3}}, "ring.background"),
+            ({"version": 1, "ring": {"background": "#fff"}}, "ring.width"),
+            # 超范围的数值
+            ({"version": 1, "ring": {**RING, "width": 1}}, "ring.width"),
+            ({"version": 1, "ring": {**RING, "width": 7}}, "ring.width"),
+            ({"version": 1, "ring": {**RING, "width": "3px"}}, "ring.width"),
+            ({"version": 1, "ring": {**RING, "width": True}}, "ring.width"),
+            ({"version": 1, "ring": {**RING, "width": float("nan")}}, "ring.width"),
+            ({"version": 1, "ring": {**RING, "gap": -1}}, "ring.gap"),
+            ({"version": 1, "ring": {**RING, "gap": 3.5}}, "ring.gap"),
+            ({"version": 1, "ring": {**RING, "gap": "1"}}, "ring.gap"),
+            ({**PLAIN_FRAME, "glow": "#fff"}, "glow"),
+            ({**PLAIN_FRAME, "glow": {"blur": 4}}, "glow.color"),
+            ({**PLAIN_FRAME, "glow": {"color": "gold", "blur": 4}}, "glow.color"),
+            ({**PLAIN_FRAME, "glow": {"color": "#fff;", "blur": 4}}, "glow.color"),
+            ({**PLAIN_FRAME, "glow": {"color": "#fff"}}, "glow.blur"),
+            ({**PLAIN_FRAME, "glow": {**glow, "blur": 17}}, "glow.blur"),
+            ({**PLAIN_FRAME, "glow": {**glow, "blur": -1}}, "glow.blur"),
+            ({**PLAIN_FRAME, "glow": {**glow, "blur": "8px"}}, "glow.blur"),
+            ({**PLAIN_FRAME, "animation": "flow"}, "animation"),
+            ({**PLAIN_FRAME, "animation": "breathe"}, "animation"),
+            ({**PLAIN_FRAME, "animation": "spin 1s infinite"}, "animation"),
+            ({**PLAIN_FRAME, "animation": 1}, "animation"),
+            # 多余的属性：气泡的字段在这里也不认
+            ({**PLAIN_FRAME, "background": "#fff"}, "background"),
+            ({**PLAIN_FRAME, "text": "#fff"}, "text"),
+            ({**PLAIN_FRAME, "pattern": PATTERN}, "pattern"),
+            ({**PLAIN_FRAME, "css": "body{display:none}"}, "css"),
+            ({**PLAIN_FRAME, "image": "https://evil.example/f.png"}, "image"),
+            ({"version": 1, "ring": {**RING, "style": "dashed"}}, "ring.style"),
+            ({"version": 1, "ring": {**RING, "image": "x.png"}}, "ring.image"),
+            ({**PLAIN_FRAME, "glow": {**glow, "spread": 2}}, "glow.spread"),
+            # 深色覆盖里只有 ring.background 和 glow
+            ({**PLAIN_FRAME, "dark": "#000"}, "dark"),
+            ({**PLAIN_FRAME, "dark": {"ring": "#000"}}, "dark.ring"),
+            ({**PLAIN_FRAME, "dark": {"ring": {"background": "#000", "width": 3}}}, "dark.ring.width"),
+            ({**PLAIN_FRAME, "dark": {"ring": {"gap": 1}}}, "dark.ring.gap"),
+            ({**PLAIN_FRAME, "dark": {"glow": {"color": "#000"}}}, "dark.glow.blur"),
+            ({**PLAIN_FRAME, "dark": {"glow": {**glow, "blur": 99}}}, "dark.glow.blur"),
+            ({**PLAIN_FRAME, "dark": {"animation": "spin"}}, "dark.animation"),
+            ({**PLAIN_FRAME, "dark": {"ornaments": [FRAME_ORNAMENT]}}, "dark.ornaments"),
+            ({**PLAIN_FRAME, "dark": {"background": "#000"}}, "dark.background"),
+            ({**PLAIN_FRAME, "dark": {"dark": {}}}, "dark.dark"),
+        ]
+        for style, field in cases:
+            with self.subTest(style=style):
+                self.assertEqual(self._field(style), field)
+
+    def test_ornaments_accept_only_builtin_names(self) -> None:
+        self.assertEqual(FRAME_ORNAMENTS, (*ORNAMENTS, "cat_ears", "halo", "horns", "laurel", "wings", "bow"))
+        self.assertEqual(FRAME_POSITIONS, ("top", "tr", "right", "br", "bottom", "bl", "left", "tl"))
+        for key in FRAME_ORNAMENTS:
+            ornament = {**FRAME_ORNAMENT, "key": key}
+            self.assertEqual(validate_frame_style({**PLAIN_FRAME, "ornaments": [ornament]})["ornaments"], [ornament])
+        for position in FRAME_POSITIONS:
+            ornament = {**FRAME_ORNAMENT, "position": position}
+            self.assertEqual(validate_frame_style({**PLAIN_FRAME, "ornaments": [ornament]})["ornaments"], [ornament])
+        # 头像框专用的那几个，气泡不能用
+        for key in ("cat_ears", "halo", "horns", "laurel", "wings", "bow"):
+            with self.assertRaises(StyleError) as caught:
+                validate_bubble_style({**PLAIN, "ornaments": [{**ORNAMENT, "key": key}]})
+            self.assertEqual(caught.exception.field, "ornaments[0].key")
+        # 最多 3 个；边界值、可空的 animated
+        three = [
+            {**FRAME_ORNAMENT, "size": 10, "animated": False},
+            {**FRAME_ORNAMENT, "key": "star", "position": "bl", "size": 28.0, "animated": None},
+            {**FRAME_ORNAMENT, "key": "wings", "position": "left", "animated": True},
+        ]
+        self.assertEqual(
+            validate_frame_style({**PLAIN_FRAME, "ornaments": three})["ornaments"],
+            [
+                {**FRAME_ORNAMENT, "size": 10, "animated": False},
+                {**FRAME_ORNAMENT, "key": "star", "position": "bl", "size": 28},
+                {**FRAME_ORNAMENT, "key": "wings", "position": "left", "animated": True},
+            ],
+        )
+        bad: list[tuple[Any, str]] = [
+            ({"key": "halo"}, "ornaments"),
+            ("halo", "ornaments"),
+            ([*three, {**FRAME_ORNAMENT, "position": "right"}], "ornaments"),
+            (["halo"], "ornaments[0]"),
+            ([None], "ornaments[0]"),
+            ([{k: v for k, v in FRAME_ORNAMENT.items() if k != "key"}], "ornaments[0].key"),
+            ([{**FRAME_ORNAMENT, "key": "dragon"}], "ornaments[0].key"),
+            ([{**FRAME_ORNAMENT, "key": "cat-ears"}], "ornaments[0].key"),
+            ([{**FRAME_ORNAMENT, "key": "stars"}], "ornaments[0].key"),
+            ([{**FRAME_ORNAMENT, "key": "https://evil.example/o.svg"}], "ornaments[0].key"),
+            ([{**FRAME_ORNAMENT, "key": "<svg onload=alert(1)>"}], "ornaments[0].key"),
+            ([{**FRAME_ORNAMENT, "key": 1}], "ornaments[0].key"),
+            ([{**FRAME_ORNAMENT, "url": "https://evil.example/o.svg"}], "ornaments[0].url"),
+            ([{**FRAME_ORNAMENT, "svg": "<svg/>"}], "ornaments[0].svg"),
+            # 位置字段叫 position，不是气泡的 corner
+            ([{**FRAME_ORNAMENT, "corner": "tr"}], "ornaments[0].corner"),
+            ([{k: v for k, v in FRAME_ORNAMENT.items() if k != "position"}], "ornaments[0].position"),
+            ([{**FRAME_ORNAMENT, "position": "center"}], "ornaments[0].position"),
+            ([{**FRAME_ORNAMENT, "position": "TOP"}], "ornaments[0].position"),
+            ([{**FRAME_ORNAMENT, "position": "top-right"}], "ornaments[0].position"),
+            ([{**FRAME_ORNAMENT, "position": 0}], "ornaments[0].position"),
+            ([{k: v for k, v in FRAME_ORNAMENT.items() if k != "color"}], "ornaments[0].color"),
+            ([{**FRAME_ORNAMENT, "color": "gold"}], "ornaments[0].color"),
+            ([{k: v for k, v in FRAME_ORNAMENT.items() if k != "size"}], "ornaments[0].size"),
+            ([{**FRAME_ORNAMENT, "size": 9}], "ornaments[0].size"),
+            ([{**FRAME_ORNAMENT, "size": 29}], "ornaments[0].size"),
+            ([{**FRAME_ORNAMENT, "size": "18px"}], "ornaments[0].size"),
+            ([{**FRAME_ORNAMENT, "animated": "yes"}], "ornaments[0].animated"),
+            ([{**FRAME_ORNAMENT, "animated": 1}], "ornaments[0].animated"),
+            # 同一个位置不能放两个；出问题的是第二个
+            ([FRAME_ORNAMENT, {**FRAME_ORNAMENT, "key": "crown"}], "ornaments[1].position"),
+            ([FRAME_ORNAMENT, {**FRAME_ORNAMENT, "position": "bl", "key": "ufo"}], "ornaments[1].key"),
+        ]
+        for ornaments, field in bad:
+            with self.subTest(ornaments=ornaments):
+                self.assertEqual(self._field({**PLAIN_FRAME, "ornaments": ornaments}), field)
+
+
 # ---------------------------------------------------------------- 余额
 
 
@@ -544,15 +835,15 @@ class BalanceTests(ShopTestCase):
     async def test_never_verified_overview_does_not_query_the_ledger(self) -> None:
         self.ledger.donate(OID_A, 100)
         view = await self._overview("alice")
-        self.assertEqual(view["balance"], {"bound": True, "donated": 0, "spent": 0, "balance": 0, "verified_at": None, "stale": False})
-        self.assertEqual((await self._overview("carol"))["balance"], {"bound": False, "donated": 0, "spent": 0, "balance": 0, "verified_at": None, "stale": False})
+        self.assertEqual(view["balance"], {"bound": True, "donated": 0, "spent": 0, "balance": 0, "verified_at": None, "stale": False, **NO_PACKETS})
+        self.assertEqual((await self._overview("carol"))["balance"], {"bound": False, "donated": 0, "spent": 0, "balance": 0, "verified_at": None, "stale": False, **NO_PACKETS})
         self.assertEqual(self.ledger.calls, [])
         self.assertIsNone(await self._account("alice"))
 
     async def test_refresh_asks_the_ledger_once(self) -> None:
         self.ledger.donate(OID_A, 320.9)
         balance = await self._refresh()
-        self.assertEqual(balance, {"bound": True, "donated": 320, "spent": 0, "balance": 320, "verified_at": self.now, "stale": False})
+        self.assertEqual(balance, {"bound": True, "donated": 320, "spent": 0, "balance": 320, "verified_at": self.now, "stale": False, **NO_PACKETS})
         # 问的是用户绑定的那个外部账号
         self.assertEqual(self.ledger.calls, [("credited_to", OID_A)])
         self.assertEqual((await self._overview())["balance"], balance)
@@ -577,7 +868,7 @@ class BalanceTests(ShopTestCase):
     async def test_refresh_for_someone_who_never_donated(self) -> None:
         self.ledger.fill(300)
         balance = await self._refresh("dave")
-        self.assertEqual(balance, {"bound": True, "donated": 0, "spent": 0, "balance": 0, "verified_at": self.now, "stale": False})
+        self.assertEqual(balance, {"bound": True, "donated": 0, "spent": 0, "balance": 0, "verified_at": self.now, "stale": False, **NO_PACKETS})
 
     async def test_ledger_errors_keep_the_last_number_and_mark_stale(self) -> None:
         self.ledger.donate(OID_A, 100)
@@ -588,7 +879,7 @@ class BalanceTests(ShopTestCase):
             self.ledger.error = problem
             with self.subTest(problem=problem):
                 balance = await self._refresh()
-                self.assertEqual(balance, {"bound": True, "donated": 100, "spent": 0, "balance": 100, "verified_at": verified_at, "stale": True})
+                self.assertEqual(balance, {"bound": True, "donated": 100, "spent": 0, "balance": 100, "verified_at": verified_at, "stale": True, **NO_PACKETS})
                 account = await self._account("alice")
                 self.assertEqual((account.donated, account.verify_ok, bool(account.last_error)), (100, False, True))
                 self.assertTrue((await self._overview())["balance"]["stale"])
@@ -596,11 +887,11 @@ class BalanceTests(ShopTestCase):
         self.tick(21)
         self.ledger.error = None
         self.ledger.donate(OID_A, 150)
-        self.assertEqual(await self._refresh(), {"bound": True, "donated": 150, "spent": 0, "balance": 150, "verified_at": self.now, "stale": False})
+        self.assertEqual(await self._refresh(), {"bound": True, "donated": 150, "spent": 0, "balance": 150, "verified_at": self.now, "stale": False, **NO_PACKETS})
 
     async def test_first_ever_refresh_failing(self) -> None:
         self.ledger.error = TimeoutError()
-        self.assertEqual(await self._refresh(), {"bound": True, "donated": 0, "spent": 0, "balance": 0, "verified_at": None, "stale": True})
+        self.assertEqual(await self._refresh(), {"bound": True, "donated": 0, "spent": 0, "balance": 0, "verified_at": None, "stale": True, **NO_PACKETS})
 
     async def test_refresh_requires_binding(self) -> None:
         self.assertEqual((await self._fails(self._refresh("carol")))[:2], (409, "ccw_not_bound"))
@@ -625,7 +916,7 @@ class BalanceTests(ShopTestCase):
         free = await self._item("bubble.free", unlock_level=2)
         for _ in range(3):
             # 没配置时刷新不计入限频，也不建账户
-            self.assertEqual(await self._refresh(), {"bound": True, "donated": 0, "spent": 0, "balance": 0, "verified_at": None, "stale": True})
+            self.assertEqual(await self._refresh(), {"bound": True, "donated": 0, "spent": 0, "balance": 0, "verified_at": None, "stale": True, **NO_PACKETS})
         view = await self._overview()
         self.assertEqual((view["balance"]["stale"], view["donate_url"]), (True, None))
         # 没绑定外部账号的人：不算 stale（本来就没有余额可言）
@@ -664,10 +955,10 @@ class BalanceTests(ShopTestCase):
         self.assertEqual((await self._buy("alice", item))["balance"]["balance"], 40)
         await self._rebind("alice", OID_X)
         # 换绑之后、重新核实之前：原来那个账号的累计投币不算数了
-        self.assertEqual((await self._overview())["balance"], {"bound": True, "donated": 0, "spent": 60, "balance": -60, "verified_at": None, "stale": True})
+        self.assertEqual((await self._overview())["balance"], {"bound": True, "donated": 0, "spent": 60, "balance": -60, "verified_at": None, "stale": True, **NO_PACKETS})
         self.tick(21)
         balance = await self._refresh()
-        self.assertEqual(balance, {"bound": True, "donated": 30, "spent": 60, "balance": -30, "verified_at": self.now, "stale": False})
+        self.assertEqual(balance, {"bound": True, "donated": 30, "spent": 60, "balance": -30, "verified_at": self.now, "stale": False, **NO_PACKETS})
         status_code, code, detail = await self._fails(self._buy("alice", cheap))
         self.assertEqual((status_code, code, detail["balance"], detail["price"], detail["shortfall"]), (402, "insufficient_coins", -30, 20, 50))
         # 后台能看到这个人花的比投的多
@@ -675,7 +966,7 @@ class BalanceTests(ShopTestCase):
         self.assertEqual([(row["user"]["username"], row["donated"], row["spent"], row["balance"], row["mismatch"]) for row in accounts["items"]], [("alice", 30, 60, -30, True)])
         # 解绑：能逛不能买
         await self._rebind("alice", None)
-        self.assertEqual((await self._overview())["balance"], {"bound": False, "donated": 0, "spent": 60, "balance": -60, "verified_at": None, "stale": False})
+        self.assertEqual((await self._overview())["balance"], {"bound": False, "donated": 0, "spent": 60, "balance": -60, "verified_at": None, "stale": False, **NO_PACKETS})
         self.assertEqual((await self._fails(self._buy("alice", cheap)))[:2], (409, "ccw_not_bound"))
 
     async def test_a_ccw_account_cannot_be_spent_twice_by_moving_it(self) -> None:
@@ -687,7 +978,7 @@ class BalanceTests(ShopTestCase):
         await self._rebind("alice", None)
         await self._rebind("carol", OID_A)
         balance = await self._refresh("carol")
-        self.assertEqual(balance, {"bound": True, "donated": 100, "spent": 60, "balance": 40, "verified_at": self.now, "stale": False})
+        self.assertEqual(balance, {"bound": True, "donated": 100, "spent": 60, "balance": 40, "verified_at": self.now, "stale": False, **NO_PACKETS})
         status_code, code, detail = await self._fails(self._buy("carol", sixty))
         self.assertEqual((status_code, code, detail["balance"], detail["shortfall"]), (402, "insufficient_coins", 40, 20))
         self.assertEqual((await self._buy("carol", forty))["balance"]["balance"], 0)
@@ -708,7 +999,7 @@ class PurchaseTests(ShopTestCase):
         result = await self._buy("alice", self.item)
         self.assertEqual(set(result), {"item", "balance", "equipped"})
         self.assertEqual((result["item"]["sku"], result["item"]["owned"], result["item"]["equipped"], result["item"]["obtainable"]), ("bubble.sixty", True, False, "owned"))
-        self.assertEqual(result["balance"], {"bound": True, "donated": 100, "spent": 60, "balance": 40, "verified_at": self.now, "stale": False})
+        self.assertEqual(result["balance"], {"bound": True, "donated": 100, "spent": 60, "balance": 40, "verified_at": self.now, "stale": False, **NO_PACKETS})
         self.assertEqual(result["equipped"], {})
         rows = await self._purchases("alice")
         self.assertEqual([(row.item_id, row.price, row.source, row.ccw_oid, row.revoked_at) for row in rows], [(self.item, 60, "purchase", OID_A, None)])
@@ -1006,8 +1297,10 @@ class EquipTests(ShopTestCase):
     async def test_equip_errors(self) -> None:
         self.assertEqual((await self._fails(self._equip("bob", "bubble.aurora")))[:2], (403, "not_owned"))
         self.assertEqual((await self._fails(self._equip("alice", "bubble.nope")))[:2], (404, "item_not_found"))
+        self.assertEqual((await self._fails(self._equip("alice", "bubble.aurora", slot="nameplate")))[:2], (422, "invalid_slot"))
+        self.assertEqual((await self._fails(self._equip("alice", None, slot="nameplate")))[:2], (422, "invalid_slot"))
+        # 槽是有的，但这件商品不是这个槽的
         self.assertEqual((await self._fails(self._equip("alice", "bubble.aurora", slot="frame")))[:2], (422, "invalid_slot"))
-        self.assertEqual((await self._fails(self._equip("alice", None, slot="frame")))[:2], (422, "invalid_slot"))
         self.assertEqual(((await self._user("bob")).cosmetics, (await self._user("alice")).cosmetics), (None, None))
         self.assertEqual(await self._cosmetics_events(), [])
 
@@ -1142,6 +1435,164 @@ class EquipTests(ShopTestCase):
         self.assertEqual(((await self._public("alice"))["cosmetics"]["bubble"]["sku"], len(await self._cosmetics_events())), ("bubble.plain", sent))
 
 
+class FrameEquipTests(ShopTestCase):
+    """头像框是第二个槽：买、装备、卸下、收回、改样式都和气泡走同一套代码，两个槽互不影响。"""
+
+    async def asyncSetUp(self) -> None:
+        await super().asyncSetUp()
+        self.bubble = await self._item("bubble.aurora", price=10)
+        self.frame = await self._item("frame.ring", price=30, category="frame")
+        self.other = await self._item("frame.plain", price=10, category="frame", style=PLAIN_FRAME)
+        self.reward = await self._item("frame.reward", unlock_level=4, category="frame", style=PLAIN_FRAME)
+        self.ledger.donate(OID_A, 100)
+        self.bubble_entry = {"sku": "bubble.aurora", "style": validate_bubble_style(STYLE)}
+        self.frame_entry = {"sku": "frame.ring", "style": FRAME}
+        self.plain_entry = {"sku": "frame.plain", "style": PLAIN_FRAME}
+
+    async def _public(self, name: str) -> dict[str, Any]:
+        return UserPublic.model_validate(await self._user(name)).model_dump(mode="json")
+
+    async def _equip(self, name: str, sku: str | None, slot: str = "bubble") -> dict[str, Any]:
+        result = await super()._equip(name, sku, slot)
+        # 等这一次的事件发出去再往下走，免得和下一次变化并成一条
+        await shop_service.drain()
+        return result
+
+    async def test_buy_equip_and_unequip(self) -> None:
+        alice = self.ids["alice"]
+        view = await self._overview()
+        self.assertEqual(view["categories"], CATEGORIES_VIEW)
+        self.assertEqual({item["sku"]: (item["category"], item["obtainable"]) for item in view["items"] if item["category"] == "frame"}, {"frame.ring": ("frame", "buy"), "frame.plain": ("frame", "buy"), "frame.reward": ("frame", "locked")})
+        # 没买不能装备
+        self.assertEqual((await self._fails(self._equip("alice", "frame.ring", slot="frame")))[:2], (403, "not_owned"))
+        bought = await self._buy("alice", self.frame)
+        self.assertEqual((bought["item"]["sku"], bought["item"]["category"], bought["item"]["owned"], bought["item"]["style"]), ("frame.ring", "frame", True, FRAME))
+        self.assertEqual((bought["balance"]["spent"], bought["balance"]["balance"], bought["equipped"]), (30, 70, {}))
+        await self._buy("alice", self.other)
+        await self._buy("alice", self.bubble)
+        # 等级够了的头像框免费领，不扣币
+        claimed = await self._buy("alice", self.reward, level=4)
+        self.assertEqual((claimed["item"]["owned"], claimed["balance"]["spent"], [row.source for row in await self._purchases("alice")][-1]), (True, 50, "level"))
+        # 头像框只能装在 frame 槽里，气泡只能装在 bubble 槽里
+        self.assertEqual((await self._fails(self._equip("alice", "frame.ring", slot="bubble")))[:2], (422, "invalid_slot"))
+        self.assertEqual((await self._fails(self._equip("alice", "bubble.aurora", slot="frame")))[:2], (422, "invalid_slot"))
+        self.assertEqual(await self._cosmetics_events(), [])
+
+        self.assertEqual(await self._equip("alice", "frame.ring", slot="frame"), {"equipped": {"frame": "frame.ring"}})
+        self.assertEqual((await self._public("alice"))["cosmetics"], {"frame": self.frame_entry})
+        # 两个槽各装各的
+        self.assertEqual(await self._equip("alice", "bubble.aurora"), {"equipped": {"frame": "frame.ring", "bubble": "bubble.aurora"}})
+        both = {"bubble": self.bubble_entry, "frame": self.frame_entry}
+        self.assertEqual((await self._public("alice"))["cosmetics"], both)
+        view = await self._overview()
+        self.assertEqual(view["equipped"], {"bubble": "bubble.aurora", "frame": "frame.ring"})
+        self.assertEqual(sorted(item["sku"] for item in view["items"] if item["equipped"]), ["bubble.aurora", "frame.ring"])
+        # 同一个槽换一件：只顶掉这个槽里原来的那件
+        self.assertEqual((await self._equip("alice", "frame.plain", slot="frame"))["equipped"], {"bubble": "bubble.aurora", "frame": "frame.plain"})
+        self.assertEqual((await self._public("alice"))["cosmetics"], {"bubble": self.bubble_entry, "frame": self.plain_entry})
+        # 卸下一个槽不动另一个
+        self.assertEqual(await self._equip("alice", None, slot="frame"), {"equipped": {"bubble": "bubble.aurora"}})
+        self.assertEqual((await self._public("alice"))["cosmetics"], {"bubble": self.bubble_entry})
+        self.assertEqual(await self._equip("alice", None, slot="frame"), {"equipped": {"bubble": "bubble.aurora"}})
+        await self._equip("alice", "frame.ring", slot="frame")
+        self.assertEqual(await self._equip("alice", None), {"equipped": {"frame": "frame.ring"}})
+        self.assertEqual(await self._equip("alice", None, slot="frame"), {"equipped": {}})
+        self.assertEqual(((await self._public("alice"))["cosmetics"], (await self._user("alice")).cosmetics), ({}, None))
+        # 每次真的变了都发一次 user.cosmetics.updated，带的是两个槽合在一起的最新状态
+        self.assertEqual(
+            [event["cosmetics"] for event in await self._cosmetics_events()],
+            [
+                {"frame": self.frame_entry},
+                both,
+                {"bubble": self.bubble_entry, "frame": self.plain_entry},
+                {"bubble": self.bubble_entry},
+                both,
+                {"frame": self.frame_entry},
+                {},
+            ],
+        )
+        self.assertEqual({event["user_id"] for event in await self._cosmetics_events()}, {alice})
+
+    async def test_user_public_carries_both_slots_without_queries(self) -> None:
+        await self._buy("alice", self.frame)
+        await self._buy("alice", self.bubble)
+        await self._equip("alice", "bubble.aurora")
+        await self._equip("alice", "frame.ring", slot="frame")
+        async with self.sessions() as db:
+            alice = await db.get(User, self.ids["alice"])
+            with self._statements() as seen:
+                self.assertEqual(UserPublic.model_validate(alice).cosmetics, {"bubble": self.bubble_entry, "frame": self.frame_entry})
+            self.assertEqual(seen, [])
+        self.assertEqual(parse_cosmetics(json.dumps({"frame": self.frame_entry})), {"frame": self.frame_entry})
+        # 一个槽的内容坏了不连累另一个
+        self.assertEqual(parse_cosmetics(json.dumps({"bubble": "bad", "frame": {**self.frame_entry, "extra": 1}})), {"frame": self.frame_entry})
+
+    async def test_revoke_unequips_only_that_slot(self) -> None:
+        alice = self.ids["alice"]
+        await self._buy("alice", self.frame)
+        await self._buy("alice", self.bubble)
+        await self._equip("alice", "bubble.aurora")
+        await self._equip("alice", "frame.ring", slot="frame")
+        sent = len(await self._cosmetics_events())
+        revoked = await self._as("admin", shop_service.admin_revoke, alice, self.frame, "测试收回", refund=True)
+        self.assertEqual((revoked["item"], revoked["refunded"]), ({"sku": "frame.ring", "name": "frame.ring", "category": "frame"}, True))
+        # 头像框卸下了，气泡还在；买头像框花的币退回来
+        self.assertEqual((await self._public("alice"))["cosmetics"], {"bubble": self.bubble_entry})
+        self.assertEqual(((await self._overview())["equipped"], (await self._account("alice")).spent), ({"bubble": "bubble.aurora"}, 10))
+        self.assertEqual((await self._cosmetics_events())[sent:], [{"user_id": alice, "cosmetics": {"bubble": self.bubble_entry}}])
+        self.assertEqual((await self._fails(self._equip("alice", "frame.ring", slot="frame")))[:2], (403, "not_owned"))
+        # 收回之后可以再买回来、再装上
+        await self._buy("alice", self.frame)
+        self.assertEqual((await self._equip("alice", "frame.ring", slot="frame"))["equipped"], {"bubble": "bubble.aurora", "frame": "frame.ring"})
+        # 收回拥有但没装备着的那件：装扮没变，不发事件
+        await self._buy("alice", self.other)
+        sent = len(await self._cosmetics_events())
+        await self._as("admin", shop_service.admin_revoke, alice, self.other, None)
+        self.assertEqual(((await self._overview())["equipped"], len(await self._cosmetics_events())), ({"bubble": "bubble.aurora", "frame": "frame.ring"}, sent))
+
+    async def test_style_edit_follows_equipped_users(self) -> None:
+        alice = self.ids["alice"]
+        await self._buy("alice", self.frame)
+        await self._buy("alice", self.bubble)
+        await self._equip("alice", "bubble.aurora")
+        await self._equip("alice", "frame.ring", slot="frame")
+        sent = len(await self._cosmetics_events())
+        new_style = {"version": 1, "ring": {"background": "conic-gradient(from 90deg, #000, #fff, #000)", "width": 4}, "ornaments": [FRAME_ORNAMENT]}
+        updated = await self._as("admin", shop_service.admin_update_item, self.frame, {"style": new_style})
+        self.assertEqual(updated["style"], new_style)
+        expected = {"bubble": self.bubble_entry, "frame": {"sku": "frame.ring", "style": new_style}}
+        self.assertEqual((await self._public("alice"))["cosmetics"], expected)
+        self.assertEqual((await self._cosmetics_events())[sent:], [{"user_id": alice, "cosmetics": expected}])
+        # 后台提交的样式按商品的类别校验：气泡的样式存不进头像框，反过来也一样
+        status_code, code, detail = await self._fails(self._as("admin", shop_service.admin_update_item, self.frame, {"style": STYLE}))
+        self.assertEqual((status_code, code, detail["field"]), (422, "invalid_style", "background"))
+        status_code, code, detail = await self._fails(self._as("admin", shop_service.admin_update_item, self.bubble, {"style": FRAME}))
+        self.assertEqual((status_code, code, detail["field"]), (422, "invalid_style", "ring"))
+        status_code, code, detail = await self._fails(self._as("admin", shop_service.admin_update_item, self.frame, {"style": {**FRAME, "ring": {**RING, "background": "url(x)"}}}))
+        self.assertEqual((status_code, code, detail["field"]), (422, "invalid_style", "ring.background"))
+        # 只改类别不改样式：旧样式过不了新类别的校验，改不成
+        self.assertEqual((await self._fails(self._as("admin", shop_service.admin_update_item, self.frame, {"category": "bubble"})))[:2], (422, "invalid_style"))
+        # 类别和样式一起换成气泡：原来装在 frame 槽里的那份被拿掉
+        await self._as("admin", shop_service.admin_update_item, self.frame, {"category": "bubble", "style": PLAIN})
+        self.assertEqual((await self._public("alice"))["cosmetics"], {"bubble": self.bubble_entry})
+        self.assertEqual((await self._cosmetics_events())[-1], {"user_id": alice, "cosmetics": {"bubble": self.bubble_entry}})
+
+    async def test_admin_creates_and_grants_frames(self) -> None:
+        carol = self.ids["carol"]
+        created = await self._as("admin", shop_service.admin_create_item, {"sku": "frame.event", "category": "frame", "name": "活动限定", "style": FRAME, "tag": "limited"})
+        self.assertEqual((created["category"], created["style"], created["price"]), ("frame", FRAME, 0))
+        status_code, code, detail = await self._fails(self._as("admin", shop_service.admin_create_item, {"sku": "frame.bad", "category": "frame", "name": "坏的", "style": PLAIN}))
+        self.assertEqual((status_code, code, detail["field"]), (422, "invalid_style", "background"))
+        # 送出去的头像框本人会收到 shop.item.granted，没绑定 CCW 的人也能装
+        await self._as("admin", shop_service.admin_grant, carol, created["id"], "送你")
+        self.assertEqual(self.send_to_user.await_args_list[-1].args, (carol, "shop.item.granted", {"item": {"sku": "frame.event", "name": "活动限定", "category": "frame"}, "source": "grant"}))
+        self.assertEqual(await self._equip("carol", "frame.event", slot="frame"), {"equipped": {"frame": "frame.event"}})
+        self.assertEqual((await self._public("carol"))["cosmetics"], {"frame": {"sku": "frame.event", "style": FRAME}})
+        # 升级时等级解锁的头像框和气泡一起发
+        granted = await self._as("dave", lambda db, user: shop_service.on_level_up(db, user.id, 4))
+        self.assertEqual(granted, [{"sku": "frame.reward", "name": "frame.reward", "category": "frame"}])
+
+
 # ---------------------------------------------------------------- 初始商品
 
 
@@ -1170,7 +1621,9 @@ def _blend(base: str, overlay: str, opacity: float) -> str:
 
 class SeedTests(ShopTestCase):
     def test_catalog_is_what_was_asked_for(self) -> None:
-        items = shop_service.DEFAULT_ITEMS
+        self.assertEqual([item.get("category", "bubble") for item in shop_service.DEFAULT_ITEMS], ["bubble"] * 8 + ["frame"] * 11)
+        self.assertEqual(len({item["sku"] for item in shop_service.DEFAULT_ITEMS}), 19)
+        items = [item for item in shop_service.DEFAULT_ITEMS if item.get("category", "bubble") == "bubble"]
         by_sku = {item["sku"]: item for item in items}
         self.assertEqual((len(items), len(by_sku)), (8, 8))
         self.assertEqual(len({item["name"] for item in items}), 8)
@@ -1240,14 +1693,85 @@ class SeedTests(ShopTestCase):
                     # 角饰没有深色覆盖，还会探出气泡：颜色要在浅色和深色聊天背景上都看得见
                     self.assertTrue(0.12 <= _luminance(ornament["color"]) <= 0.75, (item["sku"], ornament))
 
+    def test_frame_catalog_is_what_was_asked_for(self) -> None:
+        frames = [item for item in shop_service.DEFAULT_ITEMS if item.get("category") == "frame"]
+        by_sku = {item["sku"]: item for item in frames}
+        self.assertEqual(
+            [(item["sku"], item["name"], item["price"], item.get("unlock_level")) for item in frames],
+            [
+                ("frame.mint", "薄荷", 10, None),
+                ("frame.sakura", "樱花", 30, None),
+                ("frame.ocean", "海盐", 60, None),
+                ("frame.neko", "猫耳", 60, None),
+                ("frame.galaxy", "星环", 100, None),
+                ("frame.aurora", "极光", 200, None),
+                ("frame.halo", "光环", 0, 4),
+                ("frame.crown", "加冕", 0, 16),
+                ("frame.bow", "蝴蝶结", 30, None),
+                ("frame.devil", "小恶魔", 50, None),
+                ("frame.angel", "天使", 120, None),
+            ],
+        )
+        # 前 8 件和气泡成套：价位、等级奖励的档位一一对应
+        bubbles = [item for item in shop_service.DEFAULT_ITEMS if item.get("category", "bubble") == "bubble"]
+        self.assertEqual([(item["price"], item.get("unlock_level")) for item in frames[:8]], [(item["price"], item.get("unlock_level")) for item in bubbles])
+
+        def keys(sku: str) -> list[tuple[str, str]]:
+            return [(ornament["key"], ornament["position"]) for ornament in by_sku[sku]["style"].get("ornaments", [])]
+
+        self.assertEqual(keys("frame.mint"), [("leaf", "br")])
+        self.assertEqual(keys("frame.sakura"), [("petal", "tr"), ("petal", "bl")])
+        self.assertEqual(keys("frame.ocean"), [("sparkle", "tr")])
+        self.assertEqual(keys("frame.neko"), [("cat_ears", "top"), ("paw", "br")])
+        self.assertEqual(keys("frame.galaxy"), [("star", "tr"), ("sparkle", "bl")])
+        self.assertEqual(keys("frame.aurora"), [])
+        self.assertEqual(keys("frame.halo"), [("halo", "top")])
+        self.assertEqual(keys("frame.crown"), [("crown", "top"), ("laurel", "bottom")])
+        self.assertEqual(keys("frame.bow"), [("bow", "tr"), ("heart", "bl")])
+        self.assertEqual(keys("frame.devil"), [("horns", "top"), ("bolt", "br")])
+        self.assertEqual(keys("frame.angel"), [("wings", "right"), ("halo", "top")])
+        # 头像框专用的六种装饰每一种都有默认商品用到
+        used = {key for sku in by_sku for key, _position in keys(sku)}
+        self.assertTrue(set(FRAME_ORNAMENTS) - set(ORNAMENTS) <= used)
+        # 星环和极光是会转的锥形渐变；凡是锥形渐变都首尾同色，转起来（或者静止时）没有接缝
+        self.assertEqual({sku for sku in by_sku if by_sku[sku]["style"].get("animation") == "spin"}, {"frame.galaxy", "frame.aurora"})
+        self.assertEqual({sku for sku in by_sku if "conic" in by_sku[sku]["style"]["ring"]["background"]}, {"frame.galaxy", "frame.aurora", "frame.crown"})
+        # 彼此要有区别：环的配色没有重样的，四种动效都用上了，等级奖励写明了怎么得到
+        self.assertEqual(len({item["style"]["ring"]["background"] for item in frames}), 11)
+        self.assertEqual({item["style"].get("animation") for item in frames}, {None, "spin", "pulse", "shimmer"})
+        self.assertEqual([item["sku"] for item in frames if "等级奖励" in item["description"]], ["frame.halo", "frame.crown"])
+
+        # 客户端两种聊天背景的大致颜色。样式是在客户端截图看过的，这里只挡「整圈环都融进背景里」这种明显的失误
+        light_page, dark_page = "#F4F5FA", "#1E1F27"
+        for item in frames:
+            with self.subTest(sku=item["sku"]):
+                style = item["style"]
+                # 存进去的就是规范形式
+                self.assertEqual(validate_frame_style(style), style)
+                self.assertTrue(shop_service.SKU_RE.fullmatch(item["sku"]) and item["sku"].startswith("frame."))
+                self.assertTrue(0 < len(item["name"]) <= shop_service.NAME_MAX and 0 < len(item["description"]) <= shop_service.DESCRIPTION_MAX)
+                self.assertIn(item.get("tag"), (None, *shop_service.TAGS))
+                dark = style.get("dark", {})
+                for ring in (style["ring"], dark.get("ring", style["ring"])):
+                    stops = re.findall(r"#[0-9A-Fa-f]{6}", ring["background"])
+                    if ring["background"].startswith("conic-gradient("):
+                        self.assertEqual(stops[0], stops[-1], ring)
+                # 浅色背景：环上最深的那一段要和背景分得开；整圈都很浅的（光环、天使）靠外发光把轮廓托出来
+                light_stops = re.findall(r"#[0-9A-Fa-f]{6}", style["ring"]["background"])
+                self.assertTrue(max(_contrast(stop, light_page) for stop in light_stops) >= 1.5 or "glow" in style, (item["sku"], light_stops))
+                # 深色背景（有覆盖用覆盖）：环上最亮的那一段要够亮
+                dark_stops = re.findall(r"#[0-9A-Fa-f]{6}", dark.get("ring", style["ring"])["background"])
+                self.assertGreaterEqual(max(_contrast(stop, dark_page) for stop in dark_stops), 3.0, (item["sku"], dark_stops))
+
     async def test_seeding_is_idempotent_and_leaves_existing_items_alone(self) -> None:
         async with self.sessions() as db:
-            self.assertEqual(await shop_service.ensure_default_items(db), 8)
+            self.assertEqual(await shop_service.ensure_default_items(db), 19)
             self.assertEqual(await shop_service.ensure_default_items(db), 0)
         listing = await self._as("admin", lambda db, _admin: shop_service.admin_list_items(db))
         self.assertEqual([item["sku"] for item in listing["items"]], [item["sku"] for item in shop_service.DEFAULT_ITEMS])
-        self.assertEqual([item["sort"] for item in listing["items"]], [10, 20, 30, 40, 50, 60, 70, 80])
-        self.assertTrue(all(item["is_active"] and item["category"] == "bubble" for item in listing["items"]))
+        self.assertEqual([item["sort"] for item in listing["items"]], [index * 10 for index in range(1, 20)])
+        self.assertTrue(all(item["is_active"] for item in listing["items"]))
+        self.assertEqual([item["category"] for item in listing["items"]], ["bubble"] * 8 + ["frame"] * 11)
         self.assertEqual([item["style"] for item in listing["items"]], [item["style"] for item in shop_service.DEFAULT_ITEMS])
         # 后台改过价、下架过、删掉一件之后重新启动：只补缺的那一件，其余不动
         async with self.sessions() as db:
@@ -1259,11 +1783,44 @@ class SeedTests(ShopTestCase):
             await db.commit()
             self.assertEqual(await shop_service.ensure_default_items(db), 1)
             rows = {item.sku: item for item in (await db.execute(select(ShopItem))).scalars()}
-        self.assertEqual((len(rows), rows["bubble.mint"].price, rows["bubble.mint"].name, rows["bubble.peach"].is_active), (8, 999, "改过的名字", False))
+        self.assertEqual((len(rows), rows["bubble.mint"].price, rows["bubble.mint"].name, rows["bubble.peach"].is_active), (19, 999, "改过的名字", False))
         self.assertEqual(rows["bubble.aurora"].price, 200)
-        # 和线上的商店一样用：等级解锁的两件对 0 级的人是 locked
+        # 和线上的商店一样用：等级解锁的几件对 0 级的人是 locked
         view = await self._overview("carol")
-        self.assertEqual({item["sku"]: item["obtainable"] for item in view["items"] if item["price"] == 0}, {"bubble.moonlight": "locked", "bubble.corona": "locked"})
+        self.assertEqual(
+            {item["sku"]: item["obtainable"] for item in view["items"] if item["price"] == 0},
+            {"bubble.moonlight": "locked", "bubble.corona": "locked", "frame.halo": "locked", "frame.crown": "locked"},
+        )
+
+    async def test_frames_are_added_to_a_shop_that_already_has_the_bubbles(self) -> None:
+        """线上的情况：气泡早就播种过、后台也改过，这次启动只补头像框，气泡和已有的头像框一概不动。"""
+        frames = tuple(item for item in shop_service.DEFAULT_ITEMS if item.get("category") == "frame")
+        bubbles = tuple(item for item in shop_service.DEFAULT_ITEMS if item.get("category", "bubble") == "bubble")
+        edited = {"version": 1, "ring": {"background": "#123456", "width": 5}}
+        async with self.sessions() as db:
+            with patch.object(shop_service, "DEFAULT_ITEMS", bubbles):
+                self.assertEqual(await shop_service.ensure_default_items(db), 8)
+            mint = (await db.execute(select(ShopItem).where(ShopItem.sku == "bubble.mint"))).scalar_one()
+            mint.price, mint.style, mint.sort = 7, json.dumps(PLAIN), 5
+            # 后台自己先建了一件同名 sku 的头像框，样式、价格都和默认的不一样，还下架了
+            db.add(ShopItem(sku="frame.mint", category="frame", name="后台建的", price=77, style=json.dumps(edited), is_active=False, sort=1))
+            await db.commit()
+            self.assertEqual(await shop_service.ensure_default_items(db), 10)
+            self.assertEqual(await shop_service.ensure_default_items(db), 0)
+            rows = {item.sku: item for item in (await db.execute(select(ShopItem))).scalars()}
+        self.assertEqual(len(rows), 19)
+        self.assertEqual((rows["bubble.mint"].price, json.loads(rows["bubble.mint"].style), rows["bubble.mint"].sort), (7, PLAIN, 5))
+        kept = rows["frame.mint"]
+        self.assertEqual((kept.name, kept.price, json.loads(kept.style), kept.is_active, kept.sort), ("后台建的", 77, edited, False, 1))
+        for spec in frames[1:]:
+            row = rows[spec["sku"]]
+            self.assertEqual((row.category, row.name, row.price, row.unlock_level, json.loads(row.style), row.is_active), ("frame", spec["name"], spec["price"], spec.get("unlock_level"), spec["style"], True))
+        self.assertEqual([rows[spec["sku"]].sort for spec in frames[1:]], [100, 110, 120, 130, 140, 150, 160, 170, 180, 190])
+        # 默认的头像框买得了、装得上
+        self.ledger.donate(OID_A, 100)
+        await self._buy("alice", rows["frame.galaxy"].id)
+        self.assertEqual(await self._equip("alice", "frame.galaxy", slot="frame"), {"equipped": {"frame": "frame.galaxy"}})
+        self.assertEqual(parse_cosmetics((await self._user("alice")).cosmetics), {"frame": {"sku": "frame.galaxy", "style": frames[4]["style"]}})
 
     async def test_seeding_never_raises(self) -> None:
         async with self.sessions() as db:
@@ -1330,7 +1887,7 @@ class AdminTests(ShopTestCase):
             ({"sku": "bubble x"}, "sku"),
             ({"sku": "x" * 65}, "sku"),
             ({"sku": None}, "sku"),
-            ({"category": "frame"}, "category"),
+            ({"category": "nameplate"}, "category"),
             ({"category": None}, "category"),
             ({"name": "   "}, "name"),
             ({"name": "名" * 41}, "name"),
@@ -1378,7 +1935,7 @@ class AdminTests(ShopTestCase):
         self.assertEqual((await self._fails(self._admin(shop_service.admin_update_item, item_id, {"sku": "bubble.other"})))[:2], (422, "sku_immutable"))
         self.assertEqual((await self._fails(self._admin(shop_service.admin_update_item, item_id, {"style": {"version": 1}})))[:2], (422, "invalid_style"))
         self.assertEqual((await self._fails(self._admin(shop_service.admin_update_item, item_id, {"price": -5})))[:2], (422, "invalid_item"))
-        self.assertEqual((await self._fails(self._admin(shop_service.admin_update_item, item_id, {"category": "frame"})))[:2], (422, "invalid_item"))
+        self.assertEqual((await self._fails(self._admin(shop_service.admin_update_item, item_id, {"category": "nameplate"})))[:2], (422, "invalid_item"))
         self.assertEqual((await self._fails(self._admin(shop_service.admin_update_item, 4040, {"price": 1})))[:2], (404, "item_not_found"))
         listing = await self._admin(lambda db, _admin: shop_service.admin_list_items(db))
         self.assertEqual([(item["sku"], item["price"], item["is_active"], item["sort"]) for item in listing["items"]], [("bubble.new", 80, False, -3)])
@@ -1418,7 +1975,7 @@ class AdminTests(ShopTestCase):
         self.send_to_user.assert_awaited_once_with(
             self.ids["carol"], "shop.item.granted", {"item": {"sku": "bubble.gift", "name": "礼物", "category": "bubble"}, "source": "grant"}
         )
-        self.assertEqual(await self._audit(), [("shop.grant", {"item_id": gift, "sku": "bubble.gift", "note": "活动奖励"})])
+        self.assertEqual(await self._audit(), [("shop.grant", {"item_id": gift, "sku": "bubble.gift", "note": "活动奖励", "duration_days": None})])
         # 送的东西（哪怕已下架、不卖）出现在对方的商店里，能装备
         view = await self._overview("carol")
         self.assertEqual([(item["sku"], item["owned"], item["obtainable"]) for item in view["items"]], [("bubble.gift", True, "owned")])
@@ -1492,13 +2049,13 @@ class AdminTests(ShopTestCase):
         self.ledger.entries = [(OID_A, 100.5), (OID_B, 55.9), (OID_X, 10.0)]
         result = await self._admin(shop_service.admin_reconcile)
         # 名单上 3 个投币人，对得上 alice 和 bob；dave 绑定了但没投过，不用建账户
-        self.assertEqual(result, {"donors": 3, "matched": 2, "updated": 2, "mismatched": []})
+        self.assertEqual(result, {"donors": 3, "matched": 2, "updated": 2, "mismatched": [], "red_packets": NO_PACKET_LEDGER, "gifts": NO_GIFT_LEDGER, "group_plus": NO_PLUS_LEDGER})
         # 对账要的是不走缓存的完整名单
         self.assertEqual(self.ledger.calls, [("all_credits", True)])
         self.assertEqual((await self._audit())[-1], ("shop.reconcile", {"donors": 3, "matched": 2, "updated": 2}))
         self.assertIsNone(await self._account("dave"))
         # 对账之后不用自己刷新就有余额
-        self.assertEqual((await self._overview("bob"))["balance"], {"bound": True, "donated": 55, "spent": 0, "balance": 55, "verified_at": self.now, "stale": False})
+        self.assertEqual((await self._overview("bob"))["balance"], {"bound": True, "donated": 55, "spent": 0, "balance": 55, "verified_at": self.now, "stale": False, **NO_PACKETS})
 
         async def accounts(**filters: Any) -> dict[str, Any]:
             options = {"q": None, "mismatch": None, "limit": 50, "offset": 0, **filters}
@@ -1564,13 +2121,17 @@ class AdminTests(ShopTestCase):
                 "ranking_cache_seconds": 60,
                 "changed_interval_seconds": 0,
                 "cosmetics_event_interval_seconds": 0,
-                "categories": [{"key": "bubble", "label": "气泡", "slot": "bubble"}],
+                "categories": CATEGORIES_VIEW,
                 "tags": ["new", "hot", "limited"],
                 "animations": ["none", "flow", "shimmer", "breathe"],
                 "patterns": list(PATTERNS),
                 "ornaments": list(ORNAMENTS),
+                "frame_animations": ["none", "spin", "pulse", "shimmer"],
+                "frame_ornaments": list(FRAME_ORNAMENTS),
+                "frame_positions": list(FRAME_POSITIONS),
                 "price_max": shop_service.PRICE_MAX,
                 "unlock_level_max": 256,
+                "duration_max": 3650,
             },
         )
         # creation_oid / creation_oid_source / donate_url 原样取自余额来源的说明
@@ -1675,11 +2236,11 @@ class HttpShopTests(ShopTestCase):
         self.ledger.donate(OID_A, 320)
         shop = await self._json("GET", "/shop")
         self.assertEqual(set(shop), {"categories", "items", "balance", "equipped", "donate_url", "level"})
-        self.assertEqual(shop["categories"], [{"key": "bubble", "label": "气泡", "slot": "bubble"}])
-        self.assertEqual(shop["balance"], {"bound": True, "donated": 0, "spent": 0, "balance": 0, "verified_at": None, "stale": False})
+        self.assertEqual(shop["categories"], CATEGORIES_VIEW)
+        self.assertEqual(shop["balance"], {"bound": True, "donated": 0, "spent": 0, "balance": 0, "verified_at": None, "stale": False, **NO_PACKETS})
         self.assertEqual((shop["equipped"], shop["donate_url"], shop["level"]), ({}, TOPUP_URL, 0))
-        self.assertEqual(len(shop["items"]), 8)
-        item_keys = {"id", "sku", "category", "name", "description", "price", "unlock_level", "style", "preview_text", "tag", "available_until", "is_active", "owned", "equipped", "obtainable"}
+        self.assertEqual(len(shop["items"]), 19)
+        item_keys = {"id", "sku", "category", "name", "description", "price", "unlock_level", "style", "preview_text", "tag", "available_until", "is_active", "owned", "equipped", "obtainable", "duration_days", "expires_at"}
         self.assertTrue(all(set(item) == item_keys and item["is_active"] is True for item in shop["items"]))
         aurora = next(item for item in shop["items"] if item["sku"] == "bubble.aurora")
         self.assertEqual((aurora["price"], aurora["owned"], aurora["equipped"], aurora["obtainable"], aurora["style"]["animation"]), (200, False, False, "buy", "flow"))
@@ -1723,11 +2284,26 @@ class HttpShopTests(ShopTestCase):
         self.acting = "alice"
         self.assertEqual(await self._json("PUT", "/shop/equipped", json={"slot": "bubble", "sku": None}), {"equipped": {}})
         self.assertEqual(await self._json("PUT", "/shop/equipped", json={"slot": "bubble"}), {"equipped": {}})
+        # 头像框走同一组接口，槽是 frame
+        mint = next(item for item in shop["items"] if item["sku"] == "frame.mint")
+        self.assertEqual((mint["category"], mint["price"], mint["preview_text"], set(mint["style"])), ("frame", 10, None, {"version", "ring", "ornaments", "dark"}))
+        self.assertEqual((await self._json("PUT", "/shop/equipped", 403, json={"slot": "frame", "sku": "frame.mint"}))["detail"]["code"], "not_owned")
+        bought = await self._json("POST", f"/shop/items/{mint['id']}/purchase")
+        self.assertEqual((bought["item"]["owned"], bought["balance"]["balance"]), (True, 10))
+        self.assertEqual((await self._json("PUT", "/shop/equipped", 422, json={"slot": "bubble", "sku": "frame.mint"}))["detail"]["code"], "invalid_slot")
+        self.assertEqual(await self._json("PUT", "/shop/equipped", json={"slot": "frame", "sku": "frame.mint"}), {"equipped": {"frame": "frame.mint"}})
+        self.assertEqual(await self._json("PUT", "/shop/equipped", json={"slot": "bubble", "sku": "bubble.aurora"}), {"equipped": {"frame": "frame.mint", "bubble": "bubble.aurora"}})
+        self.acting = "bob"
+        profile = await self._json("GET", f"/users/{self.ids['alice']}")
+        self.assertEqual(profile["cosmetics"], {"bubble": {"sku": "bubble.aurora", "style": aurora["style"]}, "frame": {"sku": "frame.mint", "style": mint["style"]}})
+        self.acting = "alice"
+        self.assertEqual(await self._json("PUT", "/shop/equipped", json={"slot": "frame", "sku": None}), {"equipped": {"bubble": "bubble.aurora"}})
+        self.assertEqual(await self._json("PUT", "/shop/equipped", json={"slot": "bubble", "sku": None}), {"equipped": {}})
 
         history = await self._json("GET", "/shop/purchases?limit=1&offset=0")
-        self.assertEqual((history["total"], len(history["items"])), (2, 1))
-        self.assertEqual(set(history["items"][0]), {"id", "item", "price", "source", "created_at", "revoked_at", "refunded"})
-        self.assertEqual((history["items"][0]["item"], history["items"][0]["price"], history["items"][0]["source"]), ({"sku": "bubble.galaxy", "name": "星河", "category": "bubble"}, 100, "purchase"))
+        self.assertEqual((history["total"], len(history["items"])), (3, 1))
+        self.assertEqual(set(history["items"][0]), {"id", "item", "price", "source", "created_at", "revoked_at", "refunded", "expires_at", "duration_days", "from_user"})
+        self.assertEqual((history["items"][0]["item"], history["items"][0]["price"], history["items"][0]["source"]), ({"sku": "frame.mint", "name": "薄荷", "category": "frame"}, 10, "purchase"))
         await self._json("GET", "/shop/purchases?limit=0", 422)
 
         self.acting = "carol"
@@ -1757,12 +2333,12 @@ class HttpShopTests(ShopTestCase):
             with self.subTest(path=path):
                 await self._json(method, path, 403, json=body)
         async with self.sessions() as db:
-            self.assertEqual(await db.scalar(select(func.count()).select_from(ShopItem)), 8)
+            self.assertEqual(await db.scalar(select(func.count()).select_from(ShopItem)), 19)
             self.assertEqual(await db.scalar(select(func.count()).select_from(ShopPurchase)), 0)
 
         self.acting = "admin"
         listing = await self._json("GET", "/admin/shop/items")
-        self.assertEqual((listing["total"], len(listing["items"])), (8, 8))
+        self.assertEqual((listing["total"], len(listing["items"])), (19, 19))
         self.assertTrue({"is_active", "sort", "sold", "owners", "created_at", "updated_at", "style", "sku"} <= set(listing["items"][0]))
         created = await self._json("POST", "/admin/shop/items", json={"sku": "bubble.event", "category": "bubble", "name": "活动限定", "style": STYLE, "price": 5, "tag": "limited"})
         self.assertEqual((created["sku"], created["price"], created["tag"], created["sold"]), ("bubble.event", 5, "limited", 0))
@@ -1783,12 +2359,17 @@ class HttpShopTests(ShopTestCase):
 
         self.ledger.donate(OID_A, 40)
         reconciled = await self._json("POST", "/admin/shop/reconcile")
-        self.assertEqual(reconciled, {"donors": 1, "matched": 1, "updated": 1, "mismatched": []})
+        self.assertEqual(reconciled, {"donors": 1, "matched": 1, "updated": 1, "mismatched": [], "red_packets": NO_PACKET_LEDGER, "gifts": NO_GIFT_LEDGER, "group_plus": NO_PLUS_LEDGER})
         accounts = await self._json("GET", "/admin/shop/accounts?q=alice&mismatch=false&limit=10")
         self.assertEqual((accounts["total"], accounts["items"][0]["donated"], accounts["items"][0]["user"]["username"]), (1, 40, "alice"))
         self.assertEqual((await self._json("GET", "/admin/shop/accounts?mismatch=true"))["items"], [])
         config = await self._json("GET", "/admin/shop/settings")
         self.assertEqual((config["configured"], config["creation_oid"], config["refresh_interval_seconds"]), (True, CREATION, 20))
+        self.assertEqual((config["categories"], config["frame_animations"], config["frame_ornaments"], config["frame_positions"]), (CATEGORIES_VIEW, list(FRAME_ANIMATIONS), list(FRAME_ORNAMENTS), list(FRAME_POSITIONS)))
+        frame = await self._json("POST", "/admin/shop/items", json={"sku": "frame.event", "category": "frame", "name": "活动头像框", "style": FRAME, "price": 5})
+        self.assertEqual((frame["category"], frame["style"]), ("frame", FRAME))
+        error = await self._json("POST", "/admin/shop/items", 422, json={"sku": "frame.bad", "category": "frame", "name": "坏的", "style": {**FRAME, "ornaments": [{**FRAME_ORNAMENT, "key": "dragon"}]}})
+        self.assertEqual((error["detail"]["code"], error["detail"]["field"]), ("invalid_style", "ornaments[0].key"))
         self.ledger.error = OSError("down")
         self.assertEqual((await self._json("POST", "/admin/shop/reconcile", 503))["detail"]["code"], "verification_unavailable")
 

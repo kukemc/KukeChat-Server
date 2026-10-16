@@ -1,10 +1,12 @@
-"""商店商品样式的校验（docs/shop.md 2.2）。
+"""商店商品样式的校验（docs/shop.md 2.2 气泡皮肤、2.4 头像框）。
 
 style 不是任意 CSS，但客户端会把里面的值拼进样式里，所以这里按白名单逐个字段解析，
 再用解析出来的片段重新拼一遍 —— 存进库里的永远是规范形式，原文里多出来的任何字符都带不进去。
 
 纹样（pattern）和角饰（ornaments）是客户端内置的图形，样式里只有名字和颜色：名字不在下面两张表里的一律拒绝，
 没有任何字段能放图片地址。客户端加了新图形之后，要在这里的表里也登记上才能用。
+
+每个类别一个 validate_*_style，在 services/shop.py 的 CATEGORIES 里登记。
 """
 
 from __future__ import annotations
@@ -33,12 +35,25 @@ SHADOW_BLUR_RANGE = (0, 48)
 SHADOW_SPREAD_RANGE = (-12, 24)
 _TEXT_MAX_LENGTH = 240
 
+# —— 头像框（契约 2.4）。尺寸都按 40px 的头像计，客户端按头像实际大小等比缩放 ——
+FRAME_STYLE_VERSION = 1
+FRAME_ANIMATIONS = ("none", "spin", "pulse", "shimmer")
+# 气泡的角饰头像框都能用，另外多几个只适合戴在头像上的
+FRAME_ORNAMENTS = (*ORNAMENTS, "cat_ears", "halo", "horns", "laurel", "wings", "bow")
+FRAME_POSITIONS = ("top", "tr", "right", "br", "bottom", "bl", "left", "tl")
+FRAME_ORNAMENTS_MAX = 3
+RING_WIDTH_RANGE = (2, 6)
+RING_GAP_RANGE = (0, 3)
+GLOW_BLUR_RANGE = (0, 16)
+
 # 数字一律写 [0-9]：\d 会放进全角数字
 _HEX = r"#(?:[0-9a-fA-F]{8}|[0-9a-fA-F]{6}|[0-9a-fA-F]{3})"
 _COLOR_RE = re.compile(_HEX)
 _ANGLE_RE = re.compile(r"(-?[0-9]{1,3}(?:\.[0-9]{1,2})?)deg")
 _STOP_RE = re.compile(rf"({_HEX})(?: ([0-9]{{1,3}}(?:\.[0-9]{{1,2}})?)%)?")
-_GRADIENT_RE = re.compile(r"(linear|radial)-gradient\(([^()]*)\)")
+# 锥形渐变开头可选的 from <角度>deg
+_FROM_RE = re.compile(r"from (-?[0-9]{1,3}(?:\.[0-9]{1,2})?)deg")
+_GRADIENT_RE = re.compile(r"(linear|radial|conic)-gradient\(([^()]*)\)")
 _LENGTH_RE = re.compile(r"(-?[0-9]{1,2}(?:\.[0-9])?)px|(0)")
 # 渐变和阴影里可能出现的全部字符；别的（分号、引号、斜杠、换行……）直接拒绝
 _SAFE_TEXT_RE = re.compile(r"[0-9a-zA-Z#%.,() -]*")
@@ -48,7 +63,13 @@ _BUBBLE_KEYS = ("version", "background", "text", "link", "border", "radius", "sh
 _DARK_KEYS = ("background", "text", "link", "border", "shadow", "pattern")
 _BORDER_KEYS = ("color", "width")
 _PATTERN_KEYS = ("key", "color", "opacity", "scale")
-_ORNAMENT_KEYS = ("key", "corner", "color", "size", "animated")
+
+_FRAME_KEYS = ("version", "ring", "glow", "animation", "ornaments", "dark")
+_RING_KEYS = ("background", "width", "gap")
+_GLOW_KEYS = ("color", "blur")
+# 深色覆盖里只能换环的底色和外发光；环的粗细、留白、动效、装饰两种配色共用
+_FRAME_DARK_KEYS = ("ring", "glow")
+_FRAME_DARK_RING_KEYS = ("background",)
 
 
 class StyleError(ValueError):
@@ -100,22 +121,25 @@ def _text(value: Any, field: str) -> str:
     return " ".join(part for part in value.split(" ") if part)
 
 
-def _background(value: Any, field: str) -> str:
+def _background(value: Any, field: str, *, conic: bool = False) -> str:
+    """一个颜色或者一个渐变。conic：是否放开 conic-gradient(...)（只有头像框的环放开，气泡的底色不放开）。"""
     if isinstance(value, str) and _COLOR_RE.fullmatch(value) is not None:
         return value
     text = _text(value, field)
     matched = _GRADIENT_RE.fullmatch(text)
-    if matched is None:
-        raise StyleError(field, "只接受一个颜色，或者一个 linear-gradient(...) / radial-gradient(...)")
+    if matched is None or (matched.group(1) == "conic" and not conic):
+        kinds = "linear-gradient(...) / radial-gradient(...)" + (" / conic-gradient(...)" if conic else "")
+        raise StyleError(field, f"只接受一个颜色，或者一个 {kinds}")
     kind, inner = matched.groups()
     parts = [part.strip(" ") for part in inner.split(",")]
     pieces: list[str] = []
-    # 角度只有线性渐变有，而且只能在最前面
-    if kind == "linear" and parts and _ANGLE_RE.fullmatch(parts[0]) is not None:
-        angle = _ANGLE_RE.fullmatch(parts[0]).group(1)
+    # 角度只能在最前面：线性渐变直接写角度，锥形渐变写 from <角度>；径向渐变没有
+    opening = {"linear": _ANGLE_RE, "conic": _FROM_RE}.get(kind)
+    if opening is not None and parts and opening.fullmatch(parts[0]) is not None:
+        angle = opening.fullmatch(parts[0]).group(1)
         if abs(float(angle)) > 360:
             raise StyleError(field, "角度要在 -360deg 到 360deg 之间")
-        pieces.append(f"{angle}deg")
+        pieces.append(f"from {angle}deg" if kind == "conic" else f"{angle}deg")
         parts = parts[1:]
     low, high = GRADIENT_STOPS_RANGE
     if not low <= len(parts) <= high:
@@ -189,29 +213,40 @@ def _pattern(value: Any, field: str) -> dict[str, Any]:
     return result
 
 
-def _ornaments(value: Any, field: str) -> list[dict[str, Any]]:
-    """贴在气泡角上的小装饰：最多 ORNAMENTS_MAX 个，一个角只能放一个。"""
+def _ornaments(
+    value: Any,
+    field: str,
+    *,
+    names: tuple[str, ...] = ORNAMENTS,
+    place: str = "corner",
+    places: tuple[str, ...] = CORNERS,
+    maximum: int = ORNAMENTS_MAX,
+) -> list[dict[str, Any]]:
+    """贴在气泡角上的小装饰：最多 ORNAMENTS_MAX 个，一个角只能放一个。
+
+    头像框的装饰是同一套规则，只是表不一样：位置字段叫 position（环上的八个方位），能用的图形和个数上限也各有一份。
+    """
     if not isinstance(value, list):
         raise StyleError(field, "必须是一个数组")
-    if len(value) > ORNAMENTS_MAX:
-        raise StyleError(field, f"角饰最多 {ORNAMENTS_MAX} 个")
+    if len(value) > maximum:
+        raise StyleError(field, f"角饰最多 {maximum} 个")
     result: list[dict[str, Any]] = []
-    corners: set[str] = set()
+    taken: set[str] = set()
     for index, raw in enumerate(value):
         name = f"{field}[{index}]"
-        ornament = _object(raw, name, _ORNAMENT_KEYS)
-        for key in ("key", "corner", "color", "size"):
+        ornament = _object(raw, name, ("key", place, "color", "size", "animated"))
+        for key in ("key", place, "color", "size"):
             if ornament.get(key) is None:
                 raise StyleError(f"{name}.{key}", "不能为空")
         entry: dict[str, Any] = {
-            "key": _choice(ornament["key"], f"{name}.key", ORNAMENTS),
-            "corner": _choice(ornament["corner"], f"{name}.corner", CORNERS),
+            "key": _choice(ornament["key"], f"{name}.key", names),
+            place: _choice(ornament[place], f"{name}.{place}", places),
             "color": _color(ornament["color"], f"{name}.color"),
             "size": _number(ornament["size"], f"{name}.size", ORNAMENT_SIZE_RANGE),
         }
-        if entry["corner"] in corners:
-            raise StyleError(f"{name}.corner", "同一个角不能放两个角饰")
-        corners.add(entry["corner"])
+        if entry[place] in taken:
+            raise StyleError(f"{name}.{place}", "同一个位置不能放两个角饰")
+        taken.add(entry[place])
         animated = ornament.get("animated")
         if animated is not None:
             if not isinstance(animated, bool):
@@ -235,15 +270,20 @@ def _surface(source: dict[str, Any], prefix: str, required: bool) -> dict[str, A
     return result
 
 
+def _version(source: dict[str, Any], expected: int) -> int:
+    version = source.get("version")
+    if isinstance(version, bool) or not isinstance(version, int) or version != expected:
+        raise StyleError("version", f"目前只支持 version = {expected}")
+    return expected
+
+
 def validate_bubble_style(style: Any) -> dict[str, Any]:
     """校验一件气泡皮肤的样式，返回规范化之后的副本；不合法就抛 StyleError。
 
     可空的字段传 null 和不传是一回事，规范形式里都不带这个键。
     """
     source = _object(style, "style", _BUBBLE_KEYS)
-    version = source.get("version")
-    if isinstance(version, bool) or not isinstance(version, int) or version != BUBBLE_STYLE_VERSION:
-        raise StyleError("version", f"目前只支持 version = {BUBBLE_STYLE_VERSION}")
+    _version(source, BUBBLE_STYLE_VERSION)
     surface = _surface(source, "", required=True)
     result: dict[str, Any] = {"version": BUBBLE_STYLE_VERSION, "background": surface["background"], "text": surface["text"]}
     if "link" in surface:
@@ -265,6 +305,59 @@ def validate_bubble_style(style: Any) -> dict[str, Any]:
             result["ornaments"] = ornaments
     if source.get("dark") is not None:
         dark = _surface(_object(source["dark"], "dark", _DARK_KEYS), "dark.", required=False)
+        if dark:
+            result["dark"] = dark
+    return result
+
+
+def _glow(value: Any, field: str) -> dict[str, Any]:
+    """环外面的一圈发光：{ color, blur }。"""
+    glow = _object(value, field, _GLOW_KEYS)
+    for key in _GLOW_KEYS:
+        if glow.get(key) is None:
+            raise StyleError(f"{field}.{key}", "不能为空")
+    return {"color": _color(glow["color"], f"{field}.color"), "blur": _number(glow["blur"], f"{field}.blur", GLOW_BLUR_RANGE)}
+
+
+def validate_frame_style(style: Any) -> dict[str, Any]:
+    """校验一件头像框的样式（契约 2.4），返回规范化之后的副本；不合法就抛 StyleError。
+
+    和气泡一样：可空的字段传 null 和不传是一回事，规范形式里都不带这个键。
+    """
+    source = _object(style, "style", _FRAME_KEYS)
+    result: dict[str, Any] = {"version": _version(source, FRAME_STYLE_VERSION)}
+    if source.get("ring") is None:
+        raise StyleError("ring", "不能为空")
+    ring = _object(source["ring"], "ring", _RING_KEYS)
+    for key in ("background", "width"):
+        if ring.get(key) is None:
+            raise StyleError(f"ring.{key}", "不能为空")
+    result["ring"] = {
+        "background": _background(ring["background"], "ring.background", conic=True),
+        "width": _number(ring["width"], "ring.width", RING_WIDTH_RANGE),
+    }
+    if ring.get("gap") is not None:
+        result["ring"]["gap"] = _number(ring["gap"], "ring.gap", RING_GAP_RANGE)
+    if source.get("glow") is not None:
+        result["glow"] = _glow(source["glow"], "glow")
+    animation = source.get("animation")
+    if animation is not None:
+        result["animation"] = _choice(animation, "animation", FRAME_ANIMATIONS)
+    if source.get("ornaments") is not None:
+        ornaments = _ornaments(
+            source["ornaments"], "ornaments", names=FRAME_ORNAMENTS, place="position", places=FRAME_POSITIONS, maximum=FRAME_ORNAMENTS_MAX
+        )
+        if ornaments:
+            result["ornaments"] = ornaments
+    if source.get("dark") is not None:
+        override = _object(source["dark"], "dark", _FRAME_DARK_KEYS)
+        dark: dict[str, Any] = {}
+        if override.get("ring") is not None:
+            background = _object(override["ring"], "dark.ring", _FRAME_DARK_RING_KEYS).get("background")
+            if background is not None:
+                dark["ring"] = {"background": _background(background, "dark.ring.background", conic=True)}
+        if override.get("glow") is not None:
+            dark["glow"] = _glow(override["glow"], "dark.glow")
         if dark:
             result["dark"] = dark
     return result

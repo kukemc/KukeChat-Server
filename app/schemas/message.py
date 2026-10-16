@@ -17,7 +17,7 @@ class MessageCreate(BaseModel):
     @field_validator("type")
     @classmethod
     def validate_sendable_type(cls, value: MessageType) -> MessageType:
-        if value in {MessageType.FORWARD_BUNDLE, MessageType.SYSTEM, MessageType.POLL}:
+        if value in {MessageType.FORWARD_BUNDLE, MessageType.SYSTEM, MessageType.POLL, MessageType.RED_PACKET, MessageType.GIFT}:
             raise ValueError("This message type cannot be sent from the public message endpoint")
         return value
 
@@ -161,11 +161,16 @@ class MessageSearchResponse(BaseModel):
 class FeaturedMessageRead(BaseModel):
     id: int
     conversation_id: int
-    message_id: int
+    # 原消息 id；原消息被修剪后仍保留这个数字（message_exists = false）。回填时就没了的为 null
+    message_id: int | None = None
     set_by_id: int | None = None
     set_by: UserPublic | None = None
     created_at: datetime
+    # 由设为精华时的快照构造（docs/group-plus.md 第 6 节）；撤回的 content 为空
     message: MessageRead
+    message_exists: bool = True
+    recalled: bool = False
+    snapshot_missing: bool = False
 
 
 class ReadConversationRequest(BaseModel):
@@ -177,3 +182,6 @@ class ReadReceipt(BaseModel):
     user_id: int
     last_read_message_id: int | None
     last_read_at: datetime
+    # 只在「标记已读」接口的返回里有：读到这里之后，这个会话的 mention_pending 是什么（一般是 null）。
+    # 广播给会话成员的 conversation.read 事件里不带这一项
+    mention_pending: Literal["me", "all"] | None = None

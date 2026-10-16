@@ -18,7 +18,10 @@ from app.models.case import (
 from app.models.bot import Bot, BotInstallation, BotReview, BotReviewLike, BotReviewReply
 from app.models.conversation import Conversation, ConversationMember, GroupAnnouncement, GroupJoinRequest, TemporaryConversationBlock
 from app.models.friend import FriendRequest, Friendship
+from app.models.gift import Gift, GiftRecord
+from app.models.group_plus import GroupFile, GroupFileUpload, GroupPlusRecord, GroupTodo
 from app.models.group_activity import GroupCheckin, GroupMemberDailyActivity, GroupMemberExpLog
+from app.models.intimacy import FriendBadge, FriendBond, FriendBondDay
 from app.models.invite import InviteLink
 from app.models.jury_hall import JuryHallComment, JuryHallPost, JuryHallReport, JuryHallVote, JuryPrecedent
 from app.models.message import FeaturedMessage, MentionAllUsage, Message, MessageBookmark, MessageReaction, MessageVisibility
@@ -26,6 +29,7 @@ from app.models.penalty import UserViolation
 from app.models.poll import GroupEmoji, Poll, PollVote
 from app.models.post import Post, PostComment, PostCommentLike, PostLike, PostMention, PostNotification, PostTopic, PostTopicLink
 from app.models.profile_like import ProfileLike
+from app.models.red_packet import RedPacket, RedPacketShare
 from app.models.report import AdminAuditLog, ContentModerationRecord, PasswordResetRequest, UserReport
 from app.models.shop import ShopAccount, ShopItem, ShopPurchase
 from app.models.sticker import FavoriteSticker, StickerAsset
@@ -51,12 +55,19 @@ __all__ = [
     "TemporaryConversationBlock",
     "FriendRequest",
     "Friendship",
+    "FriendBond",
+    "FriendBondDay",
+    "FriendBadge",
     "GroupCheckin",
     "GroupMemberDailyActivity",
     "GroupMemberExpLog",
     "InviteLink",
     "Message",
     "FeaturedMessage",
+    "GroupFile",
+    "GroupFileUpload",
+    "GroupPlusRecord",
+    "GroupTodo",
     "MentionAllUsage",
     "MessageBookmark",
     "MessageReaction",
@@ -117,4 +128,8 @@ __all__ = [
     "ShopPurchase",
     "ShopAccount",
     "ProfileLike",
+    "RedPacket",
+    "RedPacketShare",
+    "Gift",
+    "GiftRecord",
 ]

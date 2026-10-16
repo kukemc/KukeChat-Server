@@ -692,6 +692,16 @@ def _text_to_moderate(message: Message, metadata: dict[str, Any]) -> str | None:
             str(option.get("text") or "") for option in poll.get("options", []) if isinstance(option, dict)
         ]
         return "\n".join(part.strip() for part in parts if part.strip()) or None
+    if message.type == MessageType.RED_PACKET:
+        # 红包消息只审祝福语（正文是给旧客户端看的兜底文字）
+        packet = metadata.get("red_packet")
+        greeting = packet.get("greeting") if isinstance(packet, dict) else None
+        return greeting.strip() or None if isinstance(greeting, str) else None
+    if message.type == MessageType.GIFT:
+        # 礼物消息只审留言（正文是给旧客户端看的兜底文字，礼物名和收礼人的名字不是这个人写的）
+        gift = metadata.get("gift")
+        note = gift.get("message") if isinstance(gift, dict) else None
+        return note.strip() or None if isinstance(note, str) else None
     if message.type == MessageType.FORWARD_BUNDLE:
         parts: list[str] = []
         note = metadata.get("note")
@@ -1109,6 +1119,9 @@ async def _apply_moderation_action(db: AsyncSession, message: Message, record: C
         conversation = await db.get(Conversation, message.conversation_id)
         if conversation is not None:
             conversation.updated_at = now
+        from app.services.messages import clear_mentions_of
+
+        await clear_mentions_of(db, message)
 
     action = await _apply_user_punishment(
         db,
@@ -1499,6 +1512,9 @@ async def _remove_record_content(db: AsyncSession, record: ContentModerationReco
         if message is not None and message.recalled_at is None:
             message.recalled_at = now
             message.recalled_by_id = None
+            from app.services.messages import clear_mentions_of
+
+            await clear_mentions_of(db, message)
             return message
         return None
     model = {"post": Post, "post_comment": PostComment, "teamup_profile": TeamupProfile, "teamup_comment": TeamupComment}.get(target_type or "")

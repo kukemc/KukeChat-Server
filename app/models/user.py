@@ -14,6 +14,8 @@ from app.models.enums import ModerationStatus, PlatformRole, PresenceStatus, Use
 from datetime import date  # noqa: E402
 from sqlalchemy import Date  # noqa: E402
 
+from app.core.localtime import is_birthday_on, local_today  # noqa: E402
+
 
 def utc_now() -> datetime:
     return datetime.now(UTC)
@@ -83,17 +85,33 @@ class User(Base):
     # 对外展示的风纪委员层级（trainee / regular / senior）。冗余自 jury_members：只有在任且本人选择公开时有值，
     # 由 jury_points.sync_badge 维护。用户对象出现在消息发送等热路径上，序列化时不能再去查 jury_members
     jury_badge: Mapped[str | None] = mapped_column(String(12), nullable=True)
-    # 商店里装备着的装饰（docs/shop.md 2.3）：{"bubble": {"sku": ..., "style": {...}}} 的 JSON，没装备为空。
+    # 商店里装备着的装饰（docs/shop.md 2.3）：{"bubble": {"sku": ..., "style": {...}}, "frame": {...}} 的 JSON，没装备为空。
     # 冗余自 shop_items / shop_purchases，由 services/shop.py 维护；和 jury_badge 一样，序列化用户时不再查别的表
     cosmetics: Mapped[str | None] = mapped_column(Text, nullable=True)
     # 资料累计收到的赞（docs/chat-features.md 第 6 节），只增不减。冗余自 profile_likes，由 services/profile_likes.py
     # 在点赞的同一个事务里用 UPDATE ... SET x = x + 1 维护；序列化用户时直接读这一列，不查别的表
     profile_like_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # 心意值（docs/gifts.md）：收到的礼物花了送礼人多少币，只增不减。冗余自 gift_records（= 这个人收到的记录的 amount 之和），
+    # 由 services/gifts.py 在送礼的同一个事务里用 UPDATE ... SET charm = charm + ? 维护；序列化用户时直接读这一列
+    charm: Mapped[int] = mapped_column(Integer, default=0, server_default="0", index=True)
+    # 生日（docs/chat-features.md 第 8 节）。年月日分三列存：公开资料上只给月日，年份要本人选择公开（birthday_show_year）才给。
+    # 用户对象出现在消息、成员列表等热路径上，「今天是不是生日」只看这几列现算，不查别的表
+    birthday_year: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    birthday_month: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    birthday_day: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    birthday_show_year: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    # 已停用：以前「365 天内只能改一次」用的两列（第一次设置的时间、上次改日期的时间）。限制取消后不再读写，列留着免得动迁移
+    birthday_set_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    birthday_changed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 哪一年（UTC+8）的庆生动画已经播过了
+    birthday_celebrated_year: Mapped[int | None] = mapped_column(Integer, nullable=True)
     registration_ip: Mapped[str | None] = mapped_column(String(45), unique=True, index=True, nullable=True)
     last_login_ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_seen_ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 通知中心「看过了」的时间点：之后来的通知才算新的、才进角标（动态类通知仍按各自的已读标记）。为空表示从没打开过
+    notifications_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     ip_login_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     presence_status: Mapped[PresenceStatus] = mapped_column(
         SAEnum(PresenceStatus, native_enum=False, values_callable=lambda enum: [item.value for item in enum]),
@@ -128,6 +146,18 @@ class User(Base):
         back_populates="reviewer", foreign_keys="UserReport.reviewer_id"
     )
     bot_owner: Mapped["User | None"] = relationship(remote_side=[id], foreign_keys=[bot_owner_id])
+
+    @property
+    def birthday(self) -> dict[str, int | None] | None:
+        """公开资料上的生日（UserPublic.birthday）：{ month, day, year }，year 只有本人选择公开时才给；没设置为 None。"""
+        if not self.birthday_month or not self.birthday_day:
+            return None
+        return {"month": self.birthday_month, "day": self.birthday_day, "year": self.birthday_year if self.birthday_show_year else None}
+
+    @property
+    def is_birthday_today(self) -> bool:
+        """今天（UTC+8）是不是这个人的生日。只读这一行上的列。"""
+        return is_birthday_on(self.birthday_month, self.birthday_day, local_today())
 
 
 class CcwBindingChallenge(Base):

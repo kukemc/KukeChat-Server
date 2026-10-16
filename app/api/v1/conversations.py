@@ -66,6 +66,7 @@ from app.schemas.message import (
 from app.services import bots as bot_service
 from app.services import conversations as conversation_service
 from app.services import group_activity as group_activity_service
+from app.services import intimacy as intimacy_service
 from app.services import messages as message_service
 from app.services import moderation as moderation_service
 from app.services import pokes as poke_service
@@ -1269,6 +1270,8 @@ async def send_message(
         )
     if not current_user.content_moderation_whitelisted:
         moderation_service.schedule_message_moderation(message.id)
+    # 好友之间的私聊涨亲密度（docs/intimacy.md）：后台用自己的会话记，不拖慢发送，失败只记日志
+    intimacy_service.schedule_message(conversation_id, current_user.id, message.type, message.created_at, bind=db.bind)
     return message_data
 
 
@@ -1312,6 +1315,7 @@ async def forward_bundle(
         )
     if not current_user.content_moderation_whitelisted:
         moderation_service.schedule_message_moderation(message.id)
+    intimacy_service.schedule_message(target_conversation_id, current_user.id, message.type, message.created_at, bind=db.bind)
     return message_data
 
 
@@ -1380,10 +1384,17 @@ async def toggle_message_feature(
 @router.get("/{conversation_id}/featured-messages", response_model=list[FeaturedMessageRead])
 async def featured_messages(
     conversation_id: int,
+    response: Response,
     current_user: Annotated[User, Depends(get_current_user)],
     db: Annotated[AsyncSession, Depends(get_db)],
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
 ) -> list[FeaturedMessageRead]:
-    return await message_service.list_featured_messages(db, conversation_id, current_user.id)
+    """精华列表（来自设为精华时的快照，原消息被修剪后仍在）。仍是数组；分页信息在响应头 X-Total-Count / X-Has-More。"""
+    items, total = await message_service.list_featured_messages(db, conversation_id, current_user.id, limit, offset)
+    response.headers["X-Total-Count"] = str(total)
+    response.headers["X-Has-More"] = "true" if offset + len(items) < total else "false"
+    return items
 
 
 @router.post("/{conversation_id}/messages/{message_id}/reactions", response_model=list[MessageReactionSummary])
@@ -1427,8 +1438,9 @@ async def read_conversation(
         db, conversation_id, current_user.id, payload.last_read_message_id if payload is not None else None
     )
     member_ids = await online_conversation_member_ids(db, conversation_id)
-    await manager.send_to_users(member_ids, "conversation.read", receipt)
-    await send_conversation_updates(db, conversation_id, {current_user.id})
+    # mention_pending 是读的人自己的事：广播给全会话的那份不带它，只放在返回里、和发给本人的 conversation.updated 里
+    await manager.send_to_users(member_ids, "conversation.read", receipt.model_dump(exclude={"mention_pending"}))
+    await send_conversation_patch(db, conversation_id, {current_user.id}, {"mention_pending": receipt.mention_pending})
     return receipt
 
 

@@ -571,6 +571,9 @@ async def _remove_content(db: AsyncSession, case: ReportCase, actor_id: int | No
         conversation = await db.get(Conversation, message.conversation_id)
         if conversation is not None:
             conversation.updated_at = now
+        from app.services.messages import clear_mentions_of
+
+        await clear_mentions_of(db, message)
         return "recall_message", {"kind": "message", "message_id": message.id, "conversation_id": message.conversation_id}
     if case.target_type == "post":
         post = await db.get(Post, case.target_id)

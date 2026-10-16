@@ -7,6 +7,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from app.schemas.user import UserPublic
+
 
 class ShopCategory(BaseModel):
     key: str
@@ -35,6 +37,8 @@ class ShopItemBase(BaseModel):
     # new / hot / limited
     tag: str | None = None
     available_until: datetime | None = None
+    # 买一次拥有多少天；null 是永久
+    duration_days: int | None = None
     # false 表示已下架。用户侧只会在「我已拥有但已下架」的商品上看到 false
     is_active: bool = True
 
@@ -42,8 +46,10 @@ class ShopItemBase(BaseModel):
 class ShopItemRead(ShopItemBase):
     owned: bool = False
     equipped: bool = False
-    # buy 可以买 / level 等级够了可以免费领 / locked 等级不够且不卖 / owned 已拥有
-    obtainable: Literal["buy", "level", "locked", "owned"] = "locked"
+    # buy 可以买 / level 等级够了可以免费领 / locked 等级不够且不卖 / owned 已拥有 / renew 我拥有的是限时的，可以再买来续期
+    obtainable: Literal["buy", "level", "locked", "owned", "renew"] = "locked"
+    # 我拥有的这一件什么时候到期；永久或者没拥有为 null
+    expires_at: datetime | None = None
 
 
 class ShopBalance(BaseModel):
@@ -52,12 +58,20 @@ class ShopBalance(BaseModel):
     # 服务端核实到的累计投币
     donated: int = 0
     spent: int = 0
-    # donated − spent；换绑过 CCW 账号的人可能是负数
+    # donated − spent − gift_spent − group_plus_spent − red_packet_sent + red_packet_received + red_packet_refunded；换绑过 CCW 账号的人可能是负数
     balance: int = 0
     # 上次向 CCW 核实成功的时间；从没核实过为 null
     verified_at: datetime | None = None
     # true 表示上次核实失败（或者现在核实不了），余额可能不是最新的
     stale: bool = False
+    # 红包（docs/red-packets.md）：发出的整包金额之和、抢到的、没被领完退回来的
+    red_packet_sent: int = 0
+    red_packet_received: int = 0
+    red_packet_refunded: int = 0
+    # 送礼物 / 送商品花掉的币（docs/gifts.md）：真消耗，对方不得币
+    gift_spent: int = 0
+    # 买群升级花掉的币（docs/group-plus.md）：不退款
+    group_plus_spent: int = 0
 
 
 class ShopOverview(BaseModel):
@@ -91,12 +105,19 @@ class ShopPurchaseRead(BaseModel):
     id: int
     item: ShopItemBrief
     price: int = 0
-    source: Literal["purchase", "level", "grant"]
+    # purchase 买的 / level 等级解锁 / grant 后台赠送 / gift 别的用户送的（price 为 0，带 from_user）
+    source: Literal["purchase", "level", "grant", "gift"]
     created_at: datetime | None = None
     # 被后台收回的时间；没被收回为 null
     revoked_at: datetime | None = None
     # 收回时是否退了金币
     refunded: bool = False
+    # 限时商品：这一条记录到什么时候为止（续期之前的那几条到续期的那一刻为止）；永久的为 null
+    expires_at: datetime | None = None
+    # 这一次得到了多少天；永久的为 null
+    duration_days: int | None = None
+    # source = gift 时是谁送的
+    from_user: UserPublic | None = None
 
 
 class ShopPurchasePage(BaseModel):
@@ -122,6 +143,8 @@ class AdminShopItemWrite(BaseModel):
     is_active: bool | None = None
     sort: int | None = None
     available_until: datetime | None = None
+    # 买一次拥有多少天（1–3650）；null 是永久
+    duration_days: int | None = None
 
 
 class AdminShopItemRead(ShopItemBase):
@@ -161,6 +184,12 @@ class AdminShopPurchaseRead(BaseModel):
     revoked_by_id: int | None = None
     revoke_note: str | None = None
     refunded: bool = False
+    # 限时商品：这一条记录到什么时候为止；永久的为 null。续期之前的那几条到续期的那一刻为止（superseded_at 就是那一刻）
+    expires_at: datetime | None = None
+    duration_days: int | None = None
+    superseded_at: datetime | None = None
+    # source = gift 时是谁送的
+    from_user: AdminShopUser | None = None
 
 
 class AdminShopPurchasePage(BaseModel):
@@ -184,8 +213,16 @@ class AdminShopAccountRead(BaseModel):
     checked_at: datetime | None = None
     stale: bool = False
     last_error: str | None = None
-    # 花的比投的多
+    # 余额为负（花掉的加上发出去的，比投的加上抢到的多）
     mismatch: bool = False
+    # 红包：发出的整包金额之和、抢到的、没被领完退回来的
+    red_packet_sent: int = 0
+    red_packet_received: int = 0
+    red_packet_refunded: int = 0
+    # 送礼物 / 送商品花掉的币
+    gift_spent: int = 0
+    # 买群升级花掉的币
+    group_plus_spent: int = 0
 
 
 class AdminShopAccountPage(BaseModel):
@@ -200,13 +237,21 @@ class AdminShopReconcileResult(BaseModel):
     matched: int = 0
     # 累计投币有变化（或者新建了账户）的用户数
     updated: int = 0
-    # 核对之后「花的比投的多」的账户
+    # 核对之后余额为负的账户
     mismatched: list[AdminShopAccountRead] = Field(default_factory=list)
+    # 全站红包账的守恒检查：{ total_sent, total_claimed, total_refunded, outstanding, balanced, problems }
+    red_packets: dict[str, Any] = Field(default_factory=dict)
+    # 送礼的账的守恒检查：{ total_amount, total_count, total_charm, balanced, problems }
+    gifts: dict[str, Any] = Field(default_factory=dict)
+    # 群升级的账的守恒检查：{ total_amount, total_count, granted_count, revoked_count, balanced, problems }
+    group_plus: dict[str, Any] = Field(default_factory=dict)
 
 
 class AdminShopGrant(BaseModel):
     item_id: int
     note: str | None = Field(default=None, max_length=500)
+    # 不传按商品的设置；正整数 = 这一份只给这么多天；0 = 送成永久。范围在服务层校验
+    duration_days: int | None = None
 
 
 class AdminShopRevoke(BaseModel):
@@ -234,5 +279,11 @@ class AdminShopSettings(BaseModel):
     # 客户端内置的纹样和角饰：style 里的 pattern.key / ornaments[].key 只能用这些名字
     patterns: list[str] = Field(default_factory=list)
     ornaments: list[str] = Field(default_factory=list)
+    # 头像框的那几张表（docs/shop.md 2.4）：animation、ornaments[].key、ornaments[].position 各自能用的名字
+    frame_animations: list[str] = Field(default_factory=list)
+    frame_ornaments: list[str] = Field(default_factory=list)
+    frame_positions: list[str] = Field(default_factory=list)
     price_max: int
     unlock_level_max: int
+    # 限时商品一次最多多少天
+    duration_max: int = 3650

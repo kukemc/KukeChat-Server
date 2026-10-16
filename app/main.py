@@ -23,10 +23,16 @@ from app.core.request_guard import ClientProofMiddleware
 from app.core.transport_metrics import TransportMetrics, TransportMetricsMiddleware
 from app.services.legacy_uploads import migrate_legacy_upload_response
 from app.services.account_levels import start_account_level_worker, stop_account_level_worker
+from app.services.intimacy import start_intimacy_worker, stop_intimacy_worker
 from app.services.cases import start_jury_sweep_worker, stop_jury_sweep_worker
 from app.services.ccw import start_ccw_binding_worker, stop_ccw_binding_worker
 from app.services.moderation import start_moderation_retry_worker, stop_moderation_retry_worker
+from app.services.group_files import start_group_file_worker, stop_group_file_worker
+from app.services.red_packets import start_red_packet_worker, stop_red_packet_worker
+from app.services.gifts import ensure_default_gifts
 from app.services.shop import ensure_default_items as ensure_default_shop_items
+from app.services.shop import start_expiry_worker as start_shop_expiry_worker
+from app.services.shop import stop_expiry_worker as stop_shop_expiry_worker
 from app.services.task import start_task_reminder_worker, stop_task_reminder_worker
 from app.services.task_assistant import ensure_task_assistant_bot
 from app.services.system_settings import export_public_download_metadata, get_public_download_settings
@@ -82,6 +88,8 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
         await ensure_task_assistant_bot(db)
         # 商店的初始商品（幂等，已有的不动）
         await ensure_default_shop_items(db)
+        # 礼物目录的首批礼物（幂等，已有的不动）
+        await ensure_default_gifts(db)
     await manager.start()
     await admin_manager.start()
     await bot_manager.start()
@@ -93,11 +101,23 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
     start_jury_sweep_worker()
     # 账号等级：记在线时长、结算活跃天；老用户的折算也在这个循环启动时做一次
     start_account_level_worker()
+    # 红包：把过期没领完的、消息已被撤回的退回发送者
+    start_red_packet_worker()
+    # 限时商品：到期的卸下并通知本人，快到期的提醒一次
+    start_shop_expiry_worker()
+    # 群文件：每小时删过期的、以及群升级到期超过宽限期的文件
+    start_group_file_worker()
+    # 好友亲密度：上线后第一次启动给老好友回填一次；之后每小时补「成为好友满 N 天」的徽章
+    start_intimacy_worker()
     if transport_metrics is not None:
         await transport_metrics.start()
     try:
         yield
     finally:
+        await stop_intimacy_worker()
+        await stop_group_file_worker()
+        await stop_shop_expiry_worker()
+        await stop_red_packet_worker()
         await stop_account_level_worker()
         await stop_jury_sweep_worker()
         await stop_task_reminder_worker()
@@ -650,7 +670,13 @@ class CachedUploadFiles(StaticFiles):
             folder == "messages" and len(parts) == 2 and suffix in cls._audio_suffixes
         )
 
+    # 群文件（docs/group-plus.md 第 5 节）只能走带鉴权的下载接口，不能通过 /uploads 直链拿
+    _private_folders = {"group-files"}
+
     async def get_response(self, path: str, scope: dict) -> Response:
+        first = PurePosixPath(path.replace("\\", "/")).parts[:1]
+        if first and first[0] in self._private_folders:
+            return Response(status_code=404)
         response = await super().get_response(path, scope)
         if self.is_public_media_path(path):
             # Historic names and deleted/replaced uploads may still resolve at the same URL.
@@ -666,6 +692,8 @@ if settings.storage_backend == "local":
 else:
     @app.get("/uploads/{path:path}", include_in_schema=False)
     async def legacy_upload(path: str, request: Request, db: AsyncSession = Depends(get_db)) -> Response:
+        if path.split("/", 1)[0] in CachedUploadFiles._private_folders:
+            return Response(status_code=404)
         response = await migrate_legacy_upload_response(path, db, request)
         if response is None:
             return Response(status_code=404)

@@ -87,6 +87,9 @@ async def accept_invite(db: AsyncSession, token: str, current_user: User) -> Inv
         member_result = await db.execute(select(ConversationMember.id).where(ConversationMember.conversation_id == conversation.id, ConversationMember.user_id == current_user.id))
         if member_result.scalar_one_or_none() is not None:
             return InviteAcceptRead(target_type=link.target_type, target_id=link.target_id, conversation_id=conversation.id, status="joined", joined_now=False)
+        from app.services.conversations import ensure_capacity
+
+        await ensure_capacity(db, conversation, 1)
         db.add(ConversationMember(conversation_id=conversation.id, user_id=current_user.id, role=MemberRole.MEMBER))
         await db.commit()
         return InviteAcceptRead(target_type=link.target_type, target_id=link.target_id, conversation_id=conversation.id, status="joined", joined_now=True)

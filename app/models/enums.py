@@ -33,6 +33,8 @@ class MessageType(str, Enum):
     FORWARD_BUNDLE = "forward_bundle"
     SYSTEM = "system"
     POLL = "poll"
+    RED_PACKET = "red_packet"
+    GIFT = "gift"
 
 
 class PostVisibility(str, Enum):

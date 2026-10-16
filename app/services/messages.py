@@ -8,10 +8,11 @@ from typing import Any
 UTC = timezone.utc
 
 from fastapi import HTTPException, status
-from sqlalchemy import and_, delete, func, or_, select
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
+from app.core import group_plus_tiers
 from app.core.emoji import validate_reaction_emoji
 from app.models.conversation import Conversation, ConversationMember
 from app.models.enums import ConversationType, MemberRole, MessageType
@@ -22,6 +23,7 @@ from app.schemas.user import UserPublic
 from app.services.penalties import ensure_can_post
 from app.services.conversations import _member_mute_expired, clear_expired_member_mute, require_membership
 from app.services import group_activity as group_activity_service
+from app.services import group_snapshots
 from app.services.ccw import enrich_metadata_with_previews, extract_creation_refs
 from app.services.upload_paths import require_message_image_upload_url, require_message_or_sticker_image_url, require_message_upload_url
 
@@ -101,8 +103,31 @@ def _metadata_image_urls(metadata: dict[str, Any] | None) -> list[str]:
     return [item.strip() for item in raw_images if isinstance(item, str) and item.strip()]
 
 
-async def _prune_conversation_messages(db: AsyncSession, conversation_id: int) -> int:
+async def _message_limit(db: AsyncSession, conversation_id: int, conversation: Conversation | None = None) -> int:
+    """这个会话云端最多留多少条：私聊和免费群是 MAX_MESSAGES_PER_CONVERSATION，付费群按档位（docs/group-plus.md）。"""
+    if conversation is None:
+        row = (
+            await db.execute(
+                select(Conversation.type, Conversation.plus_tier, Conversation.plus_expires_at).where(Conversation.id == conversation_id)
+            )
+        ).one_or_none()
+        if row is None:
+            return MAX_MESSAGES_PER_CONVERSATION
+        kind, plus_tier, plus_expires_at = row
+    else:
+        kind, plus_tier, plus_expires_at = conversation.type, conversation.plus_tier, conversation.plus_expires_at
+    if kind != ConversationType.GROUP:
+        return MAX_MESSAGES_PER_CONVERSATION
+    tier = group_plus_tiers.effective_tier(plus_tier, plus_expires_at)
+    if tier == group_plus_tiers.FREE:
+        return MAX_MESSAGES_PER_CONVERSATION
+    return max(MAX_MESSAGES_PER_CONVERSATION, group_plus_tiers.TIERS[tier]["message_limit"])
+
+
+async def _prune_conversation_messages(db: AsyncSession, conversation_id: int, conversation: Conversation | None = None) -> int:
     """Remove at most one bounded batch, independently of global message ids.
+
+    保留条数按群档位（_message_limit）。精华和群待办是独立的快照表（message_id 没有外键），不会被连带删掉。
 
     The existing (conversation_id, id) index finds the 1001st newest row without
     scanning unrelated chats. Older backlogs drain 25 at a time on subsequent
@@ -114,7 +139,7 @@ async def _prune_conversation_messages(db: AsyncSession, conversation_id: int) -
         select(Message.id)
         .where(Message.conversation_id == conversation_id)
         .order_by(Message.id.desc())
-        .offset(MAX_MESSAGES_PER_CONVERSATION)
+        .offset(await _message_limit(db, conversation_id, conversation))
         .limit(1)
     )
     cutoff_id = cutoff_result.scalar_one_or_none()
@@ -154,6 +179,63 @@ def _metadata_mentions_all(metadata: dict[str, Any] | None) -> bool:
     if not isinstance(metadata, dict):
         return False
     return metadata.get("mention_all") is True or metadata.get("mentionAll") is True or _value_mentions_all(metadata.get("mentions"))
+
+
+# 一条消息最多给多少个人记「有人@我」（再多就是刷屏了，客户端也不会点名这么多人）
+MAX_RECORDED_MENTIONS = 50
+
+
+def _mentioned_user_ids(metadata: dict[str, Any] | None) -> list[int]:
+    """metadata.mentions 里点名的用户 id。客户端发的是 [{ user_id, name }]，机器人接口解析 at 元素之后也是这个形状；也认裸的数字。"""
+    mentions = metadata.get("mentions") if isinstance(metadata, dict) else None
+    if not isinstance(mentions, list):
+        return []
+    found: list[int] = []
+    for item in mentions:
+        value = item.get("user_id", item.get("id")) if isinstance(item, dict) else item
+        if isinstance(value, str) and value.isdigit():
+            value = int(value)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0 and value not in found:
+            found.append(value)
+    return found[:MAX_RECORDED_MENTIONS]
+
+
+async def _record_mentions(db: AsyncSession, conversation: Conversation, message: Message, metadata: dict[str, Any] | None) -> None:
+    """会话列表上的「有人@我 / @全体成员」（docs/chat-features.md 第 7 节）：记下这条消息提到了谁。在发消息的事务里调。
+
+    点名的：只更新被点名的那几个成员行（一条语句；不在会话里的人、发送者自己不会被更新到）。
+    @全体：只在会话那一行上记一下（这一行本来就要改 updated_at），不去动几千个成员行。
+    读的时候和各人的已读位置比较（conversations.mention_pending），不扫消息。
+    """
+    targets = [user_id for user_id in _mentioned_user_ids(metadata) if user_id != message.sender_id]
+    if targets:
+        await db.execute(
+            update(ConversationMember)
+            .where(ConversationMember.conversation_id == message.conversation_id, ConversationMember.user_id.in_(targets))
+            .values(last_mention_message_id=message.id)
+            .execution_options(synchronize_session=False)
+        )
+    if _metadata_mentions_all(metadata) and conversation.type == ConversationType.GROUP:
+        conversation.last_mention_all_message_id = message.id
+
+
+async def clear_mentions_of(db: AsyncSession, message: Message) -> None:
+    """消息被撤回：它如果正是某些人 / 这个会话记着的「最近一条提及」，就清掉，不再提示。调用方提交。
+
+    清掉而不是退回到上一条：更早的那条提及如果也还没读，提示会跟着消失 —— 尽力而为，换来的是不用为了找上一条去扫消息。
+    """
+    await db.execute(
+        update(ConversationMember)
+        .where(ConversationMember.conversation_id == message.conversation_id, ConversationMember.last_mention_message_id == message.id)
+        .values(last_mention_message_id=None)
+        .execution_options(synchronize_session=False)
+    )
+    await db.execute(
+        update(Conversation)
+        .where(Conversation.id == message.conversation_id, Conversation.last_mention_all_message_id == message.id)
+        .values(last_mention_all_message_id=None)
+        .execution_options(synchronize_session=False)
+    )
 
 
 async def _enforce_mention_all_limit(
@@ -446,11 +528,37 @@ async def send_message(
     metadata: dict[str, Any] | None = None,
     *,
     allow_poll: bool = False,
+    allow_red_packet: bool = False,
+    allow_gift: bool = False,
+    allow_file: bool = False,
+    allow_group_todo: bool = False,
+    commit: bool = True,
 ) -> Message:
+    """commit=False：消息只 flush 不提交，由调用方和自己的改动一起提交（发红包、送礼用：扣款、记录、消息要么都成要么都不成）。"""
     ensure_can_post(sender)
     # 投票消息必须由 polls.create_poll 创建，否则 metadata 里的定义没有对应的投票记录
     if message_type == MessageType.POLL and not allow_poll:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Polls must be created through the poll endpoint")
+    # 红包消息同理，只能由 red_packets.send_red_packet 创建（那里扣款）
+    if message_type == MessageType.RED_PACKET and not allow_red_packet:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Red packets must be sent through the red packet endpoint")
+    # 别的类型的消息也不能在 metadata 里夹带一个红包（把红包消息原样「转发」出去）
+    if message_type != MessageType.RED_PACKET and isinstance(metadata, dict) and "red_packet" in metadata:
+        raise _red_packet_not_forwardable()
+    # 礼物消息只能由 gifts.send_gift 创建（那里扣款、记账）；别的类型的消息也不能在 metadata 里夹带一个礼物卡片
+    if message_type == MessageType.GIFT and not allow_gift:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Gifts must be sent through the gift endpoint")
+    if message_type != MessageType.GIFT and isinstance(metadata, dict) and "gift" in metadata:
+        raise _gift_not_forwardable()
+    # 文件消息（metadata.file）只能由群文件上传接口创建，群待办提醒（metadata.group_todo）只能由群待办接口创建
+    if isinstance(metadata, dict) and "file" in metadata and not allow_file:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail={"code": "file_not_sendable", "message": "文件消息只能通过群文件上传接口发送"}
+        )
+    if isinstance(metadata, dict) and "group_todo" in metadata and not allow_group_todo:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail={"code": "group_todo_not_sendable", "message": "群待办提醒只能通过群待办接口发送"}
+        )
     max_content_length = MAX_BOT_MESSAGE_CONTENT_LENGTH if sender.is_bot else MAX_MESSAGE_CONTENT_LENGTH
     if len(content) > max_content_length:
         detail = (
@@ -506,7 +614,9 @@ async def send_message(
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only group owners or admins can @all")
     if message_type == MessageType.TEXT and extract_creation_refs(content):
         metadata = await enrich_metadata_with_previews(content, metadata)
-    await _enforce_mention_all_limit(db, conversation, membership, sender.id, metadata)
+    if not allow_group_todo:
+        # 群待办的提醒走 @全体 的链路，但不占用也不受限于 @全体成员 的每日次数
+        await _enforce_mention_all_limit(db, conversation, membership, sender.id, metadata)
     # A prior expired mute may need persistence; do not acquire a write lock until
     # the network lookup has completed.
     if membership.muted:
@@ -532,11 +642,14 @@ async def send_message(
         setattr(message, "_sender_level_exp", membership.level_exp)
     setattr(message, "_level_previous", previous_level)
     setattr(message, "_level_current", current_level)
+    if message_type != MessageType.SYSTEM:
+        await _record_mentions(db, conversation, message, metadata)
     conversation.updated_at = now
     membership.last_read_message_id = message.id
     membership.last_read_at = now
-    await _prune_conversation_messages(db, conversation_id)
-    await db.commit()
+    await _prune_conversation_messages(db, conversation_id, conversation)
+    if commit:
+        await db.commit()
     return message
 
 
@@ -577,7 +690,7 @@ async def create_system_message(
         membership.last_read_message_id = message.id
         membership.last_read_at = now
 
-    await _prune_conversation_messages(db, conversation_id)
+    await _prune_conversation_messages(db, conversation_id, conversation)
     await db.commit()
     return message
 
@@ -619,8 +732,34 @@ async def recall_message(db: AsyncSession, conversation_id: int, actor_id: int, 
         message.recalled_at = now
         message.recalled_by_id = actor_id
         conversation.updated_at = now
+        await clear_mentions_of(db, message)
         await db.commit()
+        await _end_red_packet(db, message)
     return await get_message(db, message.id)
+
+
+def _red_packet_not_forwardable() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail={"code": "red_packet_not_forwardable", "message": "红包不能转发"}
+    )
+
+
+def _gift_not_forwardable() -> HTTPException:
+    """礼物消息不能转发（docs/gifts.md）。撤回礼物消息不需要钩子：只是把消息撤掉，礼物和币都不退。"""
+    return HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail={"code": "gift_not_forwardable", "message": "礼物不能转发"})
+
+
+async def _end_red_packet(db: AsyncSession, message: Message) -> None:
+    """红包消息被撤回 = 红包提前结束，没领的退回发送者（docs/red-packets.md）。要在撤回已经提交之后调。
+
+    别的撤回路径（机器审核、案件结案）不经过这里，由红包的定时清扫在一分钟内收尾；
+    不管哪条路径，消息一旦撤回就领不了了（领取那条语句自己会看消息有没有被撤回）。
+    """
+    if message.type != MessageType.RED_PACKET:
+        return
+    from app.services import red_packets as red_packet_service
+
+    await red_packet_service.end_for_recalled_message(db, message.id)
 
 
 async def get_message(db: AsyncSession, message_id: int) -> Message:
@@ -644,8 +783,10 @@ async def admin_recall_message(db: AsyncSession, actor_id: int, message_id: int,
         conversation = await db.get(Conversation, message.conversation_id)
         if conversation is not None:
             conversation.updated_at = message.recalled_at
+        await clear_mentions_of(db, message)
         if commit:
             await db.commit()
+            await _end_red_packet(db, message)
     return await get_message(db, message.id)
 
 
@@ -829,6 +970,7 @@ async def list_all_bookmarked_messages(db: AsyncSession, actor_id: int, limit: i
 
 
 async def toggle_featured_message(db: AsyncSession, conversation_id: int, actor_id: int, message_id: int) -> bool:
+    """切换精华。设为精华时把消息固化成快照（docs/group-plus.md 第 6 节）；数量上限按群档位，超了 409 featured_limit。取消不受限。"""
     actor = await require_membership(db, conversation_id, actor_id)
     conversation = await db.get(Conversation, conversation_id)
     if conversation is None:
@@ -841,7 +983,22 @@ async def toggle_featured_message(db: AsyncSession, conversation_id: int, actor_
     message = await _get_visible_message(db, conversation_id, actor_id, message_id, allow_recalled=False)
     result = await db.execute(select(FeaturedMessage.id).where(FeaturedMessage.message_id == message.id).limit(1))
     if result.scalar_one_or_none() is None:
-        db.add(FeaturedMessage(message_id=message.id, conversation_id=conversation_id, set_by_id=actor_id))
+        tier = group_plus_tiers.conversation_tier(conversation)
+        limit = group_plus_tiers.TIERS[tier]["featured_limit"]
+        used = int(await db.scalar(select(func.count()).select_from(FeaturedMessage).where(FeaturedMessage.conversation_id == conversation_id)) or 0)
+        if used >= limit:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "featured_limit",
+                    "message": f"精华消息已达上限（{used}/{limit}），升级群档位可以提高上限",
+                    "limit": limit,
+                    "used": used,
+                    "tier": tier,
+                },
+            )
+        fields = await group_snapshots.message_snapshot_fields(db, message)
+        db.add(FeaturedMessage(message_id=message.id, conversation_id=conversation_id, set_by_id=actor_id, **fields))
         featured = True
     else:
         await db.execute(delete(FeaturedMessage).where(FeaturedMessage.message_id == message.id))
@@ -850,42 +1007,94 @@ async def toggle_featured_message(db: AsyncSession, conversation_id: int, actor_
     return featured
 
 
-async def list_featured_messages(db: AsyncSession, conversation_id: int, actor_id: int) -> list[FeaturedMessageRead]:
+async def remove_featured_by_id(db: AsyncSession, conversation_id: int, actor_id: int, featured_id: int) -> int | None:
+    """按精华 id 取消（原消息已经被修剪时用）。返回原来的 message_id。"""
+    actor = await require_membership(db, conversation_id, actor_id)
+    if actor.role not in STAFF_ROLES:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only group owners or admins can feature messages")
+    row = (
+        await db.execute(select(FeaturedMessage).where(FeaturedMessage.id == featured_id, FeaturedMessage.conversation_id == conversation_id))
+    ).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Featured message not found")
+    message_id = row.message_id
+    await db.delete(row)
+    await db.commit()
+    return message_id
+
+
+async def list_featured_messages(
+    db: AsyncSession, conversation_id: int, actor_id: int, limit: int = 50, offset: int = 0
+) -> tuple[list[FeaturedMessageRead], int]:
+    """精华列表（来自快照，原消息被修剪后仍在）。返回 (本页, 总数)。"""
     membership = await require_membership(db, conversation_id, actor_id)
     hidden_message_ids = select(MessageVisibility.message_id).where(MessageVisibility.user_id == actor_id)
-    stmt = (
-        select(FeaturedMessage)
-        .join(Message, FeaturedMessage.message_id == Message.id)
-        .options(
-            joinedload(FeaturedMessage.message).joinedload(Message.sender),
-            joinedload(FeaturedMessage.set_by),
-        )
-        .where(
-            FeaturedMessage.conversation_id == conversation_id,
-            Message.id.not_in(hidden_message_ids),
-        )
-        .order_by(FeaturedMessage.created_at.desc(), FeaturedMessage.id.desc())
-    )
-    if membership.cleared_before_message_id is not None:
-        stmt = stmt.where(Message.id > membership.cleared_before_message_id)
-    result = await db.execute(
-        stmt
-    )
-    featured_messages = list(result.scalars().all())
-    message_reads = await build_message_reads(db, [item.message for item in featured_messages], actor_id)
-    message_by_id = {message.id: message for message in message_reads}
-    return [
-        FeaturedMessageRead(
-            id=item.id,
-            conversation_id=item.conversation_id,
-            message_id=item.message_id,
-            set_by_id=item.set_by_id,
-            set_by=UserPublic.model_validate(item.set_by) if item.set_by is not None else None,
-            created_at=item.created_at,
-            message=message_by_id[item.message_id],
-        )
-        for item in featured_messages
+    clauses: list[Any] = [
+        FeaturedMessage.conversation_id == conversation_id,
+        or_(FeaturedMessage.message_id.is_(None), FeaturedMessage.message_id.not_in(hidden_message_ids)),
     ]
+    if membership.cleared_before_message_id is not None:
+        clauses.append(or_(FeaturedMessage.message_id.is_(None), FeaturedMessage.message_id > membership.cleared_before_message_id))
+    total = int(await db.scalar(select(func.count()).select_from(FeaturedMessage).where(*clauses)) or 0)
+    rows = list(
+        (
+            await db.execute(
+                select(FeaturedMessage)
+                .options(joinedload(FeaturedMessage.set_by))
+                .where(*clauses)
+                .order_by(FeaturedMessage.created_at.desc(), FeaturedMessage.id.desc())
+                .offset(offset)
+                .limit(limit)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    message_ids = [row.message_id for row in rows if row.message_id is not None]
+    live: dict[int, Message] = {}
+    if message_ids:
+        live = {
+            message.id: message
+            for message in (
+                await db.execute(select(Message).options(joinedload(Message.sender)).where(Message.id.in_(message_ids)))
+            ).scalars().all()
+        }
+    live_reads = {read.id: read for read in await build_message_reads(db, [m for m in live.values() if m.recalled_at is None], actor_id)}
+    sender_ids = {row.snap_sender_id for row in rows if row.snap_sender_id is not None and row.message_id not in live}
+    senders: dict[int, User] = {}
+    if sender_ids:
+        senders = {user.id: user for user in (await db.execute(select(User).where(User.id.in_(sender_ids)))).scalars().all()}
+    items: list[FeaturedMessageRead] = []
+    for row in rows:
+        message = live.get(row.message_id) if row.message_id is not None else None
+        recalled = row.snap_recalled_at is not None or (message is not None and message.recalled_at is not None)
+        if message is not None and message.id in live_reads and not recalled:
+            read = live_reads[message.id]
+        else:
+            read = group_snapshots.snapshot_message_read(
+                row,
+                message_id=row.message_id or 0,
+                conversation_id=conversation_id,
+                sender=message.sender if message is not None else senders.get(row.snap_sender_id or 0),
+            )
+            if recalled and read.recalled_at is None and message is not None:
+                read = read.model_copy(update={"recalled_at": message.recalled_at, "content": "", "metadata": None})
+        items.append(
+            FeaturedMessageRead(
+                id=row.id,
+                conversation_id=row.conversation_id,
+                message_id=row.message_id,
+                set_by_id=row.set_by_id,
+                set_by=UserPublic.model_validate(row.set_by) if row.set_by is not None else None,
+                created_at=row.created_at,
+                message=read,
+                message_exists=message is not None and message.recalled_at is None,
+                recalled=recalled,
+                snapshot_missing=bool(row.snapshot_missing),
+            )
+        )
+    return items, total
+
 
 async def list_messages(
     db: AsyncSession,
@@ -1275,6 +1484,19 @@ async def create_forward_bundle(
     visible_messages = sorted(result.scalars().all(), key=lambda message: message.id)
     if not visible_messages:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No visible messages to forward")
+    # 红包不能转发，夹在合并转发里也不行（docs/red-packets.md）。引用红包消息不受影响
+    if any(message.type == MessageType.RED_PACKET for message in visible_messages):
+        raise _red_packet_not_forwardable()
+    # 礼物同理（docs/gifts.md）
+    if any(message.type == MessageType.GIFT for message in visible_messages):
+        raise _gift_not_forwardable()
+    # 文件消息（metadata.file）同理：下载要鉴权，转发出去别的会话的人下不了（docs/group-plus.md 5.2）
+    for message in visible_messages:
+        meta = _metadata_from_json(message.metadata_json)
+        if isinstance(meta, dict) and "file" in meta:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail={"code": "file_not_forwardable", "message": "文件消息不能转发"}
+            )
 
     source_title = await _conversation_snapshot_title(db, source_conversation, actor.id)
     metadata: dict[str, Any] = {
@@ -1331,9 +1553,13 @@ async def mark_conversation_read(
     membership.last_read_message_id = last_read_message_id
     membership.last_read_at = now
     await db.commit()
+    from app.services.conversations import mention_pending
+
+    conversation = await db.get(Conversation, conversation_id)
     return ReadReceipt(
         conversation_id=conversation_id,
         user_id=user_id,
         last_read_message_id=last_read_message_id,
         last_read_at=now,
+        mention_pending=mention_pending(conversation, membership) if conversation is not None else None,
     )
