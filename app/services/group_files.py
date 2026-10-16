@@ -9,6 +9,9 @@ application/octet-stream；用户声明的类型只存在库里用来显示图�
 
 直传（S3 存储且配了 S3_PRIVATE_BUCKET）：group-files/ 放私有桶，客户端先开上传单拿预签名 PUT、直接传桶、再 complete；
 下载拿 5 分钟的预签名 GET。complete 之后和 multipart 上传走同一条记录 / 落消息的路（_commit_file）。
+
+文件夹（5.5）：只有一层，Pro+ / MAX 才能新建、重命名、移入（上传进去也算移入）；群主 / 管理员管理，普通成员浏览、上传进去。
+降档之后照常浏览下载，删文件夹（文件回根目录）和移回根目录仍然可以。临时文件不进文件夹：上传变成临时文件时放根目录。
 """
 
 from __future__ import annotations
@@ -26,14 +29,15 @@ from uuid import uuid4
 
 from fastapi import HTTPException, UploadFile, status
 from fastapi.responses import FileResponse, Response
-from sqlalchemy import case, delete, func, or_, select
+from sqlalchemy import case, delete, func, or_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import group_plus_tiers as tiers
 from app.core.database import AsyncSessionLocal
 from app.models.conversation import Conversation, ConversationMember
 from app.models.enums import ConversationType, MemberRole, MessageType
-from app.models.group_plus import GroupFile, GroupFileUpload
+from app.models.group_plus import GroupFile, GroupFileFolder, GroupFileUpload
 from app.models.message import Message
 from app.models.user import User
 from app.schemas.user import UserPublic
@@ -150,9 +154,11 @@ def _too_large(quota: dict[str, Any]) -> HTTPException:
     )
 
 
-def _file_view(row: GroupFile, users: dict[int, User], conversation_id: int, now: datetime) -> dict[str, Any]:
+def _file_view(row: GroupFile, users: dict[int, User], conversation_id: int, now: datetime, folders: dict[int, str] | None = None) -> dict[str, Any]:
     expires = tiers.aware(row.expires_at)
     uploader = users.get(row.uploader_id) if row.uploader_id is not None else None
+    # 文件夹已经不在了（删文件夹时会移回根目录，这里兜底）就当在根目录
+    folder_name = (folders or {}).get(row.folder_id) if row.folder_id is not None else None
     return {
         "id": row.id,
         "conversation_id": conversation_id,
@@ -168,6 +174,8 @@ def _file_view(row: GroupFile, users: dict[int, User], conversation_id: int, now
         "expired": expires is not None and expires <= now,
         "message_id": row.message_id,
         "download_path": f"/api/v1/conversations/{conversation_id}/files/{row.id}/download",
+        "folder_id": row.folder_id if folder_name is not None else None,
+        "folder_name": folder_name,
     }
 
 
@@ -177,26 +185,72 @@ async def _views(db: AsyncSession, rows: list[GroupFile], conversation_id: int) 
     users: dict[int, User] = {}
     if ids:
         users = {user.id: user for user in (await db.execute(select(User).where(User.id.in_(ids)))).scalars().all()}
-    return [_file_view(row, users, conversation_id, now) for row in rows]
+    folder_ids = {row.folder_id for row in rows if row.folder_id is not None}
+    folders: dict[int, str] = {}
+    if folder_ids:
+        folders = {
+            folder_id: name
+            for folder_id, name in (
+                await db.execute(
+                    select(GroupFileFolder.id, GroupFileFolder.name).where(GroupFileFolder.conversation_id == conversation_id, GroupFileFolder.id.in_(folder_ids))
+                )
+            ).all()
+        }
+    return [_file_view(row, users, conversation_id, now, folders) for row in rows]
 
 
 # ---------------------------------------------------------------- 列表、配额
 
 
 async def list_files(
-    db: AsyncSession, user_id: int, conversation_id: int, *, q: str | None, uploader_id: int | None, limit: int, offset: int
+    db: AsyncSession,
+    user_id: int,
+    conversation_id: int,
+    *,
+    q: str | None,
+    uploader_id: int | None,
+    limit: int,
+    offset: int,
+    folder_id: int | None = None,
 ) -> dict[str, Any]:
-    conversation, _member = await _context(db, user_id, conversation_id)
+    """不带 folder_id：根目录的文件；带了：这个文件夹里的文件。带了 q / uploader_id 是搜索：跨所有文件夹，忽略 folder_id。
+    都带上这个群的全部文件夹（folders）和当前用户能不能管理文件夹。"""
+    conversation, member = await _context(db, user_id, conversation_id)
     now = _now()
     clauses = [GroupFile.conversation_id == conversation_id, _live(now)]
     term = (q or "").strip()
+    search = bool(term) or uploader_id is not None
     if term:
         clauses.append(GroupFile.name.ilike(f"%{term}%"))
     if uploader_id is not None:
         clauses.append(GroupFile.uploader_id == uploader_id)
+    current: GroupFileFolder | None = None
+    if not search:
+        if folder_id is not None:
+            current = await _get_folder(db, conversation_id, folder_id)
+            clauses.append(GroupFile.folder_id == folder_id)
+        else:
+            # 根目录；指向已经不在的文件夹的文件也算根目录（兜底）
+            clauses.append(
+                or_(
+                    GroupFile.folder_id.is_(None),
+                    GroupFile.folder_id.not_in(select(GroupFileFolder.id).where(GroupFileFolder.conversation_id == conversation_id)),
+                )
+            )
     total = int(await db.scalar(select(func.count()).select_from(GroupFile).where(*clauses)) or 0)
     rows = (await db.execute(select(GroupFile).where(*clauses).order_by(GroupFile.id.desc()).offset(offset).limit(limit))).scalars().all()
-    return {"items": await _views(db, list(rows), conversation_id), "total": total, "quota": await quota_of(db, conversation, now)}
+    folders = await _folder_views(db, conversation_id, now)
+    return {
+        "items": await _views(db, list(rows), conversation_id),
+        "total": total,
+        "quota": await quota_of(db, conversation, now),
+        "folder_id": current.id if current is not None else None,
+        "folder": next((view for view in folders if current is not None and view["id"] == current.id), None),
+        "folders": folders,
+        "folder_limit": tiers.FOLDER_LIMIT,
+        "search": search,
+        **_folder_permissions(conversation, member, now),
+    }
 
 
 async def usage(db: AsyncSession, user_id: int, conversation_id: int) -> dict[str, Any]:
@@ -292,6 +346,7 @@ async def _commit_file(
     keep_forever: bool,
     announce: bool,
     upload_id: str | None = None,
+    folder_id: int | None = None,
 ) -> tuple[dict[str, Any], Message | None]:
     """对象已经在存储里了：记录（落消息）并提交。multipart 上传和直传 complete 走这同一条路。
     写事务：按现在的剩余空间再定一遍是空间文件还是临时文件（别的上传可能刚进来）、记录、（落消息）、提交，一起成或一起不成；
@@ -311,6 +366,11 @@ async def _commit_file(
                 now = _now()
                 quota = await quota_of(db, conversation, now)
                 temporary, expires_at = _decide(quota, size, keep_forever, _ttl_hours(conversation), now)
+                # 临时文件不进文件夹；文件夹这时已经被删了、档位不够了，也放根目录（不让已经传上去的文件白传）
+                if folder_id is not None and (
+                    temporary or not tiers.folders_enabled(conversation, now) or await _find_folder(db, conversation_id, folder_id) is None
+                ):
+                    folder_id = None
                 row = GroupFile(
                     conversation_id=conversation_id,
                     uploader_id=user.id,
@@ -320,6 +380,7 @@ async def _commit_file(
                     storage_key=key,
                     expires_at=expires_at,
                     temporary=temporary,
+                    folder_id=folder_id,
                     created_at=now,
                 )
                 db.add(row)
@@ -366,10 +427,11 @@ async def _commit_file(
 
 
 async def upload_file(
-    db: AsyncSession, user: User, conversation_id: int, upload: UploadFile, *, announce: bool, permanent: bool
+    db: AsyncSession, user: User, conversation_id: int, upload: UploadFile, *, announce: bool, permanent: bool, folder_id: int | None = None
 ) -> tuple[dict[str, Any], Message | None]:
     """POST /conversations/{cid}/files。返回 (GroupFileRead, 落下的文件消息或 None)；消息的广播由接口层做。"""
     conversation, is_staff, now = await _uploadable(db, user, conversation_id)
+    folder_id = await _target_folder(db, conversation, folder_id, now)
     name = clean_filename(upload.filename)
     content_type = _clean_content_type(upload.content_type)
     quota = await quota_of(db, conversation, now)
@@ -384,7 +446,16 @@ async def upload_file(
     finally:
         spool.close()
     return await _commit_file(
-        db, user, conversation, key=key, name=name, size=size, content_type=content_type, keep_forever=bool(permanent and is_staff), announce=announce
+        db,
+        user,
+        conversation,
+        key=key,
+        name=name,
+        size=size,
+        content_type=content_type,
+        keep_forever=bool(permanent and is_staff),
+        announce=announce,
+        folder_id=folder_id,
     )
 
 
@@ -405,11 +476,20 @@ async def _drop_upload(db: AsyncSession, upload_id: str) -> None:
 
 
 async def create_upload(
-    db: AsyncSession, user: User, conversation_id: int, *, name: str, size: int, content_type: str | None, permanent: bool
+    db: AsyncSession,
+    user: User,
+    conversation_id: int,
+    *,
+    name: str,
+    size: int,
+    content_type: str | None,
+    permanent: bool,
+    folder_id: int | None = None,
 ) -> dict[str, Any]:
     """POST /conversations/{cid}/files/uploads：检查和 multipart 上传一样，通过了发一个预签名 PUT。
     temporary 是按现在的剩余空间预估的，complete 时会再定一遍。"""
     conversation, is_staff, now = await _uploadable(db, user, conversation_id)
+    folder_id = await _target_folder(db, conversation, folder_id, now)
     quota = await quota_of(db, conversation, now)
     _check_size(quota, size)
     keep_forever = bool(permanent and is_staff)
@@ -432,12 +512,21 @@ async def create_upload(
             content_type=_clean_content_type(content_type),
             permanent=keep_forever,
             temporary=temporary,
+            folder_id=folder_id,
             created_at=now,
             expires_at=now + timedelta(seconds=UPLOAD_TTL_SECONDS),
         )
     )
     await db.commit()
-    return {"upload_id": upload_id, "url": url, "method": "PUT", "headers": headers, "expires_at": url_expires, "temporary": temporary}
+    return {
+        "upload_id": upload_id,
+        "url": url,
+        "method": "PUT",
+        "headers": headers,
+        "expires_at": url_expires,
+        "temporary": temporary,
+        "folder_id": None if temporary else folder_id,
+    }
 
 
 async def complete_upload(
@@ -450,6 +539,7 @@ async def complete_upload(
     if pending is None or pending.conversation_id != conversation_id or pending.uploader_id != user.id or expires is None or expires <= _now():
         raise _upload_not_found()
     key, size, name, content_type, keep_forever = pending.storage_key, int(pending.size), pending.name, pending.content_type, bool(pending.permanent)
+    folder_id = pending.folder_id
     try:
         # 开单之后可能被禁言了、群升级到期了：不让落库，传上去的对象删掉
         conversation, _is_staff, _at = await _uploadable(db, user, conversation_id)
@@ -465,7 +555,17 @@ async def complete_upload(
         await _drop_upload(db, upload_id)
         raise _error(status.HTTP_422_UNPROCESSABLE_ENTITY, "upload_size_mismatch", "传上去的文件大小和申请时不一致", size=size, uploaded_size=stored_size)
     return await _commit_file(
-        db, user, conversation, key=key, name=name, size=size, content_type=content_type, keep_forever=keep_forever, announce=announce, upload_id=upload_id
+        db,
+        user,
+        conversation,
+        key=key,
+        name=name,
+        size=size,
+        content_type=content_type,
+        keep_forever=keep_forever,
+        announce=announce,
+        upload_id=upload_id,
+        folder_id=folder_id,
     )
 
 
@@ -571,6 +671,244 @@ async def set_permanent(db: AsyncSession, user_id: int, conversation_id: int, fi
     return (await _views(db, [row], conversation_id))[0]
 
 
+# ---------------------------------------------------------------- 文件夹（5.5）
+
+
+_FOLDER_FORBIDDEN = set("/\\  ")
+
+
+def clean_folder_name(raw: Any) -> tuple[str, str]:
+    """文件夹名：去掉首尾空白，1–40 个字，不能有换行 / 控制字符 / 不可见的格式字符，不能有 / 和 \\。
+    返回 (名字, 查重用的 key：NFKC + casefold，不区分大小写)。"""
+    if not isinstance(raw, str):
+        raise _error(status.HTTP_422_UNPROCESSABLE_ENTITY, "invalid_folder_name", "文件夹名不能为空")
+    name = unicodedata.normalize("NFC", raw).strip()
+    if not 1 <= len(name) <= tiers.FOLDER_NAME_MAX:
+        raise _error(status.HTTP_422_UNPROCESSABLE_ENTITY, "invalid_folder_name", f"文件夹名需要 1 到 {tiers.FOLDER_NAME_MAX} 个字")
+    if any(ch in _FOLDER_FORBIDDEN or unicodedata.category(ch) in ("Cc", "Cf", "Cs", "Co") for ch in name):
+        raise _error(status.HTTP_422_UNPROCESSABLE_ENTITY, "invalid_folder_name", "文件夹名不能包含换行、/ 或特殊字符")
+    return name, unicodedata.normalize("NFKC", name).casefold()
+
+
+def _folder_permissions(conversation: Conversation, member: ConversationMember, now: datetime) -> dict[str, bool]:
+    """can_manage_folders：能新建、重命名文件夹、把文件移进去（群管 + 档位够）；
+    can_tidy_folders：能删文件夹、把文件移回根目录（群管，降档后也行）。"""
+    staff = member.role in STAFF_ROLES
+    return {"can_manage_folders": staff and tiers.folders_enabled(conversation, now), "can_tidy_folders": staff}
+
+
+def _require_staff(member: ConversationMember) -> None:
+    if member.role not in STAFF_ROLES:
+        raise _error(status.HTTP_403_FORBIDDEN, "not_group_staff", "只有群主和管理员可以管理文件夹")
+
+
+def _require_folders(conversation: Conversation, now: datetime) -> None:
+    if not tiers.folders_enabled(conversation, now):
+        raise _error(status.HTTP_403_FORBIDDEN, "folders_require_plus", "文件夹需要群升级 Pro+ 或 MAX", tier=tiers.conversation_tier(conversation, now))
+
+
+def _folder_not_found() -> HTTPException:
+    return _error(status.HTTP_404_NOT_FOUND, "folder_not_found", "文件夹不存在")
+
+
+async def _find_folder(db: AsyncSession, conversation_id: int, folder_id: int) -> GroupFileFolder | None:
+    row = await db.get(GroupFileFolder, folder_id, populate_existing=True)
+    return row if row is not None and row.conversation_id == conversation_id else None
+
+
+async def _get_folder(db: AsyncSession, conversation_id: int, folder_id: int) -> GroupFileFolder:
+    row = await _find_folder(db, conversation_id, folder_id)
+    if row is None:
+        raise _folder_not_found()
+    return row
+
+
+async def _target_folder(db: AsyncSession, conversation: Conversation, folder_id: int | None, now: datetime) -> int | None:
+    """上传时指定的文件夹：档位要够、文件夹要是这个群的。"""
+    if folder_id is None:
+        return None
+    _require_folders(conversation, now)
+    return (await _get_folder(db, conversation.id, folder_id)).id
+
+
+async def _folder_views(db: AsyncSession, conversation_id: int, now: datetime, only_id: int | None = None) -> list[dict[str, Any]]:
+    """这个群的文件夹，按创建先后（id 升序）。file_count / total_size 只算没过期的文件。"""
+    query = select(GroupFileFolder).where(GroupFileFolder.conversation_id == conversation_id)
+    if only_id is not None:
+        query = query.where(GroupFileFolder.id == only_id)
+    rows = (await db.execute(query.order_by(GroupFileFolder.id))).scalars().all()
+    if not rows:
+        return []
+    stats = {
+        folder_id: (int(count or 0), int(total or 0))
+        for folder_id, count, total in (
+            await db.execute(
+                select(GroupFile.folder_id, func.count(GroupFile.id), func.coalesce(func.sum(GroupFile.size), 0))
+                .where(GroupFile.conversation_id == conversation_id, GroupFile.folder_id.in_([row.id for row in rows]), _live(now))
+                .group_by(GroupFile.folder_id)
+            )
+        ).all()
+    }
+    creator_ids = {row.created_by_id for row in rows if row.created_by_id is not None}
+    users: dict[int, User] = {}
+    if creator_ids:
+        users = {user.id: user for user in (await db.execute(select(User).where(User.id.in_(creator_ids)))).scalars().all()}
+    views = []
+    for row in rows:
+        count, total = stats.get(row.id, (0, 0))
+        creator = users.get(row.created_by_id) if row.created_by_id is not None else None
+        views.append(
+            {
+                "id": row.id,
+                "conversation_id": conversation_id,
+                "name": row.name,
+                "file_count": count,
+                "total_size": total,
+                "created_by": UserPublic.model_validate(creator) if creator is not None else None,
+                "created_by_id": row.created_by_id,
+                "created_at": tiers.aware(row.created_at),
+                "updated_at": tiers.aware(row.updated_at),
+            }
+        )
+    return views
+
+
+async def _folder_view(db: AsyncSession, conversation_id: int, folder_id: int) -> dict[str, Any]:
+    views = await _folder_views(db, conversation_id, _now(), only_id=folder_id)
+    if not views:
+        raise _folder_not_found()
+    return views[0]
+
+
+def _name_taken() -> HTTPException:
+    return _error(status.HTTP_409_CONFLICT, "folder_name_taken", "已经有同名的文件夹了")
+
+
+async def _name_in_use(db: AsyncSession, conversation_id: int, key: str, exclude_id: int | None = None) -> bool:
+    query = select(GroupFileFolder.id).where(GroupFileFolder.conversation_id == conversation_id, GroupFileFolder.name_key == key)
+    if exclude_id is not None:
+        query = query.where(GroupFileFolder.id != exclude_id)
+    return (await db.scalar(query.limit(1))) is not None
+
+
+async def list_folders(db: AsyncSession, user_id: int, conversation_id: int) -> dict[str, Any]:
+    conversation, member = await _context(db, user_id, conversation_id)
+    now = _now()
+    return {"items": await _folder_views(db, conversation_id, now), "limit": tiers.FOLDER_LIMIT, **_folder_permissions(conversation, member, now)}
+
+
+async def create_folder(db: AsyncSession, user_id: int, conversation_id: int, name: Any) -> dict[str, Any]:
+    conversation, member = await _context(db, user_id, conversation_id)
+    _require_staff(member)
+    _require_folders(conversation, _now())
+    name, key = clean_folder_name(name)
+    async with shop_service._write_lock():
+        try:
+            count = int(await db.scalar(select(func.count()).select_from(GroupFileFolder).where(GroupFileFolder.conversation_id == conversation_id)) or 0)
+            if count >= tiers.FOLDER_LIMIT:
+                raise _error(status.HTTP_409_CONFLICT, "folder_limit", f"每个群最多 {tiers.FOLDER_LIMIT} 个文件夹", limit=tiers.FOLDER_LIMIT)
+            if await _name_in_use(db, conversation_id, key):
+                raise _name_taken()
+            now = _now()
+            row = GroupFileFolder(conversation_id=conversation_id, name=name, name_key=key, created_by_id=user_id, created_at=now, updated_at=now)
+            db.add(row)
+            await db.commit()
+        except IntegrityError:
+            # 另一个 worker 同时建了同名的
+            await db.rollback()
+            raise _name_taken() from None
+        except BaseException:
+            await db.rollback()
+            raise
+    return await _folder_view(db, conversation_id, row.id)
+
+
+async def rename_folder(db: AsyncSession, user_id: int, conversation_id: int, folder_id: int, name: Any) -> dict[str, Any]:
+    conversation, member = await _context(db, user_id, conversation_id)
+    _require_staff(member)
+    _require_folders(conversation, _now())
+    name, key = clean_folder_name(name)
+    async with shop_service._write_lock():
+        try:
+            row = await _get_folder(db, conversation_id, folder_id)
+            if await _name_in_use(db, conversation_id, key, exclude_id=row.id):
+                raise _name_taken()
+            row.name, row.name_key, row.updated_at = name, key, _now()
+            await db.commit()
+        except IntegrityError:
+            await db.rollback()
+            raise _name_taken() from None
+        except BaseException:
+            await db.rollback()
+            raise
+    return await _folder_view(db, conversation_id, folder_id)
+
+
+async def delete_folder(db: AsyncSession, user_id: int, conversation_id: int, folder_id: int) -> dict[str, Any]:
+    """删文件夹：里面的文件移回根目录，不删文件本身。降档后也能删（方便收拾）。"""
+    _conversation, member = await _context(db, user_id, conversation_id)
+    _require_staff(member)
+    async with shop_service._write_lock():
+        try:
+            row = await _get_folder(db, conversation_id, folder_id)
+            moved = await db.execute(
+                update(GroupFile).where(GroupFile.conversation_id == conversation_id, GroupFile.folder_id == folder_id).values(folder_id=None)
+            )
+            await db.execute(
+                update(GroupFileUpload)
+                .where(GroupFileUpload.conversation_id == conversation_id, GroupFileUpload.folder_id == folder_id)
+                .values(folder_id=None)
+            )
+            await db.delete(row)
+            await db.commit()
+        except BaseException:
+            await db.rollback()
+            raise
+    return {"folder_id": folder_id, "moved_to_root": int(moved.rowcount or 0)}
+
+
+async def move_files(db: AsyncSession, user_id: int, conversation_id: int, file_ids: list[int], folder_id: int | None) -> dict[str, Any]:
+    """批量移动：folder_id 为 null 是移回根目录（降档后也行）；移进文件夹要档位够，临时文件、已过期的文件不能移进去。
+    要么全部移动，要么一个都不动。"""
+    conversation, member = await _context(db, user_id, conversation_id)
+    _require_staff(member)
+    ids = list(dict.fromkeys(file_ids))
+    if folder_id is not None:
+        _require_folders(conversation, _now())
+    async with shop_service._write_lock():
+        try:
+            if folder_id is not None:
+                await _get_folder(db, conversation_id, folder_id)
+            rows = list(
+                (await db.execute(select(GroupFile).where(GroupFile.conversation_id == conversation_id, GroupFile.id.in_(ids)))).scalars().all()
+            )
+            found = {row.id for row in rows}
+            missing = [file_id for file_id in ids if file_id not in found]
+            if missing:
+                raise _error(status.HTTP_404_NOT_FOUND, "file_not_found", "有文件不存在", file_ids=missing)
+            if folder_id is not None:
+                now = _now()
+                temporary_ids = [row.id for row in rows if row.temporary]
+                expired_ids = [row.id for row in rows if (expires := tiers.aware(row.expires_at)) is not None and expires <= now]
+                if temporary_ids or expired_ids:
+                    raise _error(
+                        status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        "file_not_movable",
+                        "临时文件和已过期的文件不能放进文件夹",
+                        temporary_ids=temporary_ids,
+                        expired_ids=expired_ids,
+                    )
+            for row in rows:
+                row.folder_id = folder_id
+            await db.commit()
+        except BaseException:
+            await db.rollback()
+            raise
+    order = {file_id: index for index, file_id in enumerate(ids)}
+    rows.sort(key=lambda row: order[row.id])
+    return {"folder_id": folder_id, "moved": len(rows), "items": await _views(db, rows, conversation_id)}
+
+
 # ---------------------------------------------------------------- 清理
 
 
@@ -597,6 +935,13 @@ async def sweep(db: AsyncSession, now: datetime | None = None) -> dict[str, int]
             keys.append(row.storage_key)
             await db.delete(row)
             orphaned += 1
+    # 失效的群（未解锁且过了宽限期 / 群不在了）：文件夹也删掉
+    folder_conversation_ids = (await db.execute(select(GroupFileFolder.conversation_id).distinct().limit(SWEEP_BATCH * 5))).scalars().all()
+    for conversation_id in folder_conversation_ids:
+        conversation = await db.get(Conversation, conversation_id)
+        if conversation is not None and tiers.file_state(conversation, now)["state"] != "locked":
+            continue
+        await db.execute(delete(GroupFileFolder).where(GroupFileFolder.conversation_id == conversation_id))
     await db.commit()
     if keys:
         await asyncio.to_thread(storage.delete_objects, keys)

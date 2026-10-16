@@ -20,6 +20,12 @@ from app.models.message import Message
 from app.models.user import User
 from app.schemas.group_plus import (
     FileQuota,
+    GroupFileFolderDeleted,
+    GroupFileFolderList,
+    GroupFileFolderRead,
+    GroupFileFolderWrite,
+    GroupFileMoveRequest,
+    GroupFileMoveResult,
     GroupFilePage,
     GroupFilePatch,
     GroupFileLink,
@@ -169,9 +175,12 @@ async def upload_group_file(
     db: Annotated[AsyncSession, Depends(get_db)],
     announce: Annotated[bool, Form()] = True,
     permanent: Annotated[bool, Form()] = False,
+    folder_id: Annotated[int | None, Form()] = None,
 ) -> GroupFileUploadResult:
     user_id, whitelisted = current_user.id, current_user.content_moderation_whitelisted
-    view, message = await file_service.upload_file(db, current_user, conversation_id, file, announce=announce, permanent=permanent)
+    view, message = await file_service.upload_file(
+        db, current_user, conversation_id, file, announce=announce, permanent=permanent, folder_id=folder_id
+    )
     return await _file_uploaded(db, conversation_id, current_user, user_id, whitelisted, view, message)
 
 
@@ -183,7 +192,12 @@ async def _file_uploaded(
     if message is not None:
         message_data = message_service.build_new_message_read(message, user_id)
         await _publish_message(db, message, current_user, whitelisted)
-    await _broadcast(db, conversation_id, "group.file.updated", {"conversation_id": conversation_id, "action": "uploaded", "file_id": view["id"]})
+    await _broadcast(
+        db,
+        conversation_id,
+        "group.file.updated",
+        {"conversation_id": conversation_id, "action": "uploaded", "file_id": view["id"], "folder_id": view.get("folder_id")},
+    )
     return GroupFileUploadResult(file=view, message=message_data)
 
 
@@ -195,7 +209,14 @@ async def create_group_file_upload(
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> GroupFileUploadTicket:
     ticket = await file_service.create_upload(
-        db, current_user, conversation_id, name=payload.name, size=payload.size, content_type=payload.content_type, permanent=payload.permanent
+        db,
+        current_user,
+        conversation_id,
+        name=payload.name,
+        size=payload.size,
+        content_type=payload.content_type,
+        permanent=payload.permanent,
+        folder_id=payload.folder_id,
     )
     return GroupFileUploadTicket(**ticket)
 
@@ -223,8 +244,86 @@ async def list_group_files(
     uploader_id: int | None = Query(default=None, ge=1),
     limit: int = Query(default=30, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
+    folder_id: int | None = Query(default=None, ge=1),
 ) -> GroupFilePage:
-    return GroupFilePage(**await file_service.list_files(db, current_user.id, conversation_id, q=q, uploader_id=uploader_id, limit=limit, offset=offset))
+    return GroupFilePage(
+        **await file_service.list_files(
+            db, current_user.id, conversation_id, q=q, uploader_id=uploader_id, limit=limit, offset=offset, folder_id=folder_id
+        )
+    )
+
+
+# 文件夹（5.5）。这几个路由要排在 /files/{file_id} 前面
+
+
+async def _folders_changed(db: AsyncSession, conversation_id: int, action: str, folder_id: int, **extra: object) -> None:
+    await _broadcast(
+        db, conversation_id, "group.file.folders.changed", {"conversation_id": conversation_id, "action": action, "folder_id": folder_id, **extra}
+    )
+
+
+@conversation_router.get("/{conversation_id}/files/folders", response_model=GroupFileFolderList)
+async def list_group_file_folders(
+    conversation_id: int,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> GroupFileFolderList:
+    return GroupFileFolderList(**await file_service.list_folders(db, current_user.id, conversation_id))
+
+
+@conversation_router.post("/{conversation_id}/files/folders", response_model=GroupFileFolderRead, status_code=201)
+async def create_group_file_folder(
+    conversation_id: int,
+    payload: GroupFileFolderWrite,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> GroupFileFolderRead:
+    view = await file_service.create_folder(db, current_user.id, conversation_id, payload.name)
+    await _folders_changed(db, conversation_id, "created", view["id"])
+    return GroupFileFolderRead(**view)
+
+
+@conversation_router.patch("/{conversation_id}/files/folders/{folder_id}", response_model=GroupFileFolderRead)
+async def rename_group_file_folder(
+    conversation_id: int,
+    folder_id: int,
+    payload: GroupFileFolderWrite,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> GroupFileFolderRead:
+    view = await file_service.rename_folder(db, current_user.id, conversation_id, folder_id, payload.name)
+    await _folders_changed(db, conversation_id, "renamed", folder_id)
+    return GroupFileFolderRead(**view)
+
+
+@conversation_router.delete("/{conversation_id}/files/folders/{folder_id}", response_model=GroupFileFolderDeleted)
+async def delete_group_file_folder(
+    conversation_id: int,
+    folder_id: int,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> GroupFileFolderDeleted:
+    result = await file_service.delete_folder(db, current_user.id, conversation_id, folder_id)
+    await _folders_changed(db, conversation_id, "deleted", folder_id, moved_to_root=result["moved_to_root"])
+    return GroupFileFolderDeleted(**result)
+
+
+@conversation_router.post("/{conversation_id}/files/move", response_model=GroupFileMoveResult)
+async def move_group_files(
+    conversation_id: int,
+    payload: GroupFileMoveRequest,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> GroupFileMoveResult:
+    result = await file_service.move_files(db, current_user.id, conversation_id, payload.file_ids, payload.folder_id)
+    file_ids = [item["id"] for item in result["items"]]
+    await _broadcast(
+        db,
+        conversation_id,
+        "group.file.updated",
+        {"conversation_id": conversation_id, "action": "moved", "file_id": file_ids[0], "file_ids": file_ids, "folder_id": result["folder_id"]},
+    )
+    return GroupFileMoveResult(**result)
 
 
 @conversation_router.get("/{conversation_id}/files/usage", response_model=FileQuota)

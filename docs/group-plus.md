@@ -194,7 +194,8 @@
 | `group.plus.updated` | `{ conversation_id, plus_tier, plus_expires_at, plus_permanent, reason }`，`reason`：`purchase` / `grant` / `revoke` / `member_limit`（后台改了人数上限，档位没变；需要的话重拉 `GET /conversations/{cid}/plus`）。不认识的 `reason` 照样按里面的档位字段更新 | 群里的在线成员。到期降级**没有事件**，客户端按 `plus_expires_at` 自己判断 |
 | `shop.balance.changed` | `{ reason: "group_plus", change: "group_plus.purchased", balance, conversation_id }` | 只发给购买人 |
 | `group.todo.updated` | 见第 6 节 | 群里的在线成员 |
-| `group.file.updated` | `{ conversation_id, action, file_id }`，`action`：`uploaded` / `deleted` / `updated`（转永久 / 转限时） | 群里的在线成员 |
+| `group.file.updated` | `{ conversation_id, action, file_id }`，`action`：`uploaded`（另带 `folder_id`） / `deleted` / `updated`（转永久 / 转限时） / `moved`（另带 `file_ids`、`folder_id`，见 5.5） | 群里的在线成员 |
+| `group.file.folders.changed` | `{ conversation_id, action, folder_id }`，`action`：`created` / `renamed` / `deleted`（另带 `moved_to_root`），见 5.5 | 群里的在线成员 |
 | `message.featured.updated` | 现有事件，不变 | 群里的在线成员 |
 
 ## 5. 群文件（Pro 起解锁）
@@ -211,13 +212,14 @@
 - 安全：下载一律 `Content-Disposition: attachment`，`X-Content-Type-Options: nosniff`，不执行、不内联渲染；`Content-Type` 对外一律 `application/octet-stream`（`GroupFileRead.content_type` 是上传时声明的类型，只用来显示图标）。文件存放在非公开的目录（`group-files/`，不可通过 `/uploads/` 直链访问），**下载必须走下面的下载接口**，要求是群成员。
 - 过期的文件：列表默认不返回；下载 410 `file_expired`。后台 worker 每小时一次删库行和存储里的对象。
 - **直传直下**（`FileQuota.direct = true` 时可用，见 5.4）：上传、下载都用预签名 URL 直接和对象存储传，不经过后端；`direct = false` 时用 multipart 上传和 `/download`。
+- **文件夹**（Pro+ / MAX，见 5.5）：一层文件夹，群主 / 管理员管理；列表默认只看根目录。
 
 ### 5.1 接口
 
 | 接口 | 权限 | 说明 |
 | --- | --- | --- |
-| `POST /conversations/{cid}/files` | 群成员（未被禁言） | multipart：`file`（必填）、`announce`（可选，默认 `true`：在群里落一条文件消息）、`permanent`（可选，仅群主 / 管理员有效，默认 `false`）。201，返回 `{ file: GroupFileRead, message: MessageRead \| null }` |
-| `GET /conversations/{cid}/files?q=&uploader_id=&limit=&offset=` | 群成员 | `{ items: [GroupFileRead], total, quota: FileQuota }`，新的在前。`q` 按文件名包含匹配，`uploader_id` 按上传人筛选；`limit` 1–100（默认 30） |
+| `POST /conversations/{cid}/files` | 群成员（未被禁言） | multipart：`file`（必填）、`announce`（可选，默认 `true`：在群里落一条文件消息）、`permanent`（可选，仅群主 / 管理员有效，默认 `false`）、`folder_id`（可选，传进这个文件夹，见 5.5）。201，返回 `{ file: GroupFileRead, message: MessageRead \| null }` |
+| `GET /conversations/{cid}/files?folder_id=&q=&uploader_id=&limit=&offset=` | 群成员 | `{ items: [GroupFileRead], total, quota: FileQuota, folders, folder, folder_id, search, can_manage_folders, can_tidy_folders, folder_limit }`，新的在前。不带 `folder_id` 是根目录，带了是这个文件夹（5.5）。`q` 按文件名包含匹配，`uploader_id` 按上传人筛选，带了任一个就是跨文件夹搜索；`limit` 1–100（默认 30） |
 | `GET /conversations/{cid}/files/usage` | 群成员 | `FileQuota` |
 | `GET /conversations/{cid}/files/{file_id}/download` | 群成员 | 带鉴权下载（`Authorization` 头，和别的接口一样），`attachment`。直传开着时也能用（后端从私有桶读出来转发） |
 | `POST /conversations/{cid}/files/uploads` | 群成员（未被禁言） | 直传开单，见 5.4。201，返回上传单 |
@@ -235,7 +237,9 @@
   "temporary": false,                          // 临时文件（空间放不下时传的，24 小时，不占配额）
   "expired": false,
   "message_id": 901,                           // 落了消息才有，否则 null；消息被修剪后指向的消息可能已经不在
-  "download_path": "/api/v1/conversations/7/files/5/download" }
+  "download_path": "/api/v1/conversations/7/files/5/download",
+  "folder_id": 3,                              // 所在的文件夹，根目录为 null（5.5）
+  "folder_name": "设计稿" }                     // 根目录为 null
 
 // FileQuota
 { "state": "active", "tier": "pro_plus", "grace_until": null,
@@ -247,7 +251,8 @@
   "temp_max_bytes": 31457280,     // 这一档临时文件的上限；未解锁为 null
   "temp_ttl_hours": 24,
   "max_file_bytes": 208666624,    // 现在能传的最大文件 = max(free_bytes, temp_max_bytes)；未解锁 / 宽限期为 0
-  "direct": true }                // 能不能直传直下（5.4）；/files/usage、/files 的 quota、/plus 的 files 都带
+  "direct": true,                 // 能不能直传直下（5.4）；/files/usage、/files 的 quota、/plus 的 files 都带
+  "folders_enabled": true }       // 档位能不能用文件夹（有效档位是 Pro+ / MAX，5.5）
 ```
 
 ### 5.2 文件消息
@@ -295,7 +300,7 @@
 
 **上传**：
 
-1. 开单 `POST /conversations/{cid}/files/uploads`，body `{ "name": "设计稿.zip", "size": 1048576, "content_type": "application/zip", "permanent": false }`（`content_type` 可空，只用来显示图标；`permanent` 同 multipart，仅群主 / 管理员有效）。权限、禁言、群文件状态、空文件、大小 / 空间 / 临时文件的检查和 multipart 上传完全一样，错误码也一样（`files_locked`、`muted`、`file_too_large`、`empty_file`……）；都过了但直传没开，409 `direct_upload_unavailable`。201：
+1. 开单 `POST /conversations/{cid}/files/uploads`，body `{ "name": "设计稿.zip", "size": 1048576, "content_type": "application/zip", "permanent": false, "folder_id": null }`（`content_type` 可空，只用来显示图标；`permanent` 同 multipart，仅群主 / 管理员有效；`folder_id` 可选，见 5.5）。权限、禁言、群文件状态、空文件、大小 / 空间 / 临时文件的检查和 multipart 上传完全一样，错误码也一样（`files_locked`、`muted`、`file_too_large`、`empty_file`……）；都过了但直传没开，409 `direct_upload_unavailable`。201：
 
    ```jsonc
    { "upload_id": "…",                    // 随机串
@@ -303,7 +308,8 @@
      "method": "PUT",
      "headers": { "Content-Type": "application/octet-stream" },   // 必须原样带上，不能多也不能改
      "expires_at": "…",                   // url 的过期时间
-     "temporary": false }                 // 按现在的剩余空间预估会不会是临时文件；以 complete 的结果为准
+     "temporary": false,                  // 按现在的剩余空间预估会不会是临时文件；以 complete 的结果为准
+     "folder_id": null }                  // 预估放进的文件夹（预估是临时文件时为 null）；以 complete 的结果为准
    ```
 
 2. 客户端 `PUT url`，请求体就是文件本身，带上 `headers`。签名里固定了 `Content-Length = size`，长度不对桶会拒（是否真的校验取决于服务商，complete 时还会再核对）。
@@ -319,6 +325,82 @@
 - 后端环境变量加 `S3_PRIVATE_BUCKET=kukechat-file`（endpoint、密钥、region 和主桶共用）。`S3_ENDPOINT_URL` 必须是 `https://`，否则预签名 URL 是 http 的，https 页面里会被浏览器当成混合内容拦掉。
 - 上线前在服务器上带着生产环境变量跑一遍 `python scripts/check_s3_direct.py`（加 `--apply-cors` 先写 CORS 规则）：实测预签名 PUT / 长度校验 / head / 预签名 GET 的下载头 / CORS 预检 / 不带签名读被拒，最后删掉测试对象，打印 PASS / FAIL。不打印密钥。
 - 已有的群文件在主桶里：配了私有桶之后后端会去私有桶找，旧文件就读不到了。上线时先把主桶 `group-files/` 下的对象迁到私有桶同名 key（或者在群文件还没真正用起来时上线）。
+
+### 5.5 文件夹（Pro+ / MAX）
+
+**规则**
+
+- **档位**：只有当前**有效档位**是 Pro+（`pro_plus`）或 MAX（`max`）的群能新建、重命名文件夹，以及把文件放进文件夹（移入、上传进去）。永久档位按它的档位算（永久 MAX 可以）。免费、Pro 没有空间，不能用，返回 403 `folders_require_plus`（带 `tier`：现在的有效档位）。`FileQuota.folders_enabled` 就是这个判断（`/files/usage`、`/files` 的 `quota`、`/plus` 的 `files` 都带）。
+- **谁能操作**：群主、管理员能新建、重命名、删除文件夹，能批量移动文件（移入 / 移出）。普通成员只能浏览；上传权限照旧（能上传的成员都能直接传进文件夹，被禁言的照样不能传）。不是群管：403 `not_group_staff`。
+- **结构**：只有一层，文件夹里不能再建文件夹。一个文件同一时间只在一个地方（根目录或某一个文件夹）。
+- **名字**：去掉首尾空白后 1–40 个字；不能有换行（含 ` ` / ` `）、控制字符、零宽等不可见格式字符、`/`、`\`，否则 422 `invalid_folder_name`。同一个群里**不区分大小写**不能重名（按 NFKC + casefold 比较，全角 / 半角也算同名），重名 409 `folder_name_taken`；重命名时只改大小写可以。名字**不过文字审核**（群文件名、群名现在也都不审，和它们保持一致）。
+- **数量**：每个群最多 50 个文件夹，满了 409 `folder_limit`（带 `limit`）。
+- **删除文件夹**：里面的文件全部移回根目录，**不删文件本身**。
+- **临时文件不进文件夹**：24 小时临时文件、已过期的文件不能移进文件夹（422 `file_not_movable`）；上传时变成临时文件的（空间满了），**忽略 `folder_id`、放根目录**，返回的 `file.folder_id` 为 `null`，客户端可以提示「空间不够，已作为临时文件放在根目录」。移回根目录不受限制。
+- **降档后**（到期进宽限期、或者换成了 Pro）：文件夹和里面的文件照常浏览、下载、删除；**不能**新建、重命名文件夹，不能移入、不能上传进文件夹（都是 403 `folders_require_plus`）；**可以**删除文件夹（文件回根目录）和把文件移回根目录，方便收拾。过了宽限期群文件被清空时，文件夹也一起删掉。
+- **旧客户端**：不传 `folder_id` 的列表只返回根目录的文件，所以放进文件夹的文件在旧客户端的列表里看不到（文件消息卡片、下载不受影响，搜索也能搜到）。
+
+**列表** `GET /conversations/{cid}/files?folder_id=&q=&uploader_id=&limit=&offset=`（群成员）
+
+- 不带 `folder_id`、不带 `q` / `uploader_id`：**根目录**的文件。
+- 带 `folder_id`：这个文件夹里的文件；文件夹不存在 / 属于别的群：404 `folder_not_found`。
+- 带了 `q` 或 `uploader_id` 就是**搜索**：跨根目录和所有文件夹搜，`folder_id` 被忽略（`search: true`）；每个文件带 `folder_id`、`folder_name` 告诉客户端它在哪。
+- 不管哪种，都返回这个群的**全部**文件夹（`folders`），排序是**按创建先后**（`created_at` / `id` 升序，新建的在最后；想按名字排客户端自己排）。
+
+```jsonc
+{ "items": [GroupFileRead], "total": 2, "quota": FileQuota,
+  "folder_id": null,               // 现在看的文件夹；根目录 / 搜索为 null
+  "folder": null,                  // 现在看的文件夹的 GroupFileFolderRead；根目录 / 搜索为 null
+  "folders": [GroupFileFolderRead],
+  "folder_limit": 50,
+  "search": false,
+  "can_manage_folders": true,      // 我能新建、重命名文件夹、把文件移进去（群管 + 档位够）→ 显示「新建文件夹」「移动到…」
+  "can_tidy_folders": true }       // 我能删文件夹、把文件移回根目录（群管，降档后也是 true）→ 显示「删除文件夹」「移回根目录」
+
+// GroupFileFolderRead
+{ "id": 3, "conversation_id": 7, "name": "设计稿",
+  "file_count": 2,                 // 里面没过期的文件数
+  "total_size": 1048576,           // 里面没过期的文件的总字节数
+  "created_by": { /* UserPublic，账号已删除为 null */ }, "created_by_id": 42,
+  "created_at": "…", "updated_at": "…" }   // 重命名会更新 updated_at
+```
+
+`GroupFileRead` 新增 `folder_id`（根目录为 `null`）、`folder_name`（根目录为 `null`），所有返回文件的接口都带。
+
+**接口**
+
+| 接口 | 权限 | 说明 |
+| --- | --- | --- |
+| `GET /conversations/{cid}/files/folders` | 群成员 | `{ items: [GroupFileFolderRead], limit: 50, can_manage_folders, can_tidy_folders }`，排序同上 |
+| `POST /conversations/{cid}/files/folders` | 群主、管理员；Pro+ / MAX | body `{ "name": "设计稿" }`。201，返回 `GroupFileFolderRead` |
+| `PATCH /conversations/{cid}/files/folders/{folder_id}` | 群主、管理员；Pro+ / MAX | body `{ "name": "新名字" }`，重命名。返回 `GroupFileFolderRead` |
+| `DELETE /conversations/{cid}/files/folders/{folder_id}` | 群主、管理员（降档后也行） | 删文件夹，里面的文件移回根目录。200，`{ "folder_id": 3, "moved_to_root": 2 }` |
+| `POST /conversations/{cid}/files/move` | 群主、管理员 | body `{ "file_ids": [5, 6], "folder_id": 3 }`，`folder_id: null` = 移回根目录（降档后也行）；移进文件夹要 Pro+ / MAX。`file_ids` 1–100 个（重复的去重），超出 / 为空 422（FastAPI 的校验错误）。**要么全部移动，要么一个都不动**。返回 `{ "folder_id": 3, "moved": 2, "items": [GroupFileRead] }`（按请求里的顺序） |
+
+**上传到文件夹**
+
+- multipart `POST /conversations/{cid}/files` 多一个可选的表单字段 `folder_id`。
+- 直传开单 `POST /conversations/{cid}/files/uploads` 的 body 多一个可选的 `folder_id`；返回的上传单多一个 `folder_id`（预估：预估是临时文件时为 `null`）。complete 不用再传，用开单时的。
+- 检查顺序：先做原来的上传检查（`files_locked`、`muted`……），再查文件夹：档位不够 403 `folders_require_plus`，文件夹不是这个群的 404 `folder_not_found`。
+- 最后落库时（multipart 的写入、直传的 complete）：变成了临时文件、文件夹在这期间被删了、或者群已经降档了，就**放根目录**，不报错（文件已经传上去了，不让它白传）。以返回的 `file.folder_id` 为准。
+
+**错误**
+
+| HTTP | `detail.code` | 含义 |
+| --- | --- | --- |
+| 403 | `folders_require_plus` | 档位不是 Pro+ / MAX：新建、重命名、移入、上传进文件夹。带 `tier` |
+| 403 | `not_group_staff` | 新建 / 重命名 / 删除文件夹、移动文件需要群主 / 管理员 |
+| 404 | `folder_not_found` | 文件夹不存在或属于别的群（列表、重命名、删除、移入、上传） |
+| 409 | `folder_name_taken` | 同一个群里已经有同名（不区分大小写）的文件夹 |
+| 409 | `folder_limit` | 已经有 50 个文件夹了。带 `limit` |
+| 422 | `invalid_folder_name` | 名字为空、超过 40 个字、有换行 / `/` / `\` / 不可见字符 |
+| 404 | `file_not_found` | 移动：有文件不存在或属于别的群。带 `file_ids`（不存在的那些），一个都没动 |
+| 422 | `file_not_movable` | 移进文件夹：有临时文件或已过期的文件。带 `temporary_ids`、`expired_ids`，一个都没动 |
+
+**实时事件**（发给群里的在线成员）
+
+- `group.file.folders.changed`：`{ conversation_id, action, folder_id }`，`action`：`created` / `renamed` / `deleted`；`deleted` 另带 `moved_to_root`（移回根目录的文件数）。收到后重拉 `GET /files/folders`（或当前列表）；正在看被删的文件夹时回到根目录。
+- `group.file.updated` 新增 `action: "moved"`：`{ conversation_id, action: "moved", file_id, file_ids, folder_id }`（`file_id` 是第一个，给只认 `file_id` 的旧逻辑；`folder_id` 是目标，`null` = 根目录）。`uploaded` 事件也多带 `folder_id`。上传、删除、移动都会改变文件夹的 `file_count` / `total_size`，收到任何 `group.file.updated` 时顺手刷新文件夹列表。
 
 ## 6. 精华消息（永久）
 
@@ -510,7 +592,7 @@
 
 ## 10. 实现要点
 
-- **表**：`group_plus_records`（每次购买 / 赠送 / 取消一行，带购买时绑定的 CCW 账号）、`group_files`（`temporary` 列：临时文件）、`group_file_uploads`（直传的上传单，complete 或过期后删除）、`group_todos`（每群一行，`conversation_id` 唯一）、`featured_messages`（重建：`message_id` 可空、无外键，加快照列）、`message_search_index` / `message_search_fts`；`conversations` 新增列 `plus_tier`、`plus_expires_at`、`plus_files_tier`、`plus_files_until`、`file_default_ttl_hours`、`member_limit_override`（9.2）。启动时自动迁移（`featured_messages` 重建并回填快照）；稳妥起见上线前先单进程启动一次。
+- **表**：`group_plus_records`（每次购买 / 赠送 / 取消一行，带购买时绑定的 CCW 账号）、`group_files`（`temporary` 列：临时文件；`folder_id` 列：所在文件夹，空 = 根目录，索引 `(conversation_id, folder_id)`）、`group_file_folders`（文件夹，`(conversation_id, name_key)` 唯一，`name_key` = 名字的 NFKC + casefold）、`group_file_uploads`（直传的上传单，complete 或过期后删除；`folder_id` 列）、`group_todos`（每群一行，`conversation_id` 唯一）、`featured_messages`（重建：`message_id` 可空、无外键，加快照列）、`message_search_index` / `message_search_fts`；`conversations` 新增列 `plus_tier`、`plus_expires_at`、`plus_files_tier`、`plus_files_until`、`file_default_ttl_hours`、`member_limit_override`（9.2）。启动时自动迁移（`featured_messages` 重建并回填快照）；稳妥起见上线前先单进程启动一次。
 - **并发**：写事务第一条语句是带条件的 `UPDATE shop_accounts`（余额够才往下写，和礼物 / 红包用同一个余额表达式），之后在同一个事务里写记录、改群、提交；写事务先过 `shop._write_lock()`。同一个 CCW 账号换绑后不能再花一遍（记录上有 `ccw_oid`）。
 - **存储**：群文件放在 `group-files/{群 id}/{随机名}`。本地存储时 `/uploads/group-files/...` 直链返回 404；S3 存储时桶里这个前缀**不要**开公开读（下载接口用服务端凭据读取再转发）；配了 `S3_PRIVATE_BUCKET` 时这个前缀整个放私有桶，直传直下见 5.4。
 - **旧客户端**：精华列表仍是数组、字段只增不减；文件消息、群待办提醒都是普通文本消息；`plus_tier` 等新字段旧客户端忽略；旧的会话内搜索 `GET /conversations/{id}/messages/search` 不变。

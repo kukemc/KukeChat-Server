@@ -275,6 +275,8 @@ def file_quota_view(conversation: Conversation, used_bytes: int, file_count: int
         "temp_ttl_hours": tiers.FILE_TEMP_TTL_HOURS,
         "max_file_bytes": max(free_bytes, temp_max or 0) if state["state"] == "active" else 0,
         "direct": storage.direct_transfer_enabled(),
+        # 档位能不能用文件夹（Pro+ / MAX，5.5）；具体某个人能不能管理看列表里的 can_manage_folders
+        "folders_enabled": tiers.folders_enabled(conversation, now),
     }
 
 

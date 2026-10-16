@@ -41,6 +41,10 @@ PRICE_MAX = 1_000_000
 # 判断「是不是永久」一律用 is_permanent（到期年份 >= 2999），不要和这个值做相等比较
 PERMANENT_EXPIRES_AT = datetime(2999, 12, 31, tzinfo=UTC)
 PERMANENT_YEAR = 2999
+# 群文件文件夹（docs/group-plus.md 5.5）：只有有空间的档位（Pro+、MAX）能新建 / 重命名 / 移入；每群最多 FOLDER_LIMIT 个，名字最长 FOLDER_NAME_MAX 个字
+FOLDER_TIERS = ("pro_plus", "max")
+FOLDER_LIMIT = 50
+FOLDER_NAME_MAX = 40
 # 每个群单独的人数上限（conversations.member_limit_override）：空 = 跟随档位，0 = 不限，正数 = 就是这个上限
 MEMBER_LIMIT_UNLIMITED = 0
 MEMBER_LIMIT_OVERRIDE_MAX = 100_000
@@ -132,3 +136,8 @@ def file_state(conversation: Any, now: datetime | None = None) -> dict[str, Any]
             "quota_bytes": TIERS[files_tier]["file_quota_bytes"], "temp_max_bytes": TIERS[files_tier]["file_temp_max_bytes"],
         }
     return {"state": "locked", "tier": None, "grace_until": None, "quota_bytes": None, "temp_max_bytes": None}
+
+
+def folders_enabled(conversation: Any, now: datetime | None = None) -> bool:
+    """这个群现在的有效档位能不能用文件夹（新建、重命名、把文件放进去）。永久档位按它的档位算。"""
+    return conversation_tier(conversation, now) in FOLDER_TIERS

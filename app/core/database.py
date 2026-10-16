@@ -779,6 +779,9 @@ async def init_db() -> None:
                 ("conversations", "member_limit_override", "member_limit_override INTEGER"),
                 # 临时文件（空间放不下时传的 24 小时文件，不占配额）；老文件都是空间文件
                 ("group_files", "temporary", "temporary BOOLEAN NOT NULL DEFAULT 0"),
+                # 群文件文件夹（5.5）：新表 group_file_folders 由 create_all 建；老文件都在根目录（空）
+                ("group_files", "folder_id", "folder_id INTEGER"),
+                ("group_file_uploads", "folder_id", "folder_id INTEGER"),
             ):
                 if table_name not in table_names:
                     continue
@@ -791,6 +794,7 @@ async def init_db() -> None:
                             raise
             for index_sql in (
                 "CREATE INDEX IF NOT EXISTS ix_conversations_plus_expires ON conversations (plus_expires_at)",
+                "CREATE INDEX IF NOT EXISTS ix_group_files_folder ON group_files (conversation_id, folder_id)",
             ):
                 await conn.execute(text(index_sql))
 

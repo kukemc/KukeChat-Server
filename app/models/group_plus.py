@@ -79,6 +79,7 @@ class GroupFile(Base):
     __table_args__ = (
         Index("ix_group_files_conversation", "conversation_id", "id"),
         Index("ix_group_files_expires", "expires_at"),
+        Index("ix_group_files_folder", "conversation_id", "folder_id"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -93,7 +94,25 @@ class GroupFile(Base):
     # 临时文件：空间放不下时传的，固定 24 小时后过期，不占空间配额（docs/group-plus.md 第 5 节）
     temporary: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
     message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # 所在的文件夹（group_file_folders.id）；空 = 根目录。不建外键：删文件夹时由服务层把文件移回根目录
+    folder_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class GroupFileFolder(Base):
+    """群文件的文件夹（docs/group-plus.md 5.5）：只有一层。name_key 是名字的 NFKC + casefold，
+    (conversation_id, name_key) 唯一，保证同一个群里不区分大小写不重名（两个 worker 并发建同名也只成一个）。"""
+
+    __tablename__ = "group_file_folders"
+    __table_args__ = (UniqueConstraint("conversation_id", "name_key", name="uq_group_file_folder_name"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    conversation_id: Mapped[int] = mapped_column(Integer, index=True)
+    name: Mapped[str] = mapped_column(String(40))
+    name_key: Mapped[str] = mapped_column(String(160))
+    created_by_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
 class GroupFileUpload(Base):
@@ -113,6 +132,8 @@ class GroupFileUpload(Base):
     # 请求时带的 permanent（只对群管有效）；temporary 是开单时定的，complete 时按当时的剩余空间再定一遍
     permanent: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
     temporary: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    # 开单时指定的文件夹；complete 时文件夹没了 / 变成临时文件 / 档位不够了就放根目录
+    folder_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 

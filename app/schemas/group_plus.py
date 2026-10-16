@@ -73,6 +73,8 @@ class FileQuota(BaseModel):
     max_file_bytes: int
     # 直传直下：true 时用 /files/uploads 和 /files/{id}/link，false 时走 multipart 上传和 /download
     direct: bool = False
+    # 档位能不能用文件夹（Pro+ / MAX）
+    folders_enabled: bool = False
 
 
 class PlusRead(BaseModel):
@@ -179,6 +181,48 @@ class GroupFileRead(BaseModel):
     expired: bool = False
     message_id: int | None = None
     download_path: str
+    # 所在的文件夹；根目录为 null（5.5）
+    folder_id: int | None = None
+    folder_name: str | None = None
+
+
+class GroupFileFolderRead(BaseModel):
+    id: int
+    conversation_id: int
+    name: str
+    file_count: int = 0
+    total_size: int = 0
+    created_by: UserPublic | None = None
+    created_by_id: int | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class GroupFileFolderList(BaseModel):
+    items: list[GroupFileFolderRead] = Field(default_factory=list)
+    limit: int = 50
+    can_manage_folders: bool = False
+    can_tidy_folders: bool = False
+
+
+class GroupFileFolderWrite(BaseModel):
+    name: Any = None
+
+
+class GroupFileFolderDeleted(BaseModel):
+    folder_id: int
+    moved_to_root: int = 0
+
+
+class GroupFileMoveRequest(BaseModel):
+    file_ids: list[int] = Field(min_length=1, max_length=100)
+    folder_id: int | None = None
+
+
+class GroupFileMoveResult(BaseModel):
+    folder_id: int | None = None
+    moved: int = 0
+    items: list["GroupFileRead"] = Field(default_factory=list)
 
 
 class GroupFileUploadResult(BaseModel):
@@ -191,6 +235,7 @@ class GroupFileUploadRequest(BaseModel):
     size: int
     content_type: str | None = Field(default=None, max_length=255)
     permanent: bool = False
+    folder_id: int | None = None
 
 
 class GroupFileUploadTicket(BaseModel):
@@ -200,6 +245,8 @@ class GroupFileUploadTicket(BaseModel):
     headers: dict[str, str] = Field(default_factory=dict)
     expires_at: datetime
     temporary: bool = False
+    # 预估会放进的文件夹：预估是临时文件时为 null（临时文件不进文件夹）；以 complete 的结果为准
+    folder_id: int | None = None
 
 
 class GroupFileUploadCompleteRequest(BaseModel):
@@ -215,6 +262,15 @@ class GroupFilePage(BaseModel):
     items: list[GroupFileRead] = Field(default_factory=list)
     total: int = 0
     quota: FileQuota
+    # 文件夹（5.5）：folders 是这个群的全部文件夹；folder 是现在看的文件夹（根目录 / 搜索为 null）
+    folder_id: int | None = None
+    folder: GroupFileFolderRead | None = None
+    folders: list[GroupFileFolderRead] = Field(default_factory=list)
+    folder_limit: int = 50
+    # 搜索模式（带了 q 或 uploader_id）：跨所有文件夹搜，忽略 folder_id
+    search: bool = False
+    can_manage_folders: bool = False
+    can_tidy_folders: bool = False
 
 
 class GroupFilePatch(BaseModel):

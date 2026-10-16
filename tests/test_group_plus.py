@@ -26,7 +26,7 @@ from app.core.database import Base, configure_sqlite_connection, get_db
 from app.core.dependencies import get_current_user
 from app.models.conversation import Conversation, ConversationMember
 from app.models.enums import ConversationType, MemberRole, MessageType, PlatformRole
-from app.models.group_plus import GroupFile, GroupFileUpload, GroupPlusRecord, GroupTodo
+from app.models.group_plus import GroupFile, GroupFileFolder, GroupFileUpload, GroupPlusRecord, GroupTodo
 from app.models.message import FeaturedMessage, MentionAllUsage, Message, MessageVisibility
 from app.models.report import AdminAuditLog
 from app.models.user import User
@@ -1102,6 +1102,244 @@ class AdminTests(PlusCase):
         )
         # 后台接口不返回任何消息内容
         self.assertNotIn("content", json.dumps(groups))
+
+
+# ---------------------------------------------------------------- 群文件文件夹（5.5）
+
+
+class FolderTests(PlusCase):
+    def upload(self, name: str = "设计稿.txt", data: bytes = b"hello", **form: Any) -> dict[str, Any]:
+        return {"files": {"file": (name, data, "text/plain")}, "data": {k: str(v).lower() for k, v in form.items()}}
+
+    def path(self, suffix: str = "") -> str:
+        return f"/conversations/{self.group_id}/files{suffix}"
+
+    async def folder(self, name: str, *, as_: str = "alice", expected: int = 201) -> dict[str, Any]:
+        return await self.json("POST", self.path("/folders"), as_=as_, expected=expected, json={"name": name})
+
+    async def put(self, name: str = "a.txt", data: bytes = b"hello", *, as_: str = "carol", **form: Any) -> dict[str, Any]:
+        form.setdefault("announce", False)
+        return (await self.json("POST", self.path(), as_=as_, expected=201, **self.upload(name, data, **form)))["file"]
+
+    def events(self, name: str) -> list[dict[str, Any]]:
+        return [call.args[2] for call in self.send_to_users.call_args_list if call.args[1] == name]
+
+    async def test_tier_gate(self) -> None:
+        # 免费 / Pro 不能用；Pro+、MAX、永久 MAX 可以
+        self.assertEqual((await self.code("POST", self.path("/folders"), 403, json={"name": "资料"}))["code"], "folders_require_plus")
+        await self.grant("pro", 30)
+        listing = await self.json("GET", self.path(), as_="alice")
+        self.assertEqual((listing["can_manage_folders"], listing["can_tidy_folders"], listing["quota"]["folders_enabled"]), (False, True, False))
+        denied = await self.code("POST", self.path("/folders"), 403, json={"name": "资料"})
+        self.assertEqual((denied["code"], denied["tier"]), ("folders_require_plus", "pro"))
+        await self.grant("pro_plus", 30)
+        created = await self.folder("资料")
+        self.assertEqual((created["name"], created["file_count"], created["total_size"], created["created_by"]["username"]), ("资料", 0, 0, "alice"))
+        self.assertTrue(created["created_at"] and created["updated_at"])
+        self.assertEqual(self.events("group.file.folders.changed")[-1], {"conversation_id": self.group_id, "action": "created", "folder_id": created["id"]})
+        await self.json("POST", "/admin/group-plus/grant", as_="root", json={"conversation_id": self.group_id, "tier": "max", "permanent": True})
+        self.assertTrue((await self.json("GET", f"/conversations/{self.group_id}/plus", as_="dave"))["files"]["folders_enabled"])
+        await self.folder("永久档位也能建")
+        listing = await self.json("GET", self.path(), as_="alice")
+        self.assertEqual((listing["can_manage_folders"], listing["folder_limit"]), (True, 50))
+
+    async def test_permissions_names_and_limit(self) -> None:
+        await self.grant("max", 30)
+        # 普通成员不能建、改、删、移动，但能看
+        self.assertEqual((await self.code("POST", self.path("/folders"), 403, as_="carol", json={"name": "x"}))["code"], "not_group_staff")
+        made = await self.folder("Docs", as_="bob")
+        member_view = await self.json("GET", self.path("/folders"), as_="carol")
+        self.assertEqual(([f["name"] for f in member_view["items"]], member_view["can_manage_folders"], member_view["can_tidy_folders"]), (["Docs"], False, False))
+        self.assertEqual((await self.code("PATCH", self.path(f"/folders/{made['id']}"), 403, as_="carol", json={"name": "y"}))["code"], "not_group_staff")
+        self.assertEqual((await self.code("DELETE", self.path(f"/folders/{made['id']}"), 403, as_="dave"))["code"], "not_group_staff")
+        file = await self.put()
+        moved = await self.code("POST", self.path("/move"), 403, as_="carol", json={"file_ids": [file["id"]], "folder_id": made["id"]})
+        self.assertEqual(moved["code"], "not_group_staff")
+        # 外人看不到
+        await self.call("GET", self.path("/folders"), as_="eve", expected=404)
+        # 名字：去首尾空白；不区分大小写不重名；长度、换行、/
+        self.assertEqual((await self.code("POST", self.path("/folders"), 409, json={"name": "  docs "}))["code"], "folder_name_taken")
+        self.assertEqual((await self.folder("  报告  "))["name"], "报告")
+        for bad in ("", "   ", "a" * 41, "a\nb", "a/b", "a\\b", "a​b", 3):
+            self.assertEqual((await self.code("POST", self.path("/folders"), 422, json={"name": bad}))["code"], "invalid_folder_name", bad)
+        self.assertEqual((await self.folder("名" * 40))["name"], "名" * 40)
+        # 重命名：可以只改大小写；不能和别的重名
+        renamed = await self.json("PATCH", self.path(f"/folders/{made['id']}"), as_="alice", json={"name": "DOCS"})
+        self.assertEqual(renamed["name"], "DOCS")
+        self.assertEqual(self.events("group.file.folders.changed")[-1]["action"], "renamed")
+        self.assertEqual((await self.code("PATCH", self.path(f"/folders/{made['id']}"), 409, json={"name": "报告"}))["code"], "folder_name_taken")
+        self.assertEqual((await self.code("PATCH", self.path("/folders/9999"), 404, json={"name": "z"}))["code"], "folder_not_found")
+        # 50 个上限
+        for index in range(47):
+            await self.folder(f"f{index}")
+        self.assertEqual(len((await self.json("GET", self.path("/folders")))["items"]), 50)
+        over = await self.code("POST", self.path("/folders"), 409, json={"name": "第 51 个"})
+        self.assertEqual((over["code"], over["limit"]), ("folder_limit", 50))
+        # 别的群的文件夹当不存在
+        self.assertEqual((await self.code("GET", f"/conversations/{self.group_id}/files?folder_id=9999", 404))["code"], "folder_not_found")
+
+    async def test_move_list_search_and_delete(self) -> None:
+        await self.grant("pro_plus", 30)
+        with patch.dict(group_plus_tiers.TIERS["pro_plus"], {"file_quota_bytes": 20, "file_temp_max_bytes": 10}):
+            docs = await self.folder("文档")
+            pics = await self.folder("图片")
+            a = await self.put("a.txt", b"x" * 5)
+            b = await self.put("b.txt", b"x" * 7, as_="dave")
+            c = await self.put("c.txt", b"x" * 3)
+            temp = await self.put("temp.txt", b"x" * 9)
+            self.assertTrue(temp["temporary"])
+            self.assertEqual((a["folder_id"], a["folder_name"]), (None, None))
+            # 移进文件夹
+            result = await self.json("POST", self.path("/move"), as_="bob", json={"file_ids": [b["id"], a["id"], a["id"]], "folder_id": docs["id"]})
+            self.assertEqual((result["moved"], result["folder_id"], [f["id"] for f in result["items"]]), (2, docs["id"], [b["id"], a["id"]]))
+            self.assertEqual({(f["folder_id"], f["folder_name"]) for f in result["items"]}, {(docs["id"], "文档")})
+            event = self.events("group.file.updated")[-1]
+            self.assertEqual((event["action"], event["file_ids"], event["folder_id"]), ("moved", [b["id"], a["id"]], docs["id"]))
+            # 临时文件不能移进去（整个请求不生效）
+            rejected = await self.code("POST", self.path("/move"), 422, json={"file_ids": [c["id"], temp["id"]], "folder_id": pics["id"]})
+            self.assertEqual((rejected["code"], rejected["temporary_ids"], rejected["expired_ids"]), ("file_not_movable", [temp["id"]], []))
+            missing = await self.code("POST", self.path("/move"), 404, json={"file_ids": [c["id"], 9999], "folder_id": pics["id"]})
+            self.assertEqual((missing["code"], missing["file_ids"]), ("file_not_found", [9999]))
+            self.assertEqual((await self.code("POST", self.path("/move"), 404, json={"file_ids": [c["id"]], "folder_id": 9999}))["code"], "folder_not_found")
+            await self.json("POST", self.path("/move"), expected=422, json={"file_ids": [], "folder_id": None})
+            await self.json("POST", self.path("/move"), expected=422, json={"file_ids": list(range(1, 102)), "folder_id": None})
+            # 根目录：根目录的文件 + 全部文件夹（带数量、大小）
+            root = await self.json("GET", self.path(), as_="carol")
+            self.assertEqual(([f["id"] for f in root["items"]], root["total"], root["folder_id"], root["folder"], root["search"]), ([temp["id"], c["id"]], 2, None, None, False))
+            self.assertEqual([(f["name"], f["file_count"], f["total_size"]) for f in root["folders"]], [("文档", 2, 12), ("图片", 0, 0)])
+            self.assertEqual((root["can_manage_folders"], root["can_tidy_folders"], root["quota"]["file_count"]), (False, False, 4))
+            # 文件夹里
+            inside = await self.json("GET", self.path(f"?folder_id={docs['id']}"), as_="carol")
+            self.assertEqual(([f["id"] for f in inside["items"]], inside["folder_id"], inside["folder"]["file_count"]), ([b["id"], a["id"]], docs["id"], 2))
+            # 搜索：跨文件夹，带 folder_name；带了 folder_id 也忽略
+            found = await self.json("GET", self.path(f"?q=.txt&folder_id={pics['id']}"), as_="carol")
+            self.assertEqual((found["search"], found["total"]), (True, 4))
+            self.assertEqual({f["name"]: f["folder_name"] for f in found["items"]}, {"a.txt": "文档", "b.txt": "文档", "c.txt": None, "temp.txt": None})
+            by_dave = await self.json("GET", self.path(f"?uploader_id={self.ids['dave']}"), as_="carol")
+            self.assertEqual(([f["id"] for f in by_dave["items"]], by_dave["items"][0]["folder_id"]), ([b["id"]], docs["id"]))
+            # 移回根目录
+            back = await self.json("POST", self.path("/move"), json={"file_ids": [b["id"]], "folder_id": None})
+            self.assertEqual((back["items"][0]["folder_id"], back["folder_id"]), (None, None))
+            # 删文件夹：文件回根目录，不删文件
+            await self.json("POST", self.path("/move"), json={"file_ids": [c["id"]], "folder_id": docs["id"]})
+            deleted = await self.json("DELETE", self.path(f"/folders/{docs['id']}"), as_="bob")
+            self.assertEqual(deleted, {"folder_id": docs["id"], "moved_to_root": 2})
+            self.assertEqual(self.events("group.file.folders.changed")[-1], {"conversation_id": self.group_id, "action": "deleted", "folder_id": docs["id"], "moved_to_root": 2})
+            root = await self.json("GET", self.path(), as_="carol")
+            self.assertEqual((root["total"], [f["name"] for f in root["folders"]]), (4, ["图片"]))
+            self.assertEqual(await self.count(GroupFile), 4)
+            self.assertEqual((await self.code("DELETE", self.path(f"/folders/{docs['id']}"), 404))["code"], "folder_not_found")
+            await self.call("GET", self.path(f"/{a['id']}/download"), as_="dave", expected=200)
+
+    async def test_expired_file_cannot_move_in(self) -> None:
+        await self.grant("pro_plus", 30)
+        folder = await self.folder("资料")
+        short = await self.put("short.txt")
+        keep = await self.put("keep.txt", as_="alice", permanent=True)
+        await self.json("POST", self.path("/move"), json={"file_ids": [short["id"]], "folder_id": folder["id"]})
+        self.tick(hours=25)
+        # 过期的不算进 file_count；不能再移进去，但能移回根目录
+        self.assertEqual((await self.json("GET", self.path("/folders")))["items"][0]["file_count"], 0)
+        await self.json("POST", self.path("/move"), json={"file_ids": [short["id"]], "folder_id": None})
+        rejected = await self.code("POST", self.path("/move"), 422, json={"file_ids": [short["id"], keep["id"]], "folder_id": folder["id"]})
+        self.assertEqual((rejected["code"], rejected["expired_ids"], rejected["temporary_ids"]), ("file_not_movable", [short["id"]], []))
+
+    async def test_upload_into_folder(self) -> None:
+        await self.grant("pro_plus", 30)
+        folder = await self.folder("作业")
+        # 普通成员也能传进文件夹；事件带 folder_id
+        file = await self.put("hw.txt", folder_id=folder["id"])
+        self.assertEqual((file["folder_id"], file["folder_name"]), (folder["id"], "作业"))
+        self.assertEqual(self.events("group.file.updated")[-1]["folder_id"], folder["id"])
+        self.assertEqual((await self.json("GET", self.path(f"?folder_id={folder['id']}"), as_="dave"))["total"], 1)
+        self.assertEqual((await self.json("GET", self.path(), as_="dave"))["total"], 0)
+        missing = await self.code("POST", self.path(), 404, as_="carol", **self.upload(folder_id=9999))
+        self.assertEqual(missing["code"], "folder_not_found")
+        # 会变成临时文件的：忽略 folder_id，放根目录
+        with patch.dict(group_plus_tiers.TIERS["pro_plus"], {"file_quota_bytes": 5, "file_temp_max_bytes": 100}):
+            temp = await self.put("big.txt", b"x" * 50, folder_id=folder["id"])
+        self.assertEqual((temp["temporary"], temp["folder_id"]), (True, None))
+        # 被禁言的照样不能传
+        await self.json("PATCH", f"/conversations/{self.group_id}/settings", as_="alice", json={"all_muted": True})
+        self.assertEqual((await self.code("POST", self.path(), 403, as_="carol", **self.upload(folder_id=folder["id"])))["code"], "muted")
+
+    async def test_direct_upload_into_folder(self) -> None:
+        from app.services import storage
+
+        await self.grant("pro_plus", 30)
+        folder = await self.folder("直传")
+        keys: list[str] = []
+
+        def fake_put(key: str, size: int, expires_in: int = 900) -> tuple[str, dict[str, str]]:
+            keys.append(key)
+            return f"https://bucket.test/{key}?sig=put", {"Content-Type": "application/octet-stream"}
+
+        def stored(key: str, data: bytes) -> None:
+            target = Path(settings.upload_dir) / key
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+
+        with patch.object(storage, "direct_transfer_enabled", lambda: True), patch.object(storage, "presign_put", fake_put):
+            ticket = await self.json("POST", self.path("/uploads"), as_="carol", expected=201, json={"name": "a.zip", "size": 4, "folder_id": folder["id"]})
+            self.assertEqual((ticket["temporary"], ticket["folder_id"]), (False, folder["id"]))
+            stored(keys[-1], b"abcd")
+            done = await self.json("POST", self.path(f"/uploads/{ticket['upload_id']}/complete"), as_="carol", expected=201, json={"announce": False})
+            self.assertEqual((done["file"]["folder_id"], done["file"]["folder_name"]), (folder["id"], "直传"))
+            self.assertEqual((await self.code("POST", self.path("/uploads"), 404, as_="carol", json={"name": "a", "size": 4, "folder_id": 9999}))["code"], "folder_not_found")
+            # 开单之后文件夹被删了：complete 放根目录
+            ticket = await self.json("POST", self.path("/uploads"), as_="carol", expected=201, json={"name": "b.zip", "size": 4, "folder_id": folder["id"]})
+            stored(keys[-1], b"abcd")
+            await self.json("DELETE", self.path(f"/folders/{folder['id']}"))
+            done = await self.json("POST", self.path(f"/uploads/{ticket['upload_id']}/complete"), as_="carol", expected=201, json={"announce": False})
+            self.assertEqual(done["file"]["folder_id"], None)
+        # Pro 不能指定文件夹
+        async with self.sessions() as db:
+            conversation = await db.get(Conversation, self.group_id)
+            conversation.plus_tier = "pro"
+            await db.commit()
+        with patch.object(storage, "direct_transfer_enabled", lambda: True), patch.object(storage, "presign_put", fake_put):
+            denied = await self.code("POST", self.path("/uploads"), 403, as_="carol", json={"name": "a", "size": 4, "folder_id": 1})
+        self.assertEqual(denied["code"], "folders_require_plus")
+
+    async def test_after_downgrade(self) -> None:
+        await self.grant("pro_plus", 30)
+        keep = await self.folder("留着")
+        drop = await self.folder("删掉")
+        inside = await self.put("in.txt", as_="alice", permanent=True, folder_id=keep["id"])
+        other = await self.put("other.txt", as_="alice", permanent=True, folder_id=drop["id"])
+        root_file = await self.put("root.txt", as_="alice", permanent=True)
+
+        async def check_downgraded() -> None:
+            listing = await self.json("GET", self.path(f"?folder_id={keep['id']}"), as_="dave")
+            self.assertEqual(([f["id"] for f in listing["items"]], listing["quota"]["folders_enabled"]), ([inside["id"]], False))
+            await self.call("GET", self.path(f"/{inside['id']}/download"), as_="dave", expected=200)
+            staff = await self.json("GET", self.path(), as_="bob")
+            self.assertEqual((staff["can_manage_folders"], staff["can_tidy_folders"]), (False, True))
+            # 不能新建、重命名、移入、传进去
+            self.assertEqual((await self.code("POST", self.path("/folders"), 403, json={"name": "新"}))["code"], "folders_require_plus")
+            self.assertEqual((await self.code("PATCH", self.path(f"/folders/{keep['id']}"), 403, json={"name": "改"}))["code"], "folders_require_plus")
+            moved = await self.code("POST", self.path("/move"), 403, json={"file_ids": [root_file["id"]], "folder_id": keep["id"]})
+            self.assertEqual(moved["code"], "folders_require_plus")
+
+        # 到期进宽限期（免费档）：浏览下载照常，不能新建 / 重命名 / 移入
+        self.tick(days=31)
+        await check_downgraded()
+        # 降到 Pro：一样；也不能传进文件夹
+        await self.grant("pro", 30)
+        await check_downgraded()
+        self.assertEqual((await self.code("POST", self.path(), 403, as_="carol", **self.upload(folder_id=keep["id"])))["code"], "folders_require_plus")
+        # 能移回根目录、删文件夹（文件回根目录）
+        back = await self.json("POST", self.path("/move"), as_="bob", json={"file_ids": [inside["id"]], "folder_id": None})
+        self.assertIsNone(back["items"][0]["folder_id"])
+        deleted = await self.json("DELETE", self.path(f"/folders/{drop['id']}"), as_="bob")
+        self.assertEqual(deleted["moved_to_root"], 1)
+        root = await self.json("GET", self.path(), as_="dave")
+        self.assertEqual({f["id"] for f in root["items"]}, {inside["id"], other["id"], root_file["id"]})
+        # 过了宽限期、文件全被清掉之后，文件夹也清掉
+        self.tick(days=31 + 31)
+        async with self.sessions() as db:
+            await file_service.sweep(db)
+        self.assertEqual((await self.count(GroupFile), await self.count(GroupFileFolder)), (0, 0))
 
 
 if __name__ == "__main__":
