@@ -148,6 +148,18 @@
 | 410 | `expired` | 过期了 |
 | 410 | `revoked` | 被提前结束了（消息被撤回，或者后台撤销） |
 
+### 3.4.1 `GET /red-packets/pending?conversation_id=…`
+
+这个会话里我还能领的红包，聊天右上角「有 N 个红包没领」的提示用，点了跳到那条消息。口径和第 6 节的 `red_packet_pending` 一样。
+
+```jsonc
+{ "items": [ { "id": 12, "message_id": 345, "sender_id": 7, "kind": "lucky", "greeting": "恭喜发财", "count": 10, "claimed_count": 3,
+               "expires_at": "…", "created_at": "…" } ] }   // 新的在前，最多 20 个；不带金额
+```
+
+- 不是会话成员：403 `not_member`。
+- 客户端维护：进会话时拉一次；收到 `type = "red_packet"` 的 `message.created`、`red_packet.updated`（`status` 不是 `active` 或 `claimed_count` 变了）、自己 claim 之后重拉或本地增删即可。过期按 `expires_at` 自己去掉。
+
 ### 3.5 `GET /red-packets/mine?direction=sent|received&limit=20&offset=0`
 
 ```jsonc

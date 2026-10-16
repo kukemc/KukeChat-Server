@@ -12,7 +12,7 @@ from app.api.v1.conversations import online_conversation_member_ids, schedule_re
 from app.core.database import get_db
 from app.core.dependencies import get_current_user
 from app.models.user import User
-from app.schemas.red_packet import RedPacketClaimResult, RedPacketConfig, RedPacketCreate, RedPacketPage, RedPacketRead, RedPacketSendResult
+from app.schemas.red_packet import RedPacketClaimResult, RedPacketConfig, RedPacketCreate, RedPacketPage, RedPacketPending, RedPacketPendingList, RedPacketRead, RedPacketSendResult
 from app.services import messages as message_service
 from app.services import moderation as moderation_service
 from app.services import red_packets as red_packet_service
@@ -77,6 +77,25 @@ async def my_red_packets(
     offset: int = Query(default=0, ge=0),
 ) -> RedPacketPage:
     return RedPacketPage(**await red_packet_service.list_mine(db, current_user, direction, limit, offset))
+
+
+@router.get("/pending", response_model=RedPacketPendingList)
+async def list_pending_red_packets(
+    conversation_id: Annotated[int, Query(ge=1)],
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> RedPacketPendingList:
+    """这个会话里我还能领的红包（新的在前，最多 20 个）。不是会话成员 403。"""
+    packets = await red_packet_service.pending_in_conversation(db, current_user.id, conversation_id)
+    return RedPacketPendingList(
+        items=[
+            RedPacketPending(
+                id=packet.id, message_id=packet.message_id, sender_id=packet.sender_id, kind=packet.kind, greeting=packet.greeting,  # type: ignore[arg-type]
+                count=packet.count, claimed_count=packet.claimed_count, expires_at=packet.expires_at, created_at=packet.created_at,
+            )
+            for packet in packets
+        ]
+    )
 
 
 @router.get("/{packet_id}", response_model=RedPacketRead)

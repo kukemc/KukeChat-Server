@@ -532,6 +532,28 @@ class ClaimTests(RedPacketTestCase):
         self.assertEqual((await self._packet(direct_packet)).status, "finished")
         self.assertGreaterEqual((await self._claim("carol", group_packet))["amount"], 1)
 
+    async def test_pending_in_conversation_lists_what_i_can_still_claim(self) -> None:
+        self.ledger.donate(OID_A, 300)
+        first = await self._send_id(amount=10, count=1)
+        self.tick(1)
+        second = await self._send_id(amount=20, count=2)
+        direct = await self._send_id(conversation_id=self.direct_id, kind="normal", amount=10, count=1)
+
+        async def pending(name: str, conversation_id: int) -> list[int]:
+            return [packet.id for packet in await self._as(name, lambda db, user: rp.pending_in_conversation(db, user.id, conversation_id))]
+
+        # 新的在前；发的人在群里也算（自己还没抢），私聊里自己发的不算
+        self.assertEqual(await pending("bob", self.group_id), [second, first])
+        self.assertEqual(await pending("alice", self.group_id), [second, first])
+        self.assertEqual(await pending("alice", self.direct_id), [])
+        self.assertEqual(await pending("bob", self.direct_id), [direct])
+        await self._claim("bob", second)
+        self.assertEqual(await pending("bob", self.group_id), [first])
+        # 被别人抢完的不再出现
+        await self._claim("carol", first)
+        self.assertEqual(await pending("bob", self.group_id), [])
+        self.assertEqual(await self._code(self._as("eve", lambda db, user: rp.pending_in_conversation(db, user.id, self.group_id))), (403, "not_member"))
+
     async def test_turning_the_switch_off_only_blocks_new_packets(self) -> None:
         self.ledger.donate(OID_A, 300)
         packet_id = await self._send_id(amount=30, count=3)

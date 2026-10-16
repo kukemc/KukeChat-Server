@@ -397,6 +397,27 @@ async def pending_conversation_ids(db: AsyncSession, user_id: int, *, now: datet
     return set(rows.scalars().all())
 
 
+async def pending_in_conversation(db: AsyncSession, user_id: int, conversation_id: int, *, now: datetime | None = None) -> list[RedPacket]:
+    """这个会话里我还能领的红包（聊天右上角「有红包没领」的提示），新的在前，最多 20 个。口径同 pending_conversation_ids。"""
+    await _membership(db, conversation_id, user_id)
+    now = now or _now()
+    claimed = exists().where(RedPacketShare.packet_id == RedPacket.id, RedPacketShare.user_id == user_id)
+    rows = await db.execute(
+        select(RedPacket)
+        .where(
+            RedPacket.conversation_id == conversation_id,
+            RedPacket.status == "active",
+            RedPacket.expires_at > now,
+            RedPacket.message_id.is_not(None),
+            or_(RedPacket.conversation_type != "direct", RedPacket.sender_id != user_id),
+            ~claimed,
+        )
+        .order_by(RedPacket.id.desc())
+        .limit(20)
+    )
+    return list(rows.scalars().all())
+
+
 def _mark_live() -> None:
     """有新红包了：别再相信「全站没有进行中的红包」。"""
     global _live

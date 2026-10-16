@@ -98,6 +98,23 @@ class RedPacketReceived(BaseModel):
     red_packet: RedPacketRead
 
 
+class RedPacketPending(BaseModel):
+    """会话里我还能领的一个红包：够客户端画提示、跳到那条消息就行，不带金额"""
+    id: int
+    message_id: int
+    sender_id: int
+    kind: Literal["normal", "lucky"]
+    greeting: str
+    count: int
+    claimed_count: int = 0
+    expires_at: datetime | None = None
+    created_at: datetime | None = None
+
+
+class RedPacketPendingList(BaseModel):
+    items: list[RedPacketPending]
+
+
 class RedPacketPage(BaseModel):
     # sent：每项直接是红包对象；received：每项是 { amount, created_at, red_packet }
     items: list[RedPacketReceived | RedPacketRead] = Field(default_factory=list)
