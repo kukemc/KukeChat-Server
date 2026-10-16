@@ -187,6 +187,8 @@ class ConversationRead(BaseModel):
     updated_at: datetime
     member_count: int
     unread_count: int
+    # 我读到的最后一条消息（客户端进会话时据此画「以下是新消息」、跳到第一条未读）
+    my_last_read_message_id: int | None = None
     last_message: MessageRead | None = None
     direct_user: UserPublic | None = None
     my_role: MemberRole = MemberRole.MEMBER
