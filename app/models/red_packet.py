@@ -45,6 +45,10 @@ class RedPacket(Base):
     # normal 每份一样多 / lucky 拼手气
     kind: Mapped[str] = mapped_column(String(12))
     greeting: Mapped[str] = mapped_column(String(60))
+    # 接龙口令：有值就是接龙红包，领取成功时以领取人的身份在会话里自动发这句话（docs/red-packets.md 3.4）
+    chain_text: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    # 专属红包的目标：有值时只有这个人能领（只在群里，count 恒为 1、kind 恒为 normal）
+    target_user_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # 整包金额、份数。创建后不变
     total: Mapped[int] = mapped_column(Integer)
     count: Mapped[int] = mapped_column(Integer)

@@ -810,3 +810,19 @@ async def init_db() -> None:
                     except Exception as exc:
                         if "duplicate column name" not in str(exc).lower():
                             raise
+
+            # 接龙红包、专属红包（docs/red-packets.md 3.2）。red_packets 上两个可空列，不用回填：老红包都不是接龙、也不是专属。
+            # 两个 worker 一起启动时后到的会撞上 duplicate column name，当成别人已经加好了
+            for table_name, column_name, column_sql in (
+                ("red_packets", "chain_text", "chain_text VARCHAR(60)"),
+                ("red_packets", "target_user_id", "target_user_id INTEGER"),
+            ):
+                if table_name not in table_names:
+                    continue
+                columns = await conn.execute(text(f"PRAGMA table_info({table_name})"))
+                if column_name not in {row[1] for row in columns}:
+                    try:
+                        await conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_sql}"))
+                    except Exception as exc:
+                        if "duplicate column name" not in str(exc).lower():
+                            raise

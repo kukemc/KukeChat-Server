@@ -12,7 +12,9 @@ from app.api.v1.conversations import online_conversation_member_ids, schedule_re
 from app.core.database import get_db
 from app.core.dependencies import get_current_user
 from app.models.user import User
+from app.schemas.message import MessageRead
 from app.schemas.red_packet import RedPacketClaimResult, RedPacketConfig, RedPacketCreate, RedPacketPage, RedPacketPending, RedPacketPendingList, RedPacketRead, RedPacketSendResult
+from app.services import intimacy as intimacy_service
 from app.services import messages as message_service
 from app.services import moderation as moderation_service
 from app.services import red_packets as red_packet_service
@@ -43,6 +45,15 @@ async def send_red_packet(
     """发红包：立刻扣整包金额，会话里落一条 type = red_packet 的消息。消息的广播和发普通消息一样。"""
     user_id, whitelisted = current_user.id, current_user.content_moderation_whitelisted
     result, message = await red_packet_service.send_red_packet(db, current_user, payload.model_dump())
+    message_data = await _deliver_created(db, message, user_id)
+    if not whitelisted:
+        # 祝福语、接龙口令发之前已经审过一遍；这里和别的消息一样再走一次异步审核（审核服务当时不可用的话靠它兜底）
+        moderation_service.schedule_message_moderation(message.id)
+    return RedPacketSendResult(red_packet=result["red_packet"], message=message_data, balance=result["balance"])
+
+
+async def _deliver_created(db: AsyncSession, message, user_id: int) -> MessageRead:
+    """已经提交的一条新消息：和发普通消息一样广播（message.created、会话列表缓存、后台信号、群等级）。推送失败只记日志。"""
     conversation_id = message.conversation_id
     message_data = message_service.build_new_message_read(message, user_id)
     member_ids = await online_conversation_member_ids(db, conversation_id)
@@ -62,10 +73,7 @@ async def send_red_packet(
                 {"conversation_id": conversation_id, "user_id": user_id, "level": current_level, "level_exp": getattr(message, "_sender_level_exp", 0)},
             )
         )
-    if not whitelisted:
-        # 祝福语发之前已经审过一遍；这里和别的消息一样再走一次异步审核（审核服务当时不可用的话靠它兜底）
-        moderation_service.schedule_message_moderation(message.id)
-    return RedPacketSendResult(red_packet=result["red_packet"], message=message_data, balance=result["balance"])
+    return message_data
 
 
 @router.get("/mine", response_model=RedPacketPage)
@@ -87,15 +95,7 @@ async def list_pending_red_packets(
 ) -> RedPacketPendingList:
     """这个会话里我还能领的红包（新的在前，最多 20 个）。不是会话成员 403。"""
     packets = await red_packet_service.pending_in_conversation(db, current_user.id, conversation_id)
-    return RedPacketPendingList(
-        items=[
-            RedPacketPending(
-                id=packet.id, message_id=packet.message_id, sender_id=packet.sender_id, kind=packet.kind, greeting=packet.greeting,  # type: ignore[arg-type]
-                count=packet.count, claimed_count=packet.claimed_count, expires_at=packet.expires_at, created_at=packet.created_at,
-            )
-            for packet in packets
-        ]
-    )
+    return RedPacketPendingList(items=[RedPacketPending(**item) for item in await red_packet_service.pending_items(db, packets)])
 
 
 @router.get("/{packet_id}", response_model=RedPacketRead)
@@ -114,7 +114,13 @@ async def claim_red_packet(
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> RedPacketClaimResult:
     user_id = current_user.id
-    result = await red_packet_service.claim(db, current_user, packet_id)
+    result, chain_message = await red_packet_service.claim(db, current_user, packet_id)
     # 会话列表里的 red_packet_pending 变了，别让这个人拿到 5 秒前缓存的那份
     response_cache.invalidate_user_conversations({user_id})
-    return RedPacketClaimResult(**result)
+    message_data = None
+    if chain_message is not None:
+        # 接龙红包：领取时自动发的那句话已经和领取一起提交了，现在照普通消息广播。
+        # 不再单独送异步审核：口令是发红包的人写的，发之前审过，红包消息的异步审核也会再看一遍（算在发的人头上）
+        message_data = await _deliver_created(db, chain_message, user_id)
+        intimacy_service.schedule_message(chain_message.conversation_id, user_id, chain_message.type, chain_message.created_at, bind=db.bind)
+    return RedPacketClaimResult(**result, message=message_data)

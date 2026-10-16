@@ -532,10 +532,19 @@ async def send_message(
     allow_gift: bool = False,
     allow_file: bool = False,
     allow_group_todo: bool = False,
+    red_packet_chain: bool = False,
     commit: bool = True,
 ) -> Message:
-    """commit=False：消息只 flush 不提交，由调用方和自己的改动一起提交（发红包、送礼用：扣款、记录、消息要么都成要么都不成）。"""
+    """commit=False：消息只 flush 不提交，由调用方和自己的改动一起提交（发红包、送礼用：扣款、记录、消息要么都成要么都不成）。
+
+    red_packet_chain=True：领取接龙红包时自动发的那句话（red_packets.claim，docs/red-packets.md 3.4）。
+    允许 metadata 里带 red_packet_chain，不受每人每分钟 20 条和群发言限频的约束（领取次数本身有限：一个红包一人一次），
+    也不去抓作品链接的预览（这时调用方拿着写锁，不能等外部请求）。
+    """
     ensure_can_post(sender)
+    # 「接龙」标记只能由领取接龙红包时自动发的消息带；别的消息（比如客户端把接龙消息原样转发）里的这一项直接去掉
+    if not red_packet_chain and isinstance(metadata, dict) and "red_packet_chain" in metadata:
+        metadata = {key: value for key, value in metadata.items() if key != "red_packet_chain"} or None
     # 投票消息必须由 polls.create_poll 创建，否则 metadata 里的定义没有对应的投票记录
     if message_type == MessageType.POLL and not allow_poll:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Polls must be created through the poll endpoint")
@@ -578,7 +587,8 @@ async def send_message(
         require_message_image_upload_url(image_url, detail="Message images must reference uploaded image files")
 
     now = datetime.now(UTC)
-    await _enforce_message_rate_limit(db, sender, now, conversation_id if sender.is_bot else None)
+    if not red_packet_chain:
+        await _enforce_message_rate_limit(db, sender, now, conversation_id if sender.is_bot else None)
 
     # Membership checks must not flush expired-mute updates before external previews.
     membership = await require_membership(db, conversation_id, sender.id, clear_expired_mute=False)
@@ -590,7 +600,7 @@ async def send_message(
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="This group is muted")
         if membership.muted and not _member_mute_expired(membership, now):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Muted members cannot send messages")
-        if conversation.message_rate_limit_per_minute > 0:
+        if conversation.message_rate_limit_per_minute > 0 and not red_packet_chain:
             group_rate_cutoff = now - timedelta(minutes=1)
             group_rate_result = await db.execute(
                 select(func.count(Message.id)).where(
@@ -612,7 +622,7 @@ async def send_message(
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="@all can only be used in group conversations")
         if membership.role not in STAFF_ROLES:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only group owners or admins can @all")
-    if message_type == MessageType.TEXT and extract_creation_refs(content):
+    if message_type == MessageType.TEXT and not red_packet_chain and extract_creation_refs(content):
         metadata = await enrich_metadata_with_previews(content, metadata)
     if not allow_group_todo:
         # 群待办的提醒走 @全体 的链路，但不占用也不受限于 @全体成员 的每日次数

@@ -693,10 +693,13 @@ def _text_to_moderate(message: Message, metadata: dict[str, Any]) -> str | None:
         ]
         return "\n".join(part.strip() for part in parts if part.strip()) or None
     if message.type == MessageType.RED_PACKET:
-        # 红包消息只审祝福语（正文是给旧客户端看的兜底文字）
+        # 红包消息只审祝福语和接龙口令（正文是给旧客户端看的兜底文字）。接龙口令算发红包的人写的：
+        # 领取时以领取人身份自动发出的那条消息不再单独审（docs/red-packets.md 3.4），所以在这里审
         packet = metadata.get("red_packet")
-        greeting = packet.get("greeting") if isinstance(packet, dict) else None
-        return greeting.strip() or None if isinstance(greeting, str) else None
+        if not isinstance(packet, dict):
+            return None
+        parts = [packet.get("greeting"), packet.get("chain_text")]
+        return "\n".join(part.strip() for part in parts if isinstance(part, str) and part.strip()) or None
     if message.type == MessageType.GIFT:
         # 礼物消息只审留言（正文是给旧客户端看的兜底文字，礼物名和收礼人的名字不是这个人写的）
         gift = metadata.get("gift")

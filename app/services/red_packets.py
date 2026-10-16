@@ -61,6 +61,10 @@ KINDS = ("normal", "lucky")
 STATUSES = ("active", "finished", "expired", "revoked")
 DEFAULT_GREETING = "恭喜发财"
 GREETING_MAX = 30
+# 接龙口令最长几个字
+CHAIN_TEXT_MAX = 30
+# GET /red-packets/config 的 features：服务端支持的玩法，客户端据此决定显示不显示对应的选项
+FEATURES = ("chain", "exclusive")
 REASON_MAX = 500
 STAFF_ROLES = {MemberRole.OWNER, MemberRole.ADMIN}
 
@@ -227,7 +231,7 @@ async def _sent_today(db: AsyncSession, user_id: int, now: datetime) -> int:
 async def config_view(db: AsyncSession, user: User) -> dict[str, Any]:
     """GET /red-packets/config。"""
     config = await get_settings(db)
-    return {"enabled": config["enabled"], "limits": _limits(config), "sent_today": await _sent_today(db, user.id, _now())}
+    return {"enabled": config["enabled"], "limits": _limits(config), "sent_today": await _sent_today(db, user.id, _now()), "features": list(FEATURES)}
 
 
 # ---------------------------------------------------------------- 金额分配
@@ -261,9 +265,12 @@ def split(kind: str, amount: int, count: int, min_each: int) -> list[int]:
 # ---------------------------------------------------------------- 展示
 
 
-def fallback_text(greeting: str) -> str:
-    """消息正文：给不认识 red_packet 类型的旧客户端、搜索和通知预览用。"""
-    return f"[红包] {greeting}（更新到新版才能领取）"
+def fallback_text(greeting: str, *, chain: bool = False, target_name: str | None = None) -> str:
+    """消息正文：给不认识 red_packet 类型的旧客户端、搜索、会话列表和通知预览用。"""
+    exclusive = target_name is not None
+    label = "[专属接龙红包]" if chain and exclusive else "[专属红包]" if exclusive else "[接龙红包]" if chain else "[红包]"
+    head = f"{label} 给 {target_name}：" if exclusive else f"{label} "
+    return f"{head}{greeting}（更新到新版才能领取）"
 
 
 def effective_status(packet: RedPacket, now: datetime) -> str:
@@ -298,15 +305,24 @@ async def _claimed_shares(db: AsyncSession, packet_id: int) -> list[RedPacketSha
     return list(rows.scalars().all())
 
 
-def _base_view(packet: RedPacket, sender: User | None, mine: RedPacketShare | None, viewer_id: int, now: datetime) -> dict[str, Any]:
+def _people(packet: RedPacket) -> set[int]:
+    """展示这个红包要用到的人：发的人，专属红包还有目标。"""
+    return {packet.sender_id} | ({packet.target_user_id} if packet.target_user_id is not None else set())
+
+
+def _base_view(packet: RedPacket, users: dict[int, User], mine: RedPacketShare | None, viewer_id: int, now: datetime) -> dict[str, Any]:
     current = effective_status(packet, now)
     # 金额只给已经领了的人、发的人看；红包结束之后所有成员都能看
     open_book = mine is not None or packet.sender_id == viewer_id or current != "active"
+    target_id = packet.target_user_id
     return {
         "id": packet.id,
         "kind": packet.kind,
         "greeting": packet.greeting,
-        "sender": _public(sender),
+        "sender": _public(users.get(packet.sender_id)),
+        "chain_text": packet.chain_text,
+        "target_user_id": target_id,
+        "target": _public(users.get(target_id)) if target_id is not None else None,
         "conversation_id": packet.conversation_id,
         "message_id": packet.message_id,
         "total": packet.total if open_book else None,
@@ -327,8 +343,8 @@ async def _view(db: AsyncSession, packet: RedPacket, viewer_id: int, now: dateti
     """契约里的红包对象（带领取明细）。没抢的人在红包还进行着的时候看不到任何金额。"""
     claimed = await _claimed_shares(db, packet.id)
     mine = next((share for share in claimed if share.user_id == viewer_id), None)
-    users = await _users(db, {packet.sender_id, *(share.user_id for share in claimed)})
-    view = _base_view(packet, users.get(packet.sender_id), mine, viewer_id, now)
+    users = await _users(db, _people(packet) | {share.user_id for share in claimed})
+    view = _base_view(packet, users, mine, viewer_id, now)
     if view["total"] is not None:
         luckiest = _luckiest(packet, claimed)
         view["claims"] = [
@@ -368,8 +384,9 @@ def _ensure_not_muted(user: User) -> None:
 async def pending_conversation_ids(db: AsyncSession, user_id: int, *, now: datetime | None = None) -> set[int]:
     """哪些会话里有这个人还能领的红包（会话对象的 red_packet_pending）。会话列表是热路径，所以整个列表只查这一条。
 
-    「还能领」= 状态 active、没过期（现场按 expires_at 判断，不依赖清扫）、这个人没领过、不是「私聊里自己发的」。
-    群里自己发的、自己还没抢的算。
+    「还能领」= 状态 active、没过期（现场按 expires_at 判断，不依赖清扫）、这个人没领过、不是「私聊里自己发的」、
+    不是「给别人的专属红包」。群里自己发的、自己还没抢的算（专属红包除外：目标不会是自己）。
+    专属这一条只看红包行自己的 target_user_id，不多查任何东西。
 
     查询是从「进行中的红包」出发的，不是从这个人的会话出发：进行中的红包全站也就那么些（24 小时就过期），
     走 (status, expires_at) 索引取出来，每个再做两次唯一索引上的点查 —— 这个人在不在那个会话里
@@ -391,7 +408,7 @@ async def pending_conversation_ids(db: AsyncSession, user_id: int, *, now: datet
     rows = await db.execute(
         select(RedPacket.conversation_id)
         .join(ConversationMember, and_(ConversationMember.conversation_id == RedPacket.conversation_id, ConversationMember.user_id == user_id))
-        .where(*live, or_(RedPacket.conversation_type != "direct", RedPacket.sender_id != user_id), ~claimed)
+        .where(*live, or_(RedPacket.conversation_type != "direct", RedPacket.sender_id != user_id), _claimable_target(user_id), ~claimed)
         .distinct()
     )
     return set(rows.scalars().all())
@@ -410,12 +427,40 @@ async def pending_in_conversation(db: AsyncSession, user_id: int, conversation_i
             RedPacket.expires_at > now,
             RedPacket.message_id.is_not(None),
             or_(RedPacket.conversation_type != "direct", RedPacket.sender_id != user_id),
+            _claimable_target(user_id),
             ~claimed,
         )
         .order_by(RedPacket.id.desc())
         .limit(20)
     )
     return list(rows.scalars().all())
+
+
+def _claimable_target(user_id: int) -> Any:
+    """不是专属红包，或者专属给的就是我。"""
+    return or_(RedPacket.target_user_id.is_(None), RedPacket.target_user_id == user_id)
+
+
+async def pending_items(db: AsyncSession, packets: list[RedPacket]) -> list[dict[str, Any]]:
+    """GET /red-packets/pending 的每一项（不带金额）。"""
+    users = await _users(db, {packet.target_user_id for packet in packets if packet.target_user_id is not None})
+    return [
+        {
+            "id": packet.id,
+            "message_id": packet.message_id,
+            "sender_id": packet.sender_id,
+            "kind": packet.kind,
+            "greeting": packet.greeting,
+            "count": packet.count,
+            "claimed_count": packet.claimed_count,
+            "expires_at": _aware(packet.expires_at),
+            "created_at": _aware(packet.created_at),
+            "chain_text": packet.chain_text,
+            "target_user_id": packet.target_user_id,
+            "target": _public(users.get(packet.target_user_id)) if packet.target_user_id is not None else None,
+        }
+        for packet in packets
+    ]
 
 
 def _mark_live() -> None:
@@ -490,32 +535,93 @@ def _clean_greeting(value: Any) -> str:
     return text or DEFAULT_GREETING
 
 
-async def _ensure_greeting_allowed(user: User, greeting: str, conversation_id: int) -> None:
-    """祝福语先过一遍文本审核，明确违规的不让发。审核服务不可用时放行，消息发出去之后仍会走异步审核。"""
-    if greeting == DEFAULT_GREETING or not settings.content_moderation_enabled or user.content_moderation_whitelisted:
+# 接龙口令里不许出现的换行（\n、\r 之外再算上 Unicode 的行分隔符、段分隔符）
+_LINE_BREAKS = re.compile("[\r\n\v\f\x1c-\x1e\x85\u2028\u2029]")
+
+
+def _clean_chain_text(value: Any) -> str | None:
+    """接龙口令：不传、或者去掉首尾空白之后是空的 = 不是接龙红包。零宽字符删掉；不能有换行，最长 CHAIN_TEXT_MAX 字。"""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise _error(status.HTTP_422_UNPROCESSABLE_ENTITY, "chain_text_rejected", "接龙口令格式不对")
+    text = "".join(char for char in value if unicodedata.category(char) != "Cf").strip()
+    if not text:
+        return None
+    if _LINE_BREAKS.search(text):
+        raise _error(status.HTTP_422_UNPROCESSABLE_ENTITY, "chain_text_rejected", "接龙口令不能换行")
+    if len(text) > CHAIN_TEXT_MAX:
+        raise _error(status.HTTP_422_UNPROCESSABLE_ENTITY, "chain_text_rejected", f"接龙口令最多 {CHAIN_TEXT_MAX} 个字")
+    return text
+
+
+async def _ensure_text_allowed(user: User, text: str, conversation_id: int, code: str, message: str) -> None:
+    """发之前先过一遍文本审核，明确违规的不让发。审核服务不可用时放行，消息发出去之后仍会走异步审核。"""
+    if not settings.content_moderation_enabled or user.content_moderation_whitelisted:
         return
     from app.services import moderation as moderation_service
 
     try:
-        result = await moderation_service._call_text_moderation_for_user(greeting, user.id, context_id=f"red_packet:{conversation_id}")
+        result = await moderation_service._call_text_moderation_for_user(text, user.id, context_id=f"red_packet:{conversation_id}")
     except Exception:
         return
     if result.get("decision") == "block":
-        raise _error(status.HTTP_422_UNPROCESSABLE_ENTITY, "greeting_rejected", "祝福语未通过审核，请修改后重试")
+        raise _error(status.HTTP_422_UNPROCESSABLE_ENTITY, code, message)
+
+
+async def _ensure_greeting_allowed(user: User, greeting: str, conversation_id: int) -> None:
+    """祝福语过审核（默认祝福语不送审）。"""
+    if greeting == DEFAULT_GREETING:
+        return
+    await _ensure_text_allowed(user, greeting, conversation_id, "greeting_rejected", "祝福语未通过审核，请修改后重试")
+
+
+def _invalid_target(reason: str, message: str) -> HTTPException:
+    return _error(status.HTTP_422_UNPROCESSABLE_ENTITY, "invalid_target", message, reason=reason)
+
+
+async def _check_target(db: AsyncSession, conversation_id: int, sender_id: int, raw: Any) -> User:
+    """专属红包的目标：必须是这个群的成员、不是自己、不是机器人。"""
+    target_id = _positive_int(raw)
+    if target_id is None:
+        raise _invalid_target("invalid", "专属红包要指定一个群成员")
+    if target_id == sender_id:
+        raise _invalid_target("self", "专属红包不能发给自己")
+    target = await db.get(User, target_id)
+    if target is None:
+        raise _invalid_target("not_member", "对方不在这个群里")
+    if target.is_bot:
+        raise _invalid_target("bot", "不能给机器人发专属红包")
+    member = await db.scalar(
+        select(ConversationMember.id).where(ConversationMember.conversation_id == conversation_id, ConversationMember.user_id == target_id)
+    )
+    if member is None:
+        raise _invalid_target("not_member", "对方不在这个群里")
+    return target
+
+
+async def _member_name(db: AsyncSession, conversation_id: int, user: User) -> str:
+    """群昵称 > 昵称 > 用户名。"""
+    nickname = await db.scalar(
+        select(ConversationMember.nickname).where(ConversationMember.conversation_id == conversation_id, ConversationMember.user_id == user.id)
+    )
+    return (nickname or "").strip() or (user.nickname or "").strip() or user.username
 
 
 def _positive_int(value: Any) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
 
 
-def _plan(payload: dict[str, Any], config: dict[str, Any], direct: bool) -> tuple[str, int, int, int]:
-    """校验 kind / amount / count，返回 (kind, amount, count, 整包金额)。"""
+def _plan(payload: dict[str, Any], config: dict[str, Any], direct: bool, exclusive: bool = False) -> tuple[str, int, int, int]:
+    """校验 kind / amount / count，返回 (kind, amount, count, 整包金额)。私聊和专属红包都只能是 normal、1 个。"""
+    single = direct or exclusive
     kind = payload.get("kind")
-    if kind not in KINDS or (direct and kind != "normal"):
-        raise _error(status.HTTP_422_UNPROCESSABLE_ENTITY, "invalid_kind", "私聊只能发普通红包" if kind in KINDS else "红包类型只能是 normal 或 lucky")
+    if kind not in KINDS or (single and kind != "normal"):
+        message = "红包类型只能是 normal 或 lucky" if kind not in KINDS else "私聊只能发普通红包" if direct else "专属红包只能是普通红包"
+        raise _error(status.HTTP_422_UNPROCESSABLE_ENTITY, "invalid_kind", message)
     count = _positive_int(payload.get("count"))
-    if count is None or count > config["max_count"] or (direct and count != 1):
-        message = "私聊红包只能发 1 个" if direct else f"红包个数要在 1–{config['max_count']} 之间"
+    if count is None or count > config["max_count"] or (single and count != 1):
+        message = "私聊红包只能发 1 个" if direct else "专属红包只能发 1 个" if exclusive else f"红包个数要在 1–{config['max_count']} 之间"
         raise _error(status.HTTP_422_UNPROCESSABLE_ENTITY, "invalid_count", message, max_count=config["max_count"])
     amount = _positive_int(payload.get("amount"))
     extra = {"max_total": config["max_total"], "min_each": config["min_each"]}
@@ -554,7 +660,7 @@ async def send_red_packet(db: AsyncSession, user: User, payload: dict[str, Any])
 
     返回 (契约里的 { red_packet, balance }, 那条消息)；消息的广播和接口返回里的 message 由接口层做，和发普通消息一样。
     检查顺序：disabled → not_member → muted → invalid_kind / invalid_count / invalid_amount / greeting_rejected →
-    ccw_not_bound → 祝福语审核 → daily_limit → 503 → 402。
+    invalid_target / chain_text_rejected → ccw_not_bound → 祝福语、接龙口令审核 → daily_limit → 503 → 402。
     """
     user_id, oid = user.id, shop_service._bound_oid(user)
     config = await get_settings(db)
@@ -574,12 +680,23 @@ async def send_red_packet(db: AsyncSession, user: User, payload: dict[str, Any])
 
         if conversation.all_muted or (member.muted and not _member_mute_expired(member)):
             raise _error(status.HTTP_403_FORBIDDEN, "muted", "你在这个群里被禁言了，或者群开了全员禁言")
-    kind, amount, count, total = _plan(payload, config, direct)
+    raw_target = payload.get("target_user_id")
+    exclusive = raw_target is not None
+    if exclusive and direct:
+        raise _invalid_target("direct", "专属红包只能在群里发")
+    kind, amount, count, total = _plan(payload, config, direct, exclusive)
     greeting = _clean_greeting(payload.get("greeting"))
+    chain_text = _clean_chain_text(payload.get("chain_text"))
+    target = await _check_target(db, conversation_id, user_id, raw_target) if exclusive else None
+    target_id = target.id if target is not None else None
+    target_name = await _member_name(db, conversation_id, target) if target is not None else None
+    target_public = _public(target).model_dump(mode="json") if target is not None else None
     if oid is None:
         raise _error(status.HTTP_403_FORBIDDEN, "ccw_not_bound", "先绑定 CCW 账号才能发红包")
     conversation_type = "direct" if direct else "group"
     await _ensure_greeting_allowed(user, greeting, conversation_id)
+    if chain_text is not None:
+        await _ensure_text_allowed(user, chain_text, conversation_id, "chain_text_rejected", "接龙口令未通过审核，请修改后重试")
     if await _sent_today(db, user_id, _now()) >= config["daily_send_limit"]:
         raise _daily_limit(config["daily_send_limit"])
     # 和商店购买一样：累计投币得是刚向 CCW 核实过的，核实不了就 503，不扣币
@@ -616,6 +733,8 @@ async def send_red_packet(db: AsyncSession, user: User, payload: dict[str, Any])
                     conversation_type=conversation_type,
                     kind=kind,
                     greeting=greeting,
+                    chain_text=chain_text,
+                    target_user_id=target_id,
                     total=total,
                     count=count,
                     ccw_oid=oid,
@@ -626,16 +745,23 @@ async def send_red_packet(db: AsyncSession, user: User, payload: dict[str, Any])
                 await db.flush()
                 db.add_all([RedPacketShare(packet_id=packet.id, seq=index, amount=value) for index, value in enumerate(amounts, start=1)])
                 # 走正常的发消息路径（成员、禁言、限频、群活跃度都和普通消息一致），但不让它自己提交。
-                # metadata 里只放不会变的字段；状态和金额要调 GET /red-packets/{id}
+                # metadata 里只放发的时候就定下的字段；状态和金额要调 GET /red-packets/{id}。
+                # 接龙、专属的字段只在是的时候才有（普通红包的 metadata 和以前一模一样）
                 from app.services import messages as message_service
 
+                info: dict[str, Any] = {"id": packet.id, "kind": kind, "greeting": greeting, "count": count}
+                if chain_text is not None:
+                    info["chain_text"] = chain_text
+                if target_id is not None:
+                    info["target_user_id"] = target_id
+                    info["target"] = target_public
                 message = await message_service.send_message(
                     db,
                     conversation_id,
                     user,
-                    fallback_text(greeting),
+                    fallback_text(greeting, chain=chain_text is not None, target_name=target_name),
                     MessageType.RED_PACKET,
-                    {"red_packet": {"id": packet.id, "kind": kind, "greeting": greeting, "count": count}},
+                    {"red_packet": info},
                     allow_red_packet=True,
                     commit=False,
                 )
@@ -834,8 +960,30 @@ async def get_red_packet(db: AsyncSession, user: User, packet_id: int) -> dict[s
     return await _view(db, packet, user_id, now)
 
 
-async def _take_share(db: AsyncSession, packet_id: int, user_id: int, now: datetime) -> str:
-    """抢一份。返回 "ok" / "none"（没抢到：没有剩的了，或者红包已经不在进行中）/ "already"（这个人已经有一份了）。"""
+def _muted_in_group() -> HTTPException:
+    return _error(status.HTTP_403_FORBIDDEN, "muted_in_group", "你在这个群里被禁言了（或者群开了全员禁言），领接龙红包要发言，暂时领不了")
+
+
+def _chain_send_error(exc: HTTPException) -> HTTPException:
+    """领接龙红包时自动发言被发消息那条路径拒了，换成这里的错误格式。这时整个领取已经回滚，没有领到。"""
+    detail = exc.detail
+    if isinstance(detail, dict) and detail.get("code") == "account_muted":
+        return _error(status.HTTP_403_FORBIDDEN, "muted", detail.get("message") or "你正在被禁言", muted_until=detail.get("muted_until"))
+    if isinstance(detail, dict) and detail.get("code"):
+        return exc
+    if exc.status_code == status.HTTP_404_NOT_FOUND:
+        return _not_member()
+    if exc.status_code == status.HTTP_403_FORBIDDEN:
+        return _muted_in_group()
+    return _error(exc.status_code, "chain_send_failed", "接龙消息发不出去，这次没有领取，稍后再试")
+
+
+async def _take_share(db: AsyncSession, packet_id: int, user_id: int, now: datetime, chain: tuple[User, int, str] | None = None) -> tuple[str, Message | None]:
+    """抢一份。返回 ("ok", 接龙消息或 None) / ("none", None)（没抢到：没有剩的了，或者红包已经不在进行中）/ ("already", None)（这个人已经有一份了）。
+
+    chain：接龙红包，(领取人, 会话 id, 接龙口令)。领到之后在**同一个事务**里以领取人的身份发接龙口令，两件事一起提交：
+    消息发不出去（比如这一刻刚被禁言）就整个回滚，钱没动、消息也没有，接口报错。实时推送由调用方在提交之后做。
+    """
     free = (
         select(RedPacketShare.id)
         .where(RedPacketShare.packet_id == packet_id, RedPacketShare.user_id.is_(None))
@@ -860,7 +1008,7 @@ async def _take_share(db: AsyncSession, packet_id: int, user_id: int, now: datet
             )
             if taken.rowcount != 1:
                 await db.rollback()
-                return "none"
+                return "none", None
             amount = select(RedPacketShare.amount).where(RedPacketShare.packet_id == packet_id, RedPacketShare.user_id == user_id).scalar_subquery()
             last = RedPacket.claimed_count + 1 >= RedPacket.count
             # 红包上的计数和上面那一份一起提交；领完最后一份就地置 finished
@@ -875,12 +1023,36 @@ async def _take_share(db: AsyncSession, packet_id: int, user_id: int, now: datet
                 )
                 .execution_options(synchronize_session=False)
             )
-            await db.commit()
-            return "ok"
         except IntegrityError:
             # (packet_id, user_id) 唯一：这个人的另一个请求已经拿到一份了
             await db.rollback()
-            return "already"
+            return "already", None
+        except BaseException:
+            await db.rollback()
+            raise
+        message: Message | None = None
+        try:
+            if chain is not None:
+                claimer, conversation_id, chain_text = chain
+                from app.services import messages as message_service
+
+                # 前面的重试回滚过会话的话 claimer 的属性已经过期，发消息要读它们，先重新读出来（这时已经拿着写锁，读到的是最新的）
+                await db.refresh(claimer)
+                message = await message_service.send_message(
+                    db,
+                    conversation_id,
+                    claimer,
+                    chain_text,
+                    MessageType.TEXT,
+                    {"red_packet_chain": {"red_packet_id": packet_id}},
+                    red_packet_chain=True,
+                    commit=False,
+                )
+            await db.commit()
+            return "ok", message
+        except HTTPException as exc:
+            await db.rollback()
+            raise _chain_send_error(exc) from None
         except BaseException:
             await db.rollback()
             raise
@@ -892,16 +1064,39 @@ async def _my_share(db: AsyncSession, packet_id: int, user_id: int) -> RedPacket
     ).scalar_one_or_none()
 
 
-async def claim(db: AsyncSession, user: User, packet_id: int) -> dict[str, Any]:
-    """POST /red-packets/{id}/claim。没绑定 CCW 的人也能领：币记在账上，花的时候才要求绑定。"""
+async def _ensure_can_speak_in_group(db: AsyncSession, packet: RedPacket, member: ConversationMember) -> None:
+    """接龙红包：领了就要在群里发言，群里被禁言（或者群开了全员禁言）的不能领。群主、管理员不受群内禁言限制。"""
+    if packet.conversation_type != "group" or member.role in STAFF_ROLES:
+        return
+    conversation = await db.get(Conversation, packet.conversation_id)
+    if conversation is None:
+        raise _not_member()
+    from app.services.conversations import _member_mute_expired
+
+    if conversation.all_muted or (member.muted and not _member_mute_expired(member)):
+        raise _muted_in_group()
+
+
+async def claim(db: AsyncSession, user: User, packet_id: int) -> tuple[dict[str, Any], Message | None]:
+    """POST /red-packets/{id}/claim。没绑定 CCW 的人也能领：币记在账上，花的时候才要求绑定。
+
+    返回 (契约里的 { amount, red_packet, balance }, 接龙消息)。接龙红包领到时会以领取人的身份发一条消息（和领取一起提交），
+    它的广播由接口层做，和发普通消息一样；不是接龙红包时第二项是 None。
+    """
     user_id, oid = user.id, shop_service._bound_oid(user)
     # 这里不看总开关：关掉开关只是不让发新的，已经发出去的照常能领、照常过期退回（要止损用后台撤销）
     packet = await _load(db, packet_id)
-    await _membership(db, packet.conversation_id, user_id)
+    member = await _membership(db, packet.conversation_id, user_id)
     _ensure_not_muted(user)
+    if packet.target_user_id is not None and packet.target_user_id != user_id:
+        raise _error(status.HTTP_403_FORBIDDEN, "not_target", "这是给别人的专属红包")
     if packet.conversation_type == "direct" and packet.sender_id == user_id:
         raise _error(status.HTTP_403_FORBIDDEN, "own_packet", "私聊里不能领自己发的红包")
+    if packet.chain_text:
+        # 先确认能发言再去抢：被禁言的人领不了接龙红包（事务里发消息那一步还会再查一遍，挡住这之间刚被禁言的）
+        await _ensure_can_speak_in_group(db, packet, member)
     now = _now()
+    chain_message: Message | None = None
     for _attempt in range(CLAIM_ATTEMPTS):
         if await _my_share(db, packet_id, user_id) is not None:
             raise _error(status.HTTP_409_CONFLICT, "already_claimed", "你已经领过这个红包了")
@@ -909,7 +1104,7 @@ async def claim(db: AsyncSession, user: User, packet_id: int) -> dict[str, Any]:
         packet = await _settle_if_due(db, await _load(db, packet_id), now)
         if packet.status != "active":
             raise _gone(packet.status)
-        outcome = await _take_share(db, packet_id, user_id, now)
+        outcome, chain_message = await _take_share(db, packet_id, user_id, now, (user, packet.conversation_id, packet.chain_text) if packet.chain_text else None)
         if outcome == "ok":
             break
         if outcome == "already":
@@ -927,7 +1122,7 @@ async def claim(db: AsyncSession, user: User, packet_id: int) -> dict[str, Any]:
         "amount": amount,
         "red_packet": await _view(db, await _load(db, packet_id), user_id, now),
         "balance": await shop_service._balance(db, user_id, oid),
-    }
+    }, chain_message
 
 
 async def list_mine(db: AsyncSession, user: User, direction: str, limit: int, offset: int) -> dict[str, Any]:
@@ -969,8 +1164,8 @@ async def list_mine(db: AsyncSession, user: User, direction: str, limit: int, of
     if packet_ids:
         rows = await db.execute(select(RedPacketShare).where(RedPacketShare.packet_id.in_(packet_ids), RedPacketShare.user_id == user_id))
         mine = {share.packet_id: share for share in rows.scalars().all()}
-    users = await _users(db, {packet.sender_id for packet in packets})
-    views = [_base_view(packet, users.get(packet.sender_id), mine.get(packet.id), user_id, now) for packet in packets]
+    users = await _users(db, {person for packet in packets for person in _people(packet)})
+    views = [_base_view(packet, users, mine.get(packet.id), user_id, now) for packet in packets]
     if direction != "sent":
         views = [{"amount": view["my_claim"]["amount"], "created_at": view["my_claim"]["created_at"], "red_packet": view} for view in views]
     return {"items": views, "total": int(total or 0), "sum": int(amount or 0)}
@@ -979,17 +1174,22 @@ async def list_mine(db: AsyncSession, user: User, direction: str, limit: int, of
 # ---------------------------------------------------------------- 后台
 
 
-def _admin_view(packet: RedPacket, sender: User | None, now: datetime) -> dict[str, Any]:
-    """后台看到的红包。隐私边界：私聊红包的祝福语一律不给（那是私聊内容）；任何消息内容都不在这里出现。"""
+def _admin_view(packet: RedPacket, users: dict[int, User], now: datetime) -> dict[str, Any]:
+    """后台看到的红包。隐私边界：私聊红包的祝福语、接龙口令一律不给（那是私聊内容）；任何消息内容都不在这里出现。"""
+    group = packet.conversation_type == "group"
     return {
         "id": packet.id,
         "kind": packet.kind,
-        "greeting": packet.greeting if packet.conversation_type == "group" else None,
-        "sender": shop_service._admin_user_view(sender),
+        "greeting": packet.greeting if group else None,
+        "sender": shop_service._admin_user_view(users.get(packet.sender_id)),
         "sender_id": packet.sender_id,
         "conversation_id": packet.conversation_id,
         "conversation_type": packet.conversation_type,
         "message_id": packet.message_id,
+        "chain": packet.chain_text is not None,
+        "chain_text": packet.chain_text if group else None,
+        "target_user_id": packet.target_user_id,
+        "target": shop_service._admin_user_view(users.get(packet.target_user_id)) if packet.target_user_id is not None else None,
         "total": packet.total,
         "count": packet.count,
         "claimed_count": packet.claimed_count,
@@ -1055,17 +1255,12 @@ async def admin_list(
             )
         )
     ).one()
-    rows = await db.execute(
-        select(RedPacket, User)
-        .outerjoin(User, User.id == RedPacket.sender_id)
-        .where(*clauses)
-        .order_by(RedPacket.created_at.desc(), RedPacket.id.desc())
-        .offset(offset)
-        .limit(limit)
-    )
+    rows = await db.execute(select(RedPacket).where(*clauses).order_by(RedPacket.created_at.desc(), RedPacket.id.desc()).offset(offset).limit(limit))
+    packets = list(rows.scalars().all())
+    users = await _users(db, {person for packet in packets for person in _people(packet)})
     now = _now()
     return {
-        "items": [_admin_view(packet, sender, now) for packet, sender in rows.all()],
+        "items": [_admin_view(packet, users, now) for packet in packets],
         "total": int(total or 0),
         "summary": {"total_sent": int(sent), "total_claimed": int(claimed), "total_refunded": int(refunded), "outstanding": int(outstanding)},
     }
@@ -1075,10 +1270,10 @@ async def admin_detail(db: AsyncSession, packet_id: int) -> dict[str, Any]:
     """GET /admin/red-packets/{id}：红包和领取明细（谁、多少、什么时候）。"""
     packet = await _load(db, packet_id)
     claimed = await _claimed_shares(db, packet_id)
-    users = await _users(db, {packet.sender_id, *(share.user_id for share in claimed)})
+    users = await _users(db, _people(packet) | {share.user_id for share in claimed})
     luckiest = _luckiest(packet, claimed)
     return {
-        **_admin_view(packet, users.get(packet.sender_id), _now()),
+        **_admin_view(packet, users, _now()),
         "claims": [
             {
                 "user": shop_service._admin_user_view(users.get(share.user_id)),

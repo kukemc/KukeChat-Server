@@ -165,6 +165,9 @@ class RedPacketTestCase(unittest.IsolatedAsyncioTestCase):
         return (await self._send(name, **overrides))["red_packet"]["id"]
 
     async def _claim(self, name: str, packet_id: int) -> dict[str, Any]:
+        return (await self._as(name, rp.claim, packet_id))[0]
+
+    async def _claim_with_message(self, name: str, packet_id: int) -> tuple[dict[str, Any], Message | None]:
         return await self._as(name, rp.claim, packet_id)
 
     async def _get(self, name: str, packet_id: int) -> dict[str, Any]:
@@ -576,7 +579,7 @@ class ClaimTests(RedPacketTestCase):
             await db.commit()
         rp.reset_cache()
         config = await self._as("alice", rp.config_view)
-        self.assertEqual(config, {"enabled": False, "limits": {"max_total": 500, "max_count": 100, "min_each": 1, "daily_send_limit": 20, "expire_hours": 24}, "sent_today": 0})
+        self.assertEqual(config, {"enabled": False, "limits": {"max_total": 500, "max_count": 100, "min_each": 1, "daily_send_limit": 20, "expire_hours": 24}, "sent_today": 0, "features": ["chain", "exclusive"]})
         self.assertEqual(await self._code(self._send()), (403, "disabled"))
 
 
@@ -927,10 +930,10 @@ class ExpiryTests(RedPacketTestCase):
             message.recalled_at = datetime.now(UTC)
             await db.commit()
         async with self.sessions() as db:
-            self.assertEqual(await rp._take_share(db, expired, self.ids["bob"], self.now + timedelta(hours=24)), "none")
-            self.assertEqual(await rp._take_share(db, recalled, self.ids["bob"], self.now), "none")
-            self.assertEqual(await rp._take_share(db, expired, self.ids["bob"], self.now + timedelta(hours=23)), "ok")
-            self.assertEqual(await rp._take_share(db, expired, self.ids["bob"], self.now + timedelta(hours=23)), "already")
+            self.assertEqual(await rp._take_share(db, expired, self.ids["bob"], self.now + timedelta(hours=24)), ("none", None))
+            self.assertEqual(await rp._take_share(db, recalled, self.ids["bob"], self.now), ("none", None))
+            self.assertEqual(await rp._take_share(db, expired, self.ids["bob"], self.now + timedelta(hours=23)), ("ok", None))
+            self.assertEqual(await rp._take_share(db, expired, self.ids["bob"], self.now + timedelta(hours=23)), ("already", None))
         self.assertEqual([(await self._packet(packet_id)).claimed_count for packet_id in (expired, recalled)], [1, 0])
 
     async def test_sweep_refunds_and_is_idempotent(self) -> None:
@@ -1494,6 +1497,221 @@ class AdminTests(RedPacketTestCase):
 # ---------------------------------------------------------------- HTTP
 
 
+# ---------------------------------------------------------------- 接龙红包、专属红包
+
+
+class ChainTests(RedPacketTestCase):
+    async def _messages(self) -> list[Message]:
+        async with self.sessions() as db:
+            return list((await db.execute(select(Message).order_by(Message.id))).scalars().all())
+
+    async def test_claiming_posts_the_chain_text_as_the_claimer(self) -> None:
+        self.ledger.donate(OID_A, 300)
+        sent = await self._send(amount=30, count=3, greeting="开工", chain_text="  老板大气  ")
+        packet, message = sent["red_packet"], sent["message"]
+        self.assertEqual((packet["chain_text"], packet["target_user_id"], packet["target"]), ("老板大气", None, None))
+        self.assertEqual(json.loads(message.metadata_json), {"red_packet": {"id": packet["id"], "kind": "lucky", "greeting": "开工", "count": 3, "chain_text": "老板大气"}})
+        self.assertEqual(message.content, "[接龙红包] 开工（更新到新版才能领取）")
+        # 发红包时的异步审核把接龙口令也算进去（算在发的人头上）
+        self.assertEqual(moderation_service._text_to_moderate(message, json.loads(message.metadata_json)), "开工\n老板大气")
+        # 群开了发言限频，bob 刚发过一条：接龙消息不受限
+        async with self.sessions() as db:
+            (await db.get(Conversation, self.group_id)).message_rate_limit_per_minute = 1
+            await db.commit()
+        async with self.sessions() as db:
+            await message_service.send_message(db, self.group_id, await db.get(User, self.ids["bob"]), "先说一句")
+        before = len(await self._messages())
+        result, chain = await self._claim_with_message("bob", packet["id"])
+        self.assertIsNotNone(chain)
+        messages = await self._messages()
+        self.assertEqual(len(messages), before + 1)
+        last = messages[-1]
+        self.assertEqual((last.id, last.sender_id, last.type, last.content), (chain.id, self.ids["bob"], MessageType.TEXT, "老板大气"))
+        self.assertEqual(json.loads(last.metadata_json), {"red_packet_chain": {"red_packet_id": packet["id"]}})
+        self.assertEqual(result["red_packet"]["my_claim"]["amount"], result["amount"])
+        # 会话最后一条、领取人自己的已读位置都跟着走（未读数由它算）
+        async with self.sessions() as db:
+            member = (await db.execute(select(ConversationMember).where(ConversationMember.conversation_id == self.group_id, ConversationMember.user_id == self.ids["bob"]))).scalar_one()
+            self.assertEqual(member.last_read_message_id, chain.id)
+        # 发的人自己在群里抢，也一样要说这句话
+        _result, own = await self._claim_with_message("alice", packet["id"])
+        self.assertEqual((own.sender_id, own.content), (self.ids["alice"], "老板大气"))
+        # 普通红包领了不发言
+        async with self.sessions() as db:
+            (await db.get(Conversation, self.group_id)).message_rate_limit_per_minute = 0
+            await db.commit()
+        plain = await self._send_id(amount=10, count=1)
+        self.assertIsNone((await self._claim_with_message("carol", plain))[1])
+        await self._assert_conserved()
+
+    async def test_chain_text_format(self) -> None:
+        self.ledger.donate(OID_A, 300)
+        self.assertEqual(await self._code(self._send(chain_text="第一行\n第二行")), (422, "chain_text_rejected"))
+        self.assertEqual(await self._code(self._send(chain_text="a b")), (422, "chain_text_rejected"))
+        self.assertEqual(await self._code(self._send(chain_text="长" * 31)), (422, "chain_text_rejected"))
+        self.assertEqual(await self._code(self._send(chain_text=123)), (422, "chain_text_rejected"))
+        self.assertEqual((await self._count(RedPacket), (await self._balance("alice"))["red_packet_sent"]), (0, 0))
+        # 30 个字可以；只有空白 = 不是接龙红包
+        self.assertEqual((await self._send(chain_text="长" * 30, amount=5, count=1))["red_packet"]["chain_text"], "长" * 30)
+        self.assertIsNone((await self._send(chain_text="   ", amount=5, count=1))["red_packet"]["chain_text"])
+
+    async def test_rejected_chain_text_charges_nothing(self) -> None:
+        self.ledger.donate(OID_A, 300)
+        seen: list[str] = []
+
+        async def moderate(text: str, _user_id: int, context_id: str | None = None) -> dict[str, Any]:
+            seen.append(text)
+            return {"decision": "block" if "坏" in text else "allow"}
+
+        with patch.object(settings, "content_moderation_enabled", True), patch.object(moderation_service, "_call_text_moderation_for_user", moderate):
+            self.assertEqual(await self._code(self._send(chain_text="坏话接龙")), (422, "chain_text_rejected"))
+            self.assertEqual((await self._count(RedPacket), await self._count(Message), (await self._balance("alice"))["red_packet_sent"]), (0, 0, 0))
+            await self._send(chain_text="好话接龙", amount=5, count=1)
+        self.assertEqual(seen, ["坏话接龙", "好话接龙"])
+        await self._assert_conserved()
+
+    async def test_muted_members_cannot_claim_a_chain_packet(self) -> None:
+        self.ledger.donate(OID_A, 300)
+        chain = await self._send_id(amount=40, count=4, chain_text="谢谢老板")
+        plain = await self._send_id(amount=10, count=1)
+        async with self.sessions() as db:
+            member = (await db.execute(select(ConversationMember).where(ConversationMember.conversation_id == self.group_id, ConversationMember.user_id == self.ids["bob"]))).scalar_one()
+            member.muted = True
+            await db.commit()
+        before = await self._count(Message)
+        self.assertEqual(await self._code(self._claim("bob", chain)), (403, "muted_in_group"))
+        # 群内禁言不影响领普通红包（领了不用发言）
+        await self._claim("bob", plain)
+        # 全员禁言：普通成员领不了，群主不受限
+        async with self.sessions() as db:
+            (await db.get(Conversation, self.group_id)).all_muted = True
+            await db.commit()
+        self.assertEqual(await self._code(self._claim("carol", chain)), (403, "muted_in_group"))
+        _result, message = await self._claim_with_message("dave", chain)
+        self.assertEqual(message.sender_id, self.ids["dave"])
+        # 平台禁言
+        async with self.sessions() as db:
+            (await db.get(Conversation, self.group_id)).all_muted = False
+            (await db.get(User, self.ids["u00"])).muted_until = datetime.now(UTC) + timedelta(hours=1)
+            await db.commit()
+        self.assertEqual(await self._code(self._claim("u00", chain)), (403, "muted"))
+        stored = await self._packet(chain)
+        self.assertEqual(stored.claimed_count, 1)
+        self.assertEqual(await self._count(Message), before + 1)
+        await self._assert_conserved()
+
+    async def test_a_failed_chain_message_rolls_the_claim_back(self) -> None:
+        """预检之后、事务里才发现发不了言（这一刻刚被禁言）：这一份没领走，消息也没有，接口报错。"""
+        self.ledger.donate(OID_A, 300)
+        chain = await self._send_id(amount=30, count=3, chain_text="谢谢老板")
+        async with self.sessions() as db:
+            await db.execute(update(ConversationMember).where(ConversationMember.user_id == self.ids["bob"]).values(muted=True))
+            await db.commit()
+        before = await self._count(Message)
+        with patch.object(rp, "_ensure_can_speak_in_group", AsyncMock()):
+            self.assertEqual(await self._code(self._claim("bob", chain)), (403, "muted_in_group"))
+        stored = await self._packet(chain)
+        self.assertEqual((stored.claimed_count, stored.claimed_amount, await self._count(Message), await self._coins("bob")), (0, 0, before, 0))
+        self.assertTrue(all(share.user_id is None for share in await self._shares(chain)))
+        await self._assert_conserved()
+
+    async def test_chain_marker_cannot_be_forged(self) -> None:
+        """普通发消息带上 red_packet_chain：这一项被去掉，消息照常发。"""
+        async with self.sessions() as db:
+            message = await message_service.send_message(db, self.group_id, await db.get(User, self.ids["bob"]), "假的", MessageType.TEXT, {"red_packet_chain": {"red_packet_id": 1}})
+            self.assertIsNone(message.metadata_json)
+
+
+class ExclusiveTests(RedPacketTestCase):
+    async def test_only_the_target_may_claim(self) -> None:
+        self.ledger.donate(OID_A, 300)
+        async with self.sessions() as db:
+            await db.execute(update(ConversationMember).where(ConversationMember.user_id == self.ids["bob"]).values(nickname="小波"))
+            await db.commit()
+        sent = await self._send(kind="normal", amount=20, count=1, greeting="生日快乐", target_user_id=self.ids["bob"])
+        packet, message = sent["red_packet"], sent["message"]
+        self.assertEqual((packet["target_user_id"], packet["target"].username, packet["total"], packet["chain_text"]), (self.ids["bob"], "bob", 20, None))
+        self.assertEqual(message.content, "[专属红包] 给 小波：生日快乐（更新到新版才能领取）")
+        info = json.loads(message.metadata_json)["red_packet"]
+        self.assertEqual((info["target_user_id"], info["target"]["username"], info["kind"], info["count"]), (self.ids["bob"], "bob", "normal", 1))
+        self.assertNotIn("chain_text", info)
+        # 别人（包括发的人）领：403 not_target；别人看详情知道是给谁的
+        for name in ("carol", "alice", "dave"):
+            self.assertEqual(await self._code(self._claim(name, packet["id"])), (403, "not_target"))
+        seen = await self._get("carol", packet["id"])
+        self.assertEqual((seen["target_user_id"], seen["target"].username, seen["total"]), (self.ids["bob"], "bob", None))
+        claimed = await self._claim("bob", packet["id"])
+        self.assertEqual((claimed["amount"], claimed["red_packet"]["status"]), (20, "finished"))
+        mine = await self._as("alice", rp.list_mine, "sent", 20, 0)
+        self.assertEqual(mine["items"][0]["target"].username, "bob")
+        await self._assert_conserved()
+
+    async def test_invalid_targets(self) -> None:
+        self.ledger.donate(OID_A, 300)
+        async with self.sessions() as db:
+            bot = User(username="robot", hashed_password="x", is_bot=True)
+            db.add(bot)
+            await db.flush()
+            db.add(ConversationMember(conversation_id=self.group_id, user_id=bot.id, role=MemberRole.MEMBER))
+            await db.commit()
+            bot_id = bot.id
+
+        async def reason(**overrides: Any) -> tuple[int, str | None, str | None]:
+            status_code, code, detail = await self._fails(self._send(**{"kind": "normal", "amount": 10, "count": 1, **overrides}))
+            return status_code, code, detail.get("reason")
+
+        self.assertEqual(await reason(conversation_id=self.direct_id, target_user_id=self.ids["bob"]), (422, "invalid_target", "direct"))
+        self.assertEqual(await reason(target_user_id=self.ids["alice"]), (422, "invalid_target", "self"))
+        self.assertEqual(await reason(target_user_id=self.ids["eve"]), (422, "invalid_target", "not_member"))
+        self.assertEqual(await reason(target_user_id=999_999), (422, "invalid_target", "not_member"))
+        self.assertEqual(await reason(target_user_id=bot_id), (422, "invalid_target", "bot"))
+        self.assertEqual(await reason(target_user_id="bob"), (422, "invalid_target", "invalid"))
+        self.assertEqual(await reason(target_user_id=self.ids["bob"], kind="lucky", amount=10, count=1), (422, "invalid_kind", None))
+        self.assertEqual(await reason(target_user_id=self.ids["bob"], count=2), (422, "invalid_count", None))
+        self.assertEqual((await self._count(RedPacket), await self._count(Message), (await self._balance("alice"))["red_packet_sent"]), (0, 0, 0))
+
+    async def test_pending_counts_only_for_the_target(self) -> None:
+        self.ledger.donate(OID_A, 300)
+        exclusive = await self._send_id(kind="normal", amount=10, count=1, target_user_id=self.ids["bob"])
+
+        async def pending(name: str) -> list[int]:
+            return [packet.id for packet in await self._as(name, lambda db, user: rp.pending_in_conversation(db, user.id, self.group_id))]
+
+        async def flagged(name: str) -> set[int]:
+            async with self.sessions() as db:
+                return await rp.pending_conversation_ids(db, self.ids[name])
+
+        self.assertEqual((await pending("bob"), await pending("alice"), await pending("carol")), ([exclusive], [], []))
+        self.assertEqual((await flagged("bob"), await flagged("alice"), await flagged("carol")), ({self.group_id}, set(), set()))
+        async with self.sessions() as db:
+            packets = await rp.pending_in_conversation(db, self.ids["bob"], self.group_id)
+            items = await rp.pending_items(db, packets)
+        self.assertEqual((items[0]["target_user_id"], items[0]["target"].username, items[0]["chain_text"]), (self.ids["bob"], "bob", None))
+        await self._claim("bob", exclusive)
+        self.assertEqual((await pending("bob"), await flagged("bob")), ([], set()))
+
+    async def test_exclusive_chain_packet(self) -> None:
+        self.ledger.donate(OID_A, 300)
+        sent = await self._send(kind="normal", amount=10, count=1, target_user_id=self.ids["bob"], chain_text="谢谢姐")
+        self.assertEqual(sent["message"].content, "[专属接龙红包] 给 bob：恭喜发财（更新到新版才能领取）")
+        self.assertEqual(await self._code(self._claim("carol", sent["red_packet"]["id"])), (403, "not_target"))
+        _result, message = await self._claim_with_message("bob", sent["red_packet"]["id"])
+        self.assertEqual((message.sender_id, message.content), (self.ids["bob"], "谢谢姐"))
+        await self._assert_conserved()
+
+    async def test_admin_view_shows_the_new_fields(self) -> None:
+        self.ledger.donate(OID_A, 300)
+        group_packet = await self._send_id(kind="normal", amount=10, count=1, target_user_id=self.ids["bob"], chain_text="谢谢")
+        direct_packet = await self._send_id(conversation_id=self.direct_id, kind="normal", amount=10, count=1, chain_text="私聊口令")
+        async with self.sessions() as db:
+            listed = {item["id"]: item for item in (await rp.admin_list(db, status_filter=None, kind=None, sender_id=None, conversation_id=None, created_from=None, created_to=None, limit=50, offset=0))["items"]}
+            detail = await rp.admin_detail(db, group_packet)
+        self.assertEqual((listed[group_packet]["chain"], listed[group_packet]["chain_text"], listed[group_packet]["target_user_id"], listed[group_packet]["target"]["username"]), (True, "谢谢", self.ids["bob"], "bob"))
+        # 私聊的接龙口令和祝福语一样不给后台看
+        self.assertEqual((listed[direct_packet]["chain"], listed[direct_packet]["chain_text"], listed[direct_packet]["target"]), (True, None, None))
+        self.assertEqual(detail["target_user_id"], self.ids["bob"])
+
+
 class HttpTests(RedPacketTestCase):
     """路径都挂上了、返回的整体形状、错误体的形状、后台接口的权限。"""
 
@@ -1529,10 +1747,39 @@ class HttpTests(RedPacketTestCase):
         self.assertEqual(response.status_code, expected, response.text)
         return response.json()
 
+    async def test_chain_and_exclusive_over_http(self) -> None:
+        self.ledger.donate(OID_A, 300)
+        body = {"conversation_id": self.group_id, "kind": "normal", "amount": 10, "count": 1, "chain_text": "谢谢老板", "target_user_id": self.ids["bob"]}
+        sent = await self._json("POST", "/red-packets", 201, json=body)
+        packet = sent["red_packet"]
+        self.assertEqual((packet["chain_text"], packet["target_user_id"], packet["target"]["username"]), ("谢谢老板", self.ids["bob"], "bob"))
+        self.assertEqual(sent["message"]["metadata"]["red_packet"]["target"]["username"], "bob")
+        self.acting = "carol"
+        error = await self._json("POST", f"/red-packets/{packet['id']}/claim", 403)
+        self.assertEqual(error["detail"]["code"], "not_target")
+        self.assertEqual((await self._json("GET", f"/red-packets/{packet['id']}"))["target"]["username"], "bob")
+        self.assertEqual((await self._json("GET", "/red-packets/pending", params={"conversation_id": self.group_id}))["items"], [])
+        self.acting = "bob"
+        pending = (await self._json("GET", "/red-packets/pending", params={"conversation_id": self.group_id}))["items"]
+        self.assertEqual([(item["id"], item["chain_text"], item["target"]["username"]) for item in pending], [(packet["id"], "谢谢老板", "bob")])
+        self.moderation.reset_mock()
+        claimed = await self._json("POST", f"/red-packets/{packet['id']}/claim")
+        message = claimed["message"]
+        self.assertEqual((message["type"], message["content"], message["sender_id"], message["metadata"]), ("text", "谢谢老板", self.ids["bob"], {"red_packet_chain": {"red_packet_id": packet["id"]}}))
+        # 照普通消息广播；不单独送异步审核（口令是发红包的人写的，已经审过）
+        created = [data for _to, data in await self._events("message.created")]
+        self.assertEqual(created[-1].id, message["id"])
+        self.moderation.assert_not_called()
+        listed = await self._json("GET", f"/conversations/{self.group_id}/messages")
+        self.assertEqual(listed[-1]["id"], message["id"])
+
     async def test_user_flow(self) -> None:
         self.ledger.donate(OID_A, 300)
         config = await self._json("GET", "/red-packets/config")
-        self.assertEqual(config, {"enabled": True, "limits": {"max_total": 500, "max_count": 100, "min_each": 1, "daily_send_limit": 20, "expire_hours": 24}, "sent_today": 0})
+        self.assertEqual(
+            config,
+            {"enabled": True, "limits": {"max_total": 500, "max_count": 100, "min_each": 1, "daily_send_limit": 20, "expire_hours": 24}, "sent_today": 0, "features": ["chain", "exclusive"]},
+        )
         body = {"conversation_id": self.group_id, "kind": "lucky", "amount": 100, "count": 3, "greeting": "开工大吉"}
         # 不带结尾斜杠（契约的写法）；带了也不重定向
         sent = await self._json("POST", "/red-packets", 201, json=body)
@@ -1542,7 +1789,7 @@ class HttpTests(RedPacketTestCase):
         packet = sent["red_packet"]
         self.assertEqual(
             set(packet),
-            {"id", "kind", "greeting", "sender", "conversation_id", "message_id", "total", "count", "claimed_count", "claimed_amount", "refunded_amount", "status", "my_claim", "expires_at", "created_at", "finished_at", "claims"},
+            {"id", "kind", "greeting", "sender", "chain_text", "target_user_id", "target", "conversation_id", "message_id", "total", "count", "claimed_count", "claimed_amount", "refunded_amount", "status", "my_claim", "expires_at", "created_at", "finished_at", "claims"},
         )
         self.assertEqual((packet["kind"], packet["greeting"], packet["sender"]["username"], packet["total"], packet["count"], packet["status"], packet["claims"]), ("lucky", "开工大吉", "alice", 100, 3, "active", []))
         message = sent["message"]
@@ -1564,7 +1811,8 @@ class HttpTests(RedPacketTestCase):
         hidden = await self._json("GET", f"/red-packets/{packet['id']}")
         self.assertEqual((hidden["total"], hidden["claimed_amount"], hidden["claims"], hidden["my_claim"], hidden["count"]), (None, None, None, None, 3))
         claimed = await self._json("POST", f"/red-packets/{packet['id']}/claim")
-        self.assertEqual(set(claimed), {"amount", "red_packet", "balance"})
+        self.assertEqual(set(claimed), {"amount", "red_packet", "balance", "message"})
+        self.assertIsNone(claimed["message"])
         self.assertEqual((claimed["red_packet"]["my_claim"]["amount"], claimed["balance"]["balance"], claimed["red_packet"]["total"]), (claimed["amount"], claimed["amount"], 100))
         self.assertEqual([(claim["user"]["username"], claim["amount"], claim["is_luckiest"]) for claim in claimed["red_packet"]["claims"]], [("bob", claimed["amount"], False)])
         error = await self._json("POST", f"/red-packets/{packet['id']}/claim", 409)
@@ -1657,7 +1905,7 @@ async def _worker(job: dict[str, Any]) -> Any:
     async def claim(user_id: int) -> list[Any]:
         async with sessions() as db:
             try:
-                result = await rp.claim(db, await db.get(User, user_id), job["packet_id"])
+                result, _message = await rp.claim(db, await db.get(User, user_id), job["packet_id"])
                 return [user_id, "ok", result["amount"]]
             except HTTPException as exc:
                 return [user_id, exc.detail["code"], 0]

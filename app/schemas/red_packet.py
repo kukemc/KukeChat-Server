@@ -30,6 +30,8 @@ class RedPacketConfig(BaseModel):
     limits: RedPacketLimits
     # 我今天已经发了几个
     sent_today: int = 0
+    # 服务端支持的玩法：chain 接龙红包、exclusive 专属红包。客户端据此决定显示不显示对应的选项
+    features: list[str] = Field(default_factory=list)
 
 
 class RedPacketCreate(BaseModel):
@@ -41,6 +43,10 @@ class RedPacketCreate(BaseModel):
     amount: Any = None
     count: Any = None
     greeting: Any = None
+    # 接龙口令（可空）：1–30 字，领取成功时以领取人的身份自动发这句话
+    chain_text: Any = None
+    # 专属红包的目标（可空）：只在群里，必须是群成员、不是自己、不是机器人；kind 只能是 normal、count 只能是 1
+    target_user_id: Any = None
 
 
 class RedPacketMyClaim(BaseModel):
@@ -61,6 +67,11 @@ class RedPacketRead(BaseModel):
     kind: Literal["normal", "lucky"]
     greeting: str
     sender: UserPublic | None = None
+    # 接龙口令；不是接龙红包为 null
+    chain_text: str | None = None
+    # 专属红包给谁；不是专属红包为 null。谁都能看
+    target_user_id: int | None = None
+    target: UserPublic | None = None
     conversation_id: int
     message_id: int | None = None
     # total / claimed_amount / claims 只在「我已经领了」「我是发的人」或「红包已不是 active」时给出，否则为 null
@@ -88,6 +99,8 @@ class RedPacketClaimResult(BaseModel):
     amount: int
     red_packet: RedPacketRead
     balance: ShopBalance
+    # 接龙红包：领取时以我的身份自动发出的那条消息；不是接龙红包为 null
+    message: MessageRead | None = None
 
 
 class RedPacketReceived(BaseModel):
@@ -109,6 +122,9 @@ class RedPacketPending(BaseModel):
     claimed_count: int = 0
     expires_at: datetime | None = None
     created_at: datetime | None = None
+    chain_text: str | None = None
+    target_user_id: int | None = None
+    target: UserPublic | None = None
 
 
 class RedPacketPendingList(BaseModel):
@@ -159,6 +175,13 @@ class AdminRedPacketRead(BaseModel):
     # direct / group
     conversation_type: str
     message_id: int | None = None
+    # 是不是接龙红包（私聊的也标，只是不给口令）
+    chain: bool = False
+    # 接龙口令；私聊红包恒为 null（和 greeting 一样不给后台看）
+    chain_text: str | None = None
+    # 专属红包的目标（只在群里）
+    target_user_id: int | None = None
+    target: AdminShopUser | None = None
     total: int
     count: int
     claimed_count: int = 0
