@@ -15,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app import integrations
 from app.api.v1.router import api_router
+from app.api.public_showcase import router as public_showcase_router
 from app.core.config import settings
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -687,6 +688,8 @@ class CachedUploadFiles(StaticFiles):
 
 
 app.include_router(api_router)
+# 作品页用的公开数据（不在 /api/v1 下：不走客户端证明头，任何来源可读）
+app.include_router(public_showcase_router)
 app.include_router(websocket_router)
 if settings.storage_backend == "local":
     app.mount("/uploads", CachedUploadFiles(directory=settings.upload_dir), name="uploads")
