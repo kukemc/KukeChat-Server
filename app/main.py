@@ -62,6 +62,11 @@ def _svg_windows() -> str:
     return """<svg width=\"25\" height=\"25\" viewBox=\"0 0 24 24\" fill=\"none\" aria-hidden=\"true\"><path d=\"M3 5.6 10.8 4.5v7.1H3V5.6Zm9.2-1.3L21 3v8.6h-8.8V4.3ZM3 12.9h7.8V20L3 18.9v-6Zm9.2 0H21V21l-8.8-1.3v-6.8Z\" fill=\"currentColor\"/></svg>"""
 
 
+def _svg_apple() -> str:
+    # 线条苹果：和其他平台图标一样用 currentColor，主按钮反色时跟着变
+    return """<svg width=\"25\" height=\"25\" viewBox=\"0 0 24 24\" fill=\"none\" aria-hidden=\"true\"><path d=\"M12 7.6c-1-1-2.3-1.5-3.6-1.4C5.9 6.4 4.3 8.6 4.3 11.6c0 3.7 2.5 8.9 4.9 8.9.9 0 1.6-.6 2.8-.6s1.9.6 2.8.6c1.6 0 3.2-2.4 4.1-4.8-1.6-.8-2.5-2.2-2.5-3.9 0-1.5.7-2.7 1.9-3.5-.8-1.2-2.1-1.9-3.6-2-1.3-.1-2.6.4-3.7 1.3Z\" stroke=\"currentColor\" stroke-width=\"1.6\" stroke-linejoin=\"round\"/><path d=\"M12.2 6.9c-.1-2.2 1.3-3.9 3.3-4.1.1 2.1-1.4 3.9-3.3 4.1Z\" stroke=\"currentColor\" stroke-width=\"1.6\" stroke-linejoin=\"round\"/></svg>"""
+
+
 def _svg_android() -> str:
     return """<svg width=\"25\" height=\"25\" viewBox=\"0 0 24 24\" fill=\"none\" aria-hidden=\"true\"><path d=\"M8.2 4.2 6.9 2.1a.7.7 0 0 1 1.2-.7l1.4 2.2a8 8 0 0 1 5 0l1.4-2.2a.7.7 0 0 1 1.2.7l-1.3 2.1A6.9 6.9 0 0 1 19 9.9H5a6.9 6.9 0 0 1 3.2-5.7ZM8.5 7.5a1 1 0 1 0 0-2 1 1 0 0 0 0 2Zm7 0a1 1 0 1 0 0-2 1 1 0 0 0 0 2ZM5 11.2h14v6.3A3.5 3.5 0 0 1 15.5 21h-7A3.5 3.5 0 0 1 5 17.5v-6.3Zm-2 1.1a1.1 1.1 0 0 1 2.2 0v4.8a1.1 1.1 0 1 1-2.2 0v-4.8Zm15.8 0a1.1 1.1 0 0 1 2.2 0v4.8a1.1 1.1 0 1 1-2.2 0v-4.8Z\" fill=\"currentColor\"/></svg>"""
 
@@ -212,12 +217,17 @@ def _download_template() -> str:
 
 
 def _detect_platform(user_agent: str) -> str:
-    """按 UA 猜访问者的平台：android / ios / desktop"""
+    """按 UA 猜访问者的平台：android / ios / mac / desktop。
+
+    iPadOS 13 起 Safari 默认发桌面版 UA（和 Mac 一模一样，带 Macintosh），服务端分不出来，
+    会被当成 mac；页面脚本里再按触屏把它纠正回 ios（见 download.html 的 data-platform）。"""
     ua = user_agent.lower()
     if "android" in ua:
         return "android"
     if any(token in ua for token in ("iphone", "ipad", "ipod")):
         return "ios"
+    if "macintosh" in ua or "mac os x" in ua:
+        return "mac"
     return "desktop"
 
 
@@ -226,24 +236,28 @@ async def download_page(request: Request, db: AsyncSession = Depends(get_db)) ->
     download_settings = await get_public_download_settings(db, request)
     pc_url = _html_attr(download_settings.pc_url)
     android_url = _html_attr(download_settings.android_url)
+    mac_url = _html_attr(download_settings.mac_url)
     scratch_url = _html_attr(download_settings.scratch_url)
     pc_version = _html_text(download_settings.pc_version or download_settings.version or "最新版")
     mobile_version = _html_text(download_settings.mobile_version or "最新版")
+    mac_version = _html_text(download_settings.mac_version or "最新版")
     # 纯数字版本号前面补个 v，「最新版」这类文字原样显示
     pc_version = f"v{pc_version}" if pc_version[:1].isdigit() else pc_version
     mobile_version = f"v{mobile_version}" if mobile_version[:1].isdigit() else mobile_version
+    mac_version = f"v{mac_version}" if mac_version[:1].isdigit() else mac_version
     available = {
         "pc": bool(download_settings.pc_url),
+        "mac": bool(download_settings.mac_url),
         "android": bool(download_settings.android_url),
         "scratch": bool(download_settings.scratch_url),
     }
 
-    # 安卓访问把 Android 设为主按钮，iOS 没有客户端就推荐社区扩展，其余（电脑）推荐 Windows；
+    # 安卓访问把 Android 设为主按钮，Mac 推荐 Mac 版，iOS 没有客户端就推荐社区扩展，其余（电脑）推荐 Windows；
     # 推荐的那一端没有链接时，顺延到第一个能下的
     platform = _detect_platform(request.headers.get("user-agent", ""))
-    preferred = {"android": "android", "ios": "scratch"}.get(platform, "pc")
-    primary = next((key for key in (preferred, "pc", "android", "scratch") if available[key]), None)
-    names = {"pc": "Windows 版", "android": "Android 版", "scratch": "CCW 社区扩展"}
+    preferred = {"android": "android", "ios": "scratch", "mac": "mac"}.get(platform, "pc")
+    primary = next((key for key in (preferred, "pc", "mac", "android", "scratch") if available[key]), None)
+    names = {"pc": "Windows 版", "mac": "Mac 版", "android": "Android 版", "scratch": "CCW 社区扩展"}
     if primary is None:
         hint = "下载链接正在准备中，请稍后再来看看。"
     elif platform == "ios":
@@ -264,20 +278,25 @@ async def download_page(request: Request, db: AsyncSession = Depends(get_db)) ->
     replacements = {
         "__PLATFORM__": platform,
         "__PC_CLASS__": button_class("pc"),
+        "__MAC_CLASS__": button_class("mac"),
         "__ANDROID_CLASS__": button_class("android"),
         "__SCRATCH_CLASS__": button_class("scratch"),
         "__PC_ARIA__": button_aria("pc"),
+        "__MAC_ARIA__": button_aria("mac"),
         "__ANDROID_ARIA__": button_aria("android"),
         "__SCRATCH_ARIA__": button_aria("scratch"),
         "__PC_META__": pc_version if available["pc"] else "暂未开放",
+        "__MAC_META__": mac_version if available["mac"] else "暂未开放",
         "__MOBILE_META__": mobile_version if available["android"] else "暂未开放",
         "__SCRATCH_META__": "在 CCW 里直接用" if available["scratch"] else "暂未开放",
         "__PC_HREF__": pc_url or "#",
+        "__MAC_HREF__": mac_url or "#",
         "__ANDROID_HREF__": android_url or "#",
         "__SCRATCH_HREF__": scratch_url or "#",
         "__HINT__": _html_text(hint),
         "__ICON_URL__": _html_attr(DOWNLOAD_ICON_URL),
         "__WINDOWS_ICON__": _svg_windows(),
+        "__APPLE_ICON__": _svg_apple(),
         "__ANDROID_ICON__": _svg_android(),
         "__SCRATCH_ICON__": _svg_scratch(),
     }

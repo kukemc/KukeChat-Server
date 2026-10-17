@@ -252,6 +252,36 @@ class AdminReleaseTests(ReleaseCase):
         self.assertTrue(meta["pc_url"].endswith("/setup.exe"))
         self.assertEqual(manual.pc_url, "https://old/pc.exe")
 
+    async def test_download_page_mac_uses_stable_dmg(self) -> None:
+        # 只有 beta 的 Mac 版不上下载页
+        beta = (await self.make("2.0.2", platform="macos", channel="beta"))["id"]
+        await self.call("POST", f"/admin/releases/{beta}/artifacts/external", 201, json={"url": "https://x/KukeChat_beta.dmg"})
+        await self.call("POST", f"/admin/releases/{beta}/publish", 200, json={})
+        async with self.sessions() as db:
+            self.assertNotIn("macos", await release_service.legacy_overlay(db))
+        # stable：先传自动更新包（universal），再传 dmg，下载页挑 dmg
+        rid = (await self.make("2.0.3", platform="macos"))["id"]
+        await self.call("POST", f"/admin/releases/{rid}/artifacts/external", 201, json={"url": "https://x/KukeChat.app.tar.gz", "arch": "universal"})
+        await self.call("POST", f"/admin/releases/{rid}/publish", 200, json={})
+        async with self.sessions() as db:
+            self.assertNotIn("macos", await release_service.legacy_overlay(db))  # 只有 tar.gz 不拿来顶
+        await self.call("POST", f"/admin/releases/{rid}/artifacts/external", 201, json={"url": "https://x/KukeChat_2.0.3_universal.dmg"})
+        release_service.invalidate_cache()
+        async with self.sessions() as db:
+            public = await system_settings.get_public_download_settings(db)
+            meta = await system_settings.export_public_download_metadata(db)
+        self.assertEqual((public.mac_version, public.mac_url), ("2.0.3", "https://x/KukeChat_2.0.3_universal.dmg"))
+        self.assertNotIn("mac_url", meta)
+
+    def test_detect_platform(self) -> None:
+        from app.main import _detect_platform
+
+        mac = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
+        win = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+        iphone = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148"
+        android = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 Chrome/126.0 Mobile Safari/537.36"
+        self.assertEqual([_detect_platform(ua) for ua in (mac, win, iphone, android, "")], ["mac", "desktop", "ios", "android", "desktop"])
+
     async def test_latest_is_by_version_and_beta_sees_stable(self) -> None:
         await self.ship("2.0.0", build=200)
         # 发布更旧的版本：要 force

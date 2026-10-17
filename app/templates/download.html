@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>下载 KukeChat</title>
-  <meta name="description" content="下载 KukeChat：Windows、Android 与 CCW 社区扩展。私聊、群聊、动态，一个账号三端互通。" />
+  <meta name="description" content="下载 KukeChat：Windows、Mac、Android 与 CCW 社区扩展。私聊、群聊、动态，一个账号三端互通。" />
   <meta name="color-scheme" content="light dark" />
   <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)" />
   <meta name="theme-color" content="#0a0a0b" media="(prefers-color-scheme: dark)" />
@@ -331,25 +331,29 @@
   <main id="top">
     <section class="hero">
       <div class="wrap">
-        <div class="eyebrow rise"><b>KukeChat</b><i></i><span>Windows · Android · CCW 社区扩展</span></div>
+        <div class="eyebrow rise"><b>KukeChat</b><i></i><span>Windows · Mac · Android · CCW 社区扩展</span></div>
         <h1 class="rise d1">好好聊天，<br /><span class="soft">本来就该这么简单。</span></h1>
         <p class="lead rise d2">为 Scratcher 打造的聊天应用。私聊、群聊、动态都在这里，电脑、手机和 CCW 社区之间随时接着聊。</p>
 
         <div class="downloads rise d3" role="group" aria-label="选择平台下载">
-          <a class="dl__PC_CLASS__" href="__PC_HREF__" target="_blank" rel="noreferrer"__PC_ARIA__>
+          <a class="dl__PC_CLASS__" data-dl="pc" href="__PC_HREF__" target="_blank" rel="noreferrer"__PC_ARIA__>
             __WINDOWS_ICON__
             <span class="dl-copy"><strong>Windows 版</strong><small>__PC_META__</small></span>
           </a>
-          <a class="dl__ANDROID_CLASS__" href="__ANDROID_HREF__" target="_blank" rel="noreferrer"__ANDROID_ARIA__>
+          <a class="dl__MAC_CLASS__" data-dl="mac" href="__MAC_HREF__" target="_blank" rel="noreferrer"__MAC_ARIA__>
+            __APPLE_ICON__
+            <span class="dl-copy"><strong>Mac 版</strong><small>__MAC_META__</small></span>
+          </a>
+          <a class="dl__ANDROID_CLASS__" data-dl="android" href="__ANDROID_HREF__" target="_blank" rel="noreferrer"__ANDROID_ARIA__>
             __ANDROID_ICON__
             <span class="dl-copy"><strong>Android 版</strong><small>__MOBILE_META__</small></span>
           </a>
-          <a class="dl__SCRATCH_CLASS__" href="__SCRATCH_HREF__" target="_blank" rel="noreferrer"__SCRATCH_ARIA__>
+          <a class="dl__SCRATCH_CLASS__" data-dl="scratch" href="__SCRATCH_HREF__" target="_blank" rel="noreferrer"__SCRATCH_ARIA__>
             __SCRATCH_ICON__
             <span class="dl-copy"><strong>CCW 社区扩展</strong><small>__SCRATCH_META__</small></span>
           </a>
         </div>
-        <p class="hint rise d4">__HINT__</p>
+        <p class="hint rise d4" id="dl-hint">__HINT__</p>
 
         <figure class="shot rise d5">
           <div class="frame">
@@ -391,7 +395,7 @@
           <div class="feat">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2.5" y="4" width="13" height="10" rx="2"/><path d="M6 18h6"/><rect x="17" y="8" width="4.5" height="12" rx="1.2"/></svg>
             <h3>三端，无缝接力</h3>
-            <p>同一个账号，Windows、Android 和 CCW 社区扩展随时切换，记录全部跟着走。</p>
+            <p>同一个账号，Windows、Mac、Android 和 CCW 社区扩展随时切换，记录全部跟着走。</p>
           </div>
           <div class="feat">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4.5" y="10.5" width="15" height="10" rx="2.5"/><path d="M8 10.5V7.5a4 4 0 0 1 8 0v3"/></svg>
@@ -445,6 +449,10 @@
             <p>这是系统对新发布程序的常规提醒。点<b>「更多信息」</b>，再点<b>「仍要运行」</b>即可继续安装。</p>
           </details>
           <details>
+            <summary>Mac 上提示「无法验证开发者」怎么办？</summary>
+            <p>打开 <b>「系统设置 › 隐私与安全性」</b>，在下面找到 KukeChat 的提示，点<b>「仍要打开」</b>即可。macOS 14 及更早的系统也可以在访达里<b>右键点 KukeChat → 打开</b>。只有第一次需要这样做。</p>
+          </details>
+          <details>
             <summary>CCW 社区扩展怎么用？</summary>
             <p>点上面的「CCW 社区扩展」打开链接，在 CCW 里就能直接登录聊天，不用另外装任何东西，适合在作品和社区里随手回消息。</p>
           </details>
@@ -464,15 +472,19 @@
       <div class="wrap reveal">
         <h2>现在就开始聊吧。</h2>
         <div class="downloads">
-          <a class="dl__PC_CLASS__" href="__PC_HREF__" target="_blank" rel="noreferrer"__PC_ARIA__>
+          <a class="dl__PC_CLASS__" data-dl="pc" href="__PC_HREF__" target="_blank" rel="noreferrer"__PC_ARIA__>
             __WINDOWS_ICON__
             <span class="dl-copy"><strong>Windows 版</strong><small>__PC_META__</small></span>
           </a>
-          <a class="dl__ANDROID_CLASS__" href="__ANDROID_HREF__" target="_blank" rel="noreferrer"__ANDROID_ARIA__>
+          <a class="dl__MAC_CLASS__" data-dl="mac" href="__MAC_HREF__" target="_blank" rel="noreferrer"__MAC_ARIA__>
+            __APPLE_ICON__
+            <span class="dl-copy"><strong>Mac 版</strong><small>__MAC_META__</small></span>
+          </a>
+          <a class="dl__ANDROID_CLASS__" data-dl="android" href="__ANDROID_HREF__" target="_blank" rel="noreferrer"__ANDROID_ARIA__>
             __ANDROID_ICON__
             <span class="dl-copy"><strong>Android 版</strong><small>__MOBILE_META__</small></span>
           </a>
-          <a class="dl__SCRATCH_CLASS__" href="__SCRATCH_HREF__" target="_blank" rel="noreferrer"__SCRATCH_ARIA__>
+          <a class="dl__SCRATCH_CLASS__" data-dl="scratch" href="__SCRATCH_HREF__" target="_blank" rel="noreferrer"__SCRATCH_ARIA__>
             __SCRATCH_ICON__
             <span class="dl-copy"><strong>CCW 社区扩展</strong><small>__SCRATCH_META__</small></span>
           </a>
@@ -498,6 +510,19 @@
       document.body.classList.remove('no-js');
       var year = document.getElementById('year');
       if (year) year.textContent = String(new Date().getFullYear());
+
+      // iPadOS 的 Safari 默认发和 Mac 一样的 UA，服务端会当成 Mac；有多点触控的「Mac」其实是 iPad，改推荐社区扩展
+      var root = document.documentElement;
+      if (root.getAttribute('data-platform') === 'mac' && navigator.maxTouchPoints > 1) {
+        root.setAttribute('data-platform', 'ios');
+        var scratchOk = !document.querySelector('[data-dl="scratch"].is-disabled');
+        if (scratchOk) {
+          document.querySelectorAll('[data-dl].is-primary').forEach(function (node) { node.classList.remove('is-primary'); });
+          document.querySelectorAll('[data-dl="scratch"]').forEach(function (node) { node.classList.add('is-primary'); });
+        }
+        var hintNode = document.getElementById('dl-hint');
+        if (hintNode) hintNode.textContent = scratchOk ? 'iOS 版还在路上，先用 CCW 社区扩展在浏览器里聊吧。' : 'iOS 版还在路上，可以先在电脑或安卓手机上使用。';
+      }
 
       // 导航滚动后加细描边
       var nav = document.getElementById('nav');
@@ -541,7 +566,8 @@
           }
         }
         var releases = (data && data.releases) || {};
-        var prefer = document.documentElement.getAttribute('data-platform') === 'android' ? ['android', 'windows'] : ['windows', 'android'];
+        var detected = document.documentElement.getAttribute('data-platform');
+        var prefer = detected === 'android' ? ['android', 'windows', 'macos'] : detected === 'mac' ? ['macos', 'windows', 'android'] : ['windows', 'android', 'macos'];
         var latest = null, platform = null;
         for (var i = 0; i < prefer.length && !latest; i++) {
           var r = releases[prefer[i]];
@@ -559,7 +585,7 @@
             }
           });
           if (list.childElementCount) {
-            document.getElementById('notes-title').textContent = '最近更新 · ' + (platform === 'android' ? 'Android' : 'Windows');
+            document.getElementById('notes-title').textContent = '最近更新 · ' + ({ android: 'Android', macos: 'Mac' }[platform] || 'Windows');
             document.getElementById('notes-meta').textContent = ['v' + latest.version, shortDate(latest.published_at)].filter(Boolean).join(' · ');
             document.getElementById('notes').hidden = false;
           }

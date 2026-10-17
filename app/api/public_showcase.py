@@ -47,7 +47,7 @@ def _short(text: str | None, limit: int) -> str | None:
 
 async def _releases(db: AsyncSession, request: Request) -> dict[str, Any]:
     result: dict[str, Any] = {}
-    for platform in ("windows", "android"):
+    for platform in ("windows", "android", "macos"):
         try:
             page = await release_service.history(db, request, platform, "stable", 3, 0)
         except Exception:  # 发版表出问题不能拖垮整个接口

@@ -41,6 +41,9 @@ async def get_public_download_settings(db: AsyncSession, request: Request | None
     if "android" in overlay:
         version, url = overlay["android"]
         changes.update(mobile_version=version, android_url=url)
+    if "macos" in overlay:
+        version, url = overlay["macos"]
+        changes.update(mac_version=version, mac_url=url)
     return manual.model_copy(update=changes) if changes else manual
 
 
