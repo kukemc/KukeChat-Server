@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
 from app.core.config import settings
-from app.core.database import AsyncSessionLocal
+from app.core.database import AsyncSessionLocal, release_connection
 from app.models.conversation import Conversation, ConversationMember
 from app.models.enums import MessageType
 from app.models.friend import Friendship
