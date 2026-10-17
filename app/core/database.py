@@ -15,8 +15,14 @@ class Base(DeclarativeBase):
 
 connect_args = {"check_same_thread": False} if settings.database_url.startswith("sqlite") else {}
 
-engine = create_async_engine(settings.database_url, echo=False, future=True, connect_args=connect_args)
+# 连接池放宽到每个 worker 10 + 20：WAL 下读不互斥，多几条连接能让读请求不必排在慢写后面（原来是默认的 5 + 10）
+_pool_args = {"pool_size": 10, "max_overflow": 20} if settings.database_url.startswith("sqlite") else {}
+engine = create_async_engine(settings.database_url, echo=False, future=True, connect_args=connect_args, **_pool_args)
 AsyncSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+from app.core import db_watch  # noqa: E402
+
+db_watch.install(engine.sync_engine)
 
 
 @event.listens_for(engine.sync_engine, "connect")
