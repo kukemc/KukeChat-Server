@@ -350,7 +350,8 @@ async def upsert_profile(db: AsyncSession, author: User, payload: TeamupProfileS
         if settings.content_moderation_enabled and not author.content_moderation_whitelisted
         else ModerationStatus.APPROVED.value
     )
-    ccw_creations = await previews_from_text(payload.intro)
+    # 在写任何东西之前取：要去 CCW 时会先把请求的读事务结束、连接还回去
+    ccw_creations = await previews_from_text(payload.intro, db=db)
     ccw_creations_json = _ccw_creations_to_json(ccw_creations)
 
     if profile is None:

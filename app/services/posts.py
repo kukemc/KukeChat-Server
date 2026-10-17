@@ -336,7 +336,8 @@ async def create_post(db: AsyncSession, author: User, payload: PostCreate) -> Po
         await get_visible_post(db, payload.repost_of_id, author.id)
 
     initial_status = ModerationStatus.PENDING.value if settings.content_moderation_enabled and not author.content_moderation_whitelisted else ModerationStatus.APPROVED.value
-    ccw_creations = await previews_from_text(payload.content)
+    # 在写任何东西之前取：要去 CCW 时会先把请求的读事务结束、连接还回去
+    ccw_creations = await previews_from_text(payload.content, db=db)
     post = Post(
         author_id=author.id,
         content=payload.content,
@@ -817,10 +818,12 @@ async def update_post(db: AsyncSession, post_id: int, actor: User, payload: Post
     if not content and not image_urls and post.repost_of_id is None:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Post content or images are required")
 
+    # CCW 作品卡片在改 post 之前取：要去 CCW 时会先把请求的读事务结束、连接还回去，这时会话里不能有改了一半的 post
+    ccw_creations_json = _ccw_creations_to_json(await previews_from_text(content, db=db)) if payload.content is not None else None
     candidate_paths = _post_upload_paths(post) if payload.image_urls is not None else set()
     post.content = content
     if payload.content is not None:
-        post.ccw_creations_json = _ccw_creations_to_json(await previews_from_text(content))
+        post.ccw_creations_json = ccw_creations_json
     if payload.visibility is not None:
         post.visibility = payload.visibility
     if payload.image_urls is not None:

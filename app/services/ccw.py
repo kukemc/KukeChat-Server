@@ -20,7 +20,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.core.database import AsyncSessionLocal
+from app.core.database import AsyncSessionLocal, release_connection
 from app.integrations import CcwUnavailable, get_ccw_gateway
 from app.models.user import CcwBindingChallenge, User
 from app.services import response_cache
@@ -150,6 +150,8 @@ async def sync_bound_student(db: AsyncSession, user: User, sync_profile: bool = 
     if not ccw_gateway_available():
         # 没有接入 CCW：没东西可同步，资料原样留着，不报错
         return user
+    # 去 CCW 拉资料可能要几秒：先结束请求的读事务、把连接还回去
+    await release_connection(db)
     try:
         profile_payload, detail_payload = await fetch_student_payloads(user.ccw_student_oid)
         data = normalize_student_profile(profile_payload, detail_payload, {"accountOid": user.ccw_student_oid, "name": user.ccw_name, "avatar": user.ccw_avatar_url})
@@ -414,7 +416,12 @@ async def fetch_creation_preview(oid: str, access_key: str = "") -> dict[str, An
     return preview
 
 
-async def previews_from_text(text: str, limit: int = 3) -> list[dict[str, Any]]:
+async def previews_from_text(text: str, limit: int = 3, db: AsyncSession | None = None) -> list[dict[str, Any]]:
+    """文本里的 CCW 作品链接 → 作品卡片。
+
+    db：调用方请求的会话。真要去 CCW 取（最多 8 秒）之前，先结束它的读事务、把连接还回去；所以调用方得在改任何东西
+    之前调这里，会话里不能有改了一半的写（有的话不提交、照样占着连接去等，只打日志）。
+    """
     # At most three independent eight-second lookups; gather preserves URL order.
     refs = extract_creation_refs(text, limit=min(3, limit)) if limit > 0 else []
     if not refs:
@@ -422,6 +429,8 @@ async def previews_from_text(text: str, limit: int = 3) -> list[dict[str, Any]]:
     if not ccw_gateway_available():
         # 没有接入 CCW：不做卡片，也不为每条带链接的消息刷一遍日志
         return []
+    if db is not None:
+        await release_connection(db)
 
     async def resolve(ref: dict[str, str]) -> dict[str, Any] | None:
         try:
