@@ -389,6 +389,9 @@ class DownloadSettingsRead(BaseModel):
     version: str | None = None
     pc_version: str | None = None
     mobile_version: str | None = None
+    # Mac 版只来自发版服务（stable 渠道的 dmg），后台「下载配置」没有手填项
+    mac_url: str | None = None
+    mac_version: str | None = None
     updated_at: datetime | None = None
     updated_by: UserPublic | None = None
 

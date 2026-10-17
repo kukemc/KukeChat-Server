@@ -46,7 +46,7 @@ KukeChat 自己的发版服务：安装包放在我们的对象存储里（或�
 后台原来的「下载配置」页（`/admin/download-settings`，手填 PC / 安卓安装包链接和版本号）继续保留。
 `/desktop-update.json`（旧版桌面端、旧版安卓检查更新用的元数据）和 `/download` 下载页的取值规则：
 
-- 某个平台在发版服务里有**已发布的 stable 版本**（且有可用安装包）→ 用发版服务的版本号和安装包地址（`windows` → `pc_version` / `pc_url`，`android` → `mobile_version` / `android_url`）；
+- 某个平台在发版服务里有**已发布的 stable 版本**（且有可用安装包）→ 用发版服务的版本号和安装包地址（`windows` → `pc_version` / `pc_url`，`android` → `mobile_version` / `android_url`）；`macos` 只给下载页用（stable 渠道里文件名是 `.dmg` 的安装包，没有手填值，也不进 `/desktop-update.json`）；
 - 没有 → 还用「下载配置」里手填的值。
 
 所以已经装在用户手上的旧客户端不用升级也能从发版服务收到更新；新客户端改调下面的 `/releases/latest`，拿到更新日志、强制更新和 sha256。

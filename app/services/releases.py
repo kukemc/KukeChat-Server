@@ -368,7 +368,8 @@ async def history(db: AsyncSession, request: Request | None, platform: str, chan
 async def legacy_overlay(db: AsyncSession, request: Request | None = None) -> dict[str, tuple[str, str]]:
     """给 /desktop-update.json 和 /download 用：各平台最新的 stable 版本 → (版本号, 安装包地址)。没有就不出现在结果里。"""
     found: dict[str, tuple[str, str]] = {}
-    for platform, arch in (("windows", "x64"), ("android", None)):
+    # macOS 不带 arch：挑到的是 dmg（带 universal 的是给自动更新用的 .app.tar.gz）
+    for platform, arch in (("windows", "x64"), ("android", None), ("macos", None)):
         try:
             release = await latest_published(db, platform, "stable")
         except Exception:  # 发版表出问题不能拖垮旧接口
@@ -376,7 +377,11 @@ async def legacy_overlay(db: AsyncSession, request: Request | None = None) -> di
             continue
         if release is None:
             continue
-        artifact = pick_artifact(_ready(release), arch)
+        ready = _ready(release)
+        if platform == "macos":
+            # 下载页只给 dmg；没有 dmg 时不拿自动更新包顶上
+            ready = [item for item in ready if item.file_name.lower().endswith(".dmg")]
+        artifact = pick_artifact(ready, arch)
         url = artifact_url(artifact, request) if artifact else None
         if url:
             found[platform] = (release.version, url)
