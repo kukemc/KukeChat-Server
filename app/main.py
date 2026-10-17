@@ -25,6 +25,7 @@ from app.core.transport_metrics import TransportMetrics, TransportMetricsMiddlew
 from app.services.legacy_uploads import migrate_legacy_upload_response
 from app.services.account_levels import start_account_level_worker, stop_account_level_worker
 from app.services.intimacy import start_intimacy_worker, stop_intimacy_worker
+from app.services.read_coalescer import start_read_coalescer, stop_read_coalescer
 from app.services.cases import start_jury_sweep_worker, stop_jury_sweep_worker
 from app.services.ccw import start_ccw_binding_worker, stop_ccw_binding_worker
 from app.services.moderation import start_moderation_retry_worker, stop_moderation_retry_worker
@@ -115,11 +116,14 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
     start_group_file_worker()
     # 好友亲密度：上线后第一次启动给老好友回填一次；之后每小时补「成为好友满 N 天」的徽章
     start_intimacy_worker()
+    # 已读位置：几秒内的连续推进合并成一次写库
+    start_read_coalescer()
     if transport_metrics is not None:
         await transport_metrics.start()
     try:
         yield
     finally:
+        await stop_read_coalescer()
         await stop_intimacy_worker()
         await stop_group_file_worker()
         await stop_shop_expiry_worker()
