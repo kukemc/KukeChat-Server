@@ -24,6 +24,12 @@ UTC = timezone.utc
 
 async def update_profile(db: AsyncSession, user: User, payload: UserUpdate) -> User:
     updates = payload.model_dump(exclude_unset=True)
+    # 头像 / 封面没改就不校验：用 CCW 资料覆盖过的号，头像和封面是 CCW 的图片地址，不是本站上传的；
+    # 客户端保存资料时会把整份资料（包括没动的头像）一起提交，校验了就什么都改不了
+    if "avatar_url" in updates and (updates["avatar_url"] or None) == (user.avatar_url or None):
+        updates.pop("avatar_url")
+    if "profile_cover_url" in updates and (updates["profile_cover_url"] or None) == (user.profile_cover_url or None):
+        updates.pop("profile_cover_url")
     if "avatar_url" in updates:
         updates["avatar_url"] = require_avatar_upload_url(updates["avatar_url"])
     if "profile_accent_color" in updates and updates["profile_accent_color"]:
