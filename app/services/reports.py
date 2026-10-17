@@ -729,6 +729,7 @@ async def build_report_read(db: AsyncSession, report: UserReport, viewer_id: int
         case_id=report.case_id,
         result_title=result_title,
         result_text=result_text,
+        archived=report.action == case_service.ARCHIVE_ACTION,
         reporter=report.reporter,
         reviewer=report.reviewer,
         reported_user=reported_user,

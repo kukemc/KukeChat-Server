@@ -49,7 +49,8 @@ class CaseRead(BaseModel):
     message_id: int | None = None
     reported_user_id: int | None = None
     reported_user: UserPublic | None = None
-    status: Literal["open", "resolved", "dismissed"]
+    # archived：管理员一键归档的历史遗留案件，未经审理、没有结论
+    status: Literal["open", "resolved", "dismissed", "archived"]
     # panel：资深合议中（三期）
     queue: Literal["triage", "jury", "panel", "admin"]
     jury_eligible: bool
@@ -204,6 +205,21 @@ class CaseResolve(BaseModel):
 
 class CaseMove(BaseModel):
     queue: Literal["jury", "admin"]
+
+
+class CaseArchive(BaseModel):
+    """一键归档：创建时间早于 before 的未结案件。queue 为空表示所有队列；dry_run 只数不改。"""
+
+    before: datetime
+    queue: Literal["admin", "triage", "jury", "panel"] | None = None
+    dry_run: bool = False
+
+
+class CaseArchiveResult(BaseModel):
+    count: int
+    # 各队列分别有多少件
+    by_queue: dict[str, int] = Field(default_factory=dict)
+    dry_run: bool
 
 
 # ---------------------------------------------------------------- 风纪委员

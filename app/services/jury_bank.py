@@ -102,7 +102,8 @@ async def block_reason(db: AsyncSession, case: ReportCase, *, group_content: boo
 
     sensitive：调用方已经用 cases.sensitive_case_ids 批量查过时把结果传进来，这里就不再逐个案件查库。
     """
-    if case.status == "open":
+    if case.status not in ("resolved", "dismissed"):
+        # 未结和已归档（archived，没有结论）的都不能当题目
         return "open"
     if not case.jury_eligible:
         return "private"

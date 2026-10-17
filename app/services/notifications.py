@@ -339,6 +339,8 @@ async def _report_result_notifications(db: AsyncSession, user_id: int) -> list[U
             UserReport.status != ReportStatus.PENDING,
             UserReport.reviewed_at.is_not(None),
             UserReport.reviewed_at >= cutoff,
+            # 管理员一键归档的历史遗留举报不发通知（docs/moderation-v2.md 2.4）
+            or_(UserReport.action.is_(None), UserReport.action != case_service.ARCHIVE_ACTION),
         )
         .order_by(UserReport.reviewed_at.desc())
         .limit(30)

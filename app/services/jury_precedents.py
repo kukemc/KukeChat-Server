@@ -66,7 +66,8 @@ async def _reasons(db: AsyncSession, case: ReportCase) -> tuple[str | None, bool
     未定案、涉及私聊、敏感类别这三项和题库用同一套判断（题库的敏感类别又和公示栏是同一份）。
     题库另外不收「内容会在公示栏展示」的案件 —— 那不妨碍它成为判例，只是不进题库。
     """
-    if case.status == "open":
+    if case.status not in ("resolved", "dismissed"):
+        # 已归档（archived）的案件没有结论，和未定案一样不能成为判例
         return "open", False
     if case.overturned_at is not None:
         return "overturned", False
@@ -273,7 +274,7 @@ async def case_fields(db: AsyncSession, user_id: int, case: ReportCase, vote: Ju
     质控题那条记录上两项恒为空：判例带着公开编号，给出去等于把真实编号还了回去。
     """
     fields: dict[str, Any] = {"precedent": None, "can_mark_precedent": False}
-    if vote.is_quality_check or case.status == "open" or case.overturned_at is not None:
+    if vote.is_quality_check or case.status not in ("resolved", "dismissed") or case.overturned_at is not None:
         return fields
     precedent = await _active(db, case.id)
     if precedent is not None:

@@ -55,6 +55,8 @@ from app.schemas.case import (
     AdminJuryOpinionModerate,
     AdminJuryOpinionPage,
     AdminJuryOpinionRead,
+    CaseArchive,
+    CaseArchiveResult,
     CaseDetail,
     CaseMove,
     CaseOverturn,
@@ -830,15 +832,32 @@ async def _case_detail(db: AsyncSession, case: ReportCase, admin_id: int, *, con
 async def admin_list_cases(
     _admin: Annotated[User, Depends(get_current_admin)],
     db: Annotated[AsyncSession, Depends(get_db)],
-    status_filter: Literal["open", "resolved", "dismissed"] | None = Query(default="open", alias="status"),
+    status_filter: Literal["open", "resolved", "dismissed", "archived"] | None = Query(default="open", alias="status"),
     queue: Literal["triage", "jury", "panel", "admin"] | None = None,
     q: str | None = Query(default=None, max_length=80),
+    # 只对未结案件生效：newest 新的在前 / oldest 旧的在前 / priority 按排队优先级
+    sort: Literal["newest", "oldest", "priority"] = "newest",
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
 ) -> CasePage:
     await case_service.escalate_stale_jury_cases(db)
-    items, total, counts = await case_service.list_cases(db, status_filter=status_filter, queue=queue, query=q, limit=limit, offset=offset)
+    items, total, counts = await case_service.list_cases(
+        db, status_filter=status_filter, queue=queue, query=q, sort=sort, limit=limit, offset=offset
+    )
     return CasePage(items=[CaseRead(**item) for item in await case_service.build_case_reads(db, items)], total=total, open_counts=counts)
+
+
+@router.post("/cases/archive", response_model=CaseArchiveResult)
+async def admin_archive_cases(
+    payload: CaseArchive,
+    admin: Annotated[User, Depends(get_current_admin)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> CaseArchiveResult:
+    """一键归档历史遗留的未结案件：不处罚任何人、不影响举报人信誉、不通知举报人，只是不再出现在待处理列表里。"""
+    result = await case_service.archive_cases(db, before=payload.before, queue=payload.queue, dry_run=payload.dry_run, actor_id=admin.id)
+    if not result["dry_run"] and result["count"]:
+        await admin_manager.broadcast("admin.report.changed", {"action": "archived", "count": result["count"]})
+    return CaseArchiveResult(**result)
 
 
 @router.get("/cases/{case_id}", response_model=CaseDetail)
