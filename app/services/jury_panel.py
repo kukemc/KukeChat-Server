@@ -16,6 +16,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.core.dialect import lock_row
 from app.models.case import JuryMember, JuryOpinion, JuryVote, ReportCase
 from app.models.user import User
 from app.services import cases as case_service
@@ -292,6 +293,8 @@ async def cast_vote(db: AsyncSession, user: User, review_id: int, vote: str, not
     await points_service.check_achievements(db, user.id, member)
     points_service.reset_leaderboard_cache()
 
+    # PG：锁住案件这一行并读最新状态（理由同 jury.cast_vote）
+    await lock_row(db, case)
     if case.status != "open" or case.queue != "panel":
         # 投票期间案件已经定案或被转走：这一票照常记，已有结论的话按结论计入一致率。
         if jury_service.has_verdict(case):

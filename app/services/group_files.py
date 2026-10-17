@@ -35,6 +35,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import group_plus_tiers as tiers
 from app.core.database import AsyncSessionLocal, release_connection
+from app.core.dialect import lock_for_update
 from app.models.conversation import Conversation, ConversationMember
 from app.models.enums import ConversationType, MemberRole, MessageType
 from app.models.group_plus import GroupFile, GroupFileFolder, GroupFileUpload
@@ -363,6 +364,8 @@ async def _commit_file(
                     if not claimed.rowcount:
                         lost_claim = True
                         raise _upload_not_found()
+                # PG：锁住群这一行再算剩余空间，同一个群同时进来的几个上传排队，不会一起超出空间（见 lock_for_update）
+                await lock_for_update(db, select(Conversation.id).where(Conversation.id == conversation_id))
                 now = _now()
                 quota = await quota_of(db, conversation, now)
                 temporary, expires_at = _decide(quota, size, keep_forever, _ttl_hours(conversation), now)
@@ -656,6 +659,7 @@ async def set_permanent(db: AsyncSession, user_id: int, conversation_id: int, fi
         # 临时文件：转回限时什么都不做；转永久要剩余空间放得下，转完就是普通的永久空间文件
         if permanent:
             async with shop_service._write_lock():
+                await lock_for_update(db, select(Conversation.id).where(Conversation.id == conversation_id))
                 quota = await quota_of(db, conversation, _now())
                 size = int(row.size)
                 if quota["state"] != "active" or size > quota["free_bytes"]:

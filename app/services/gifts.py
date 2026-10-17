@@ -35,6 +35,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core import localtime
 from app.core.config import settings
 from app.core.database import release_connection
+from app.core.dialect import lock_for_update
 from app.integrations import get_coin_ledger
 from app.models.conversation import Conversation, ConversationMember, TemporaryConversationBlock
 from app.models.enums import ConversationType, MemberRole, MessageType
@@ -577,6 +578,8 @@ async def send_gift(db: AsyncSession, user: User, payload: dict[str, Any]) -> tu
         chat = None
         async with shop_service._write_lock():
             try:
+                # PG：先锁住自己的账户行，下面的余额检查才看得到别的进程刚提交的花币（见 lock_for_update）
+                await lock_for_update(db, select(ShopAccount.user_id).where(ShopAccount.user_id == user_id))
                 # 余额够才往下走。这是事务的第一条语句：从这里到提交一直拿着写锁，条件是对着最新的数据算的；
                 # 花掉的币记在下面插入的那行记录里（余额公式对它求和），这条语句本身只是把关 + 占住写锁
                 charged = await db.execute(

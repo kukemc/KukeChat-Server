@@ -30,6 +30,7 @@ from sqlalchemy import and_, case, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import group_plus_tiers as tiers
+from app.core.dialect import lock_for_update
 from app.integrations import get_coin_ledger
 from app.models.conversation import Conversation, ConversationMember
 from app.models.enums import ConversationType, MemberRole
@@ -226,6 +227,8 @@ async def ensure_member_capacity(db: AsyncSession, conversation: Conversation, a
     limit = member_limit(conversation)
     if limit is None:
         return
+    # PG：锁住群这一行再数人数，同时进来的几个加人请求排队（锁到调用方提交，成员行和它一起提交）
+    await lock_for_update(db, select(Conversation.id).where(Conversation.id == conversation.id))
     count = int(
         await db.scalar(select(func.count()).select_from(ConversationMember).where(ConversationMember.conversation_id == conversation.id)) or 0
     )
@@ -442,6 +445,8 @@ async def purchase(db: AsyncSession, user: User, conversation_id: int, payload: 
     now = _now()
     async with shop_service._write_lock():
         try:
+            # PG：先锁住自己的账户行，下面的余额检查才看得到别的进程刚提交的花币（见 lock_for_update）
+            await lock_for_update(db, select(ShopAccount.user_id).where(ShopAccount.user_id == user_id))
             # 余额够才往下走。事务的第一条语句：从这里到提交一直拿着写锁
             charged = await db.execute(
                 update(ShopAccount)
@@ -453,6 +458,8 @@ async def purchase(db: AsyncSession, user: User, conversation_id: int, payload: 
                 await db.rollback()
                 outcome = "short"
             else:
+                # PG：锁住群这一行再读档位和到期时间，两个人同时给同一个群买时后一个按前一个买完的状态算
+                await lock_for_update(db, select(Conversation.id).where(Conversation.id == conversation_id))
                 fresh = await db.get(Conversation, conversation_id, populate_existing=True)
                 try:
                     latest = compute_plan(fresh, tier, period, price, now)
