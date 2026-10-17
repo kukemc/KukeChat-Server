@@ -627,11 +627,14 @@ async def send_message(
         if membership.role not in STAFF_ROLES:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only group owners or admins can @all")
     if message_type == MessageType.TEXT and not red_packet_chain and extract_creation_refs(content):
-        # 取 CCW 作品卡片要等 CCW（每个链接最多 8 秒）。普通发消息走到这里时会话里还没有写：先把读事务结束、连接还回去再等。
+        # 取 CCW 作品卡片要等 CCW（几个链接并发，最多 8 秒）。普通发消息走到这里时会话里还没有写：先把读事务结束、连接还回去再等。
         # 调用方在自己的写事务里落消息（commit=False，比如群待办提醒、任务卡片，正文里可能带着作品链接）时，会话里已经有
-        # 没提交的写、拿着 SQLite 的写锁 —— 这时不去取卡片：带着写锁等网络会把全站的写都卡住，卡片只是锦上添花
+        # 没提交的写：PostgreSQL 上只锁着这次改过的几行，照样取卡片（8 秒远低于 30 秒的事务空闲超时）；
+        # SQLite 上那是整库写锁，带着它等网络会把全站的写都卡住 —— 这时跳过卡片
         if not await has_uncommitted_write(db):
             await release_connection(db)
+            metadata = await enrich_metadata_with_previews(content, metadata)
+        elif db.bind is not None and db.bind.dialect.name == "postgresql":
             metadata = await enrich_metadata_with_previews(content, metadata)
     if not allow_group_todo:
         # 群待办的提醒走 @全体 的链路，但不占用也不受限于 @全体成员 的每日次数
