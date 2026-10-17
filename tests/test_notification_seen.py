@@ -18,6 +18,7 @@ from app.models.friend import FriendRequest
 from app.models.user import User
 from app.services import friends as friend_service
 from app.services import notifications as notification_service
+from pg_redirect import requires_sqlite
 
 
 class NotificationSeenTests(unittest.IsolatedAsyncioTestCase):
@@ -172,6 +173,7 @@ class NotificationSeenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(carol.new_count, 1)
 
 
+@requires_sqlite
 class InitDbTests(unittest.IsolatedAsyncioTestCase):
     async def test_init_db_adds_the_columns_to_an_existing_database(self) -> None:
         engine = create_async_engine("sqlite+aiosqlite:///:memory:")

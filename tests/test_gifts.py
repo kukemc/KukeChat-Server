@@ -50,6 +50,7 @@ from app.services import red_packets as rp
 from app.services import reports as report_service
 from app.services import shop as shop_service
 from app.websocket.manager import manager
+from pg_redirect import requires_sqlite
 from integration_fakes import FakeCoinLedger
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -1728,6 +1729,7 @@ class HttpTests(GiftTestCase):
 # ---------------------------------------------------------------- 老库升级
 
 
+@requires_sqlite
 class InitDbTests(unittest.IsolatedAsyncioTestCase):
     async def test_init_db_upgrades_an_existing_database(self) -> None:
         """老库：没有礼物的表，users / shop_items / shop_purchases 上没有新列，shop_purchases 的唯一索引还是旧条件。init_db 补上，重复执行无害。"""
@@ -1858,6 +1860,10 @@ async def _worker(job: dict[str, Any]) -> Any:
 
 if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == "worker":
+        # 测试跑在 PostgreSQL 上时（TEST_DATABASE_URL），子进程连父进程分到的同一个 schema；否则原样用 SQLite 文件
+        from pg_redirect import for_worker
+
+        create_async_engine = for_worker(create_async_engine)
         print(json.dumps(asyncio.run(_worker(json.loads(sys.argv[2])))), flush=True)
     else:
         unittest.main()

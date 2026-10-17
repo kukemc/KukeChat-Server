@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
+from app.core.dialect import lock_row
 from app.models.case import JuryMember, JuryVote, ReportCase
 from app.models.conversation import Conversation
 from app.models.enums import ConversationType, ModerationSource, ModerationStatus, PostVisibility, ReportStatus, ReportTargetType
@@ -715,6 +716,8 @@ async def resolve_case(
     case = await db.get(ReportCase, case_id)
     if case is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Case not found")
+    # PG：锁住案件这一行并读最新状态，两条路径（委员 / 合议 / 管理员）同时结案时后到的那个看到已结、报 409，不会处罚两次
+    await lock_row(db, case)
     if case.status != "open":
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Case is already closed")
     broadcast: dict[str, Any] | None = None

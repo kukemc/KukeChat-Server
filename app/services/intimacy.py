@@ -25,11 +25,11 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable
 
 from fastapi import HTTPException, status
-from sqlalchemy import and_, func, or_, select, update
-from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy import and_, func, insert, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import localtime
+from app.core.dialect import upsert_insert
 from app.models.conversation import Conversation
 from app.models.enums import ConversationType, MessageType, UserStatus
 from app.models.friend import Friendship
@@ -487,22 +487,28 @@ async def _friend_since(db: AsyncSession, low: int, high: int) -> datetime | Non
 async def _claim_bond(db: AsyncSession, low: int, high: int, now: datetime) -> FriendBond:
     """这一对的行（没有就建），读最新的。调用时已经在写事务里。"""
     await db.execute(
-        sqlite_insert(FriendBond.__table__)
+        upsert_insert(db, FriendBond.__table__)
         .values(user_low_id=low, user_high_id=high, created_at=now, updated_at=now)
         .on_conflict_do_nothing(index_elements=["user_low_id", "user_high_id"])
     )
     bond = (
         await db.execute(
-            select(FriendBond).where(FriendBond.user_low_id == low, FriendBond.user_high_id == high).execution_options(populate_existing=True)
+            # FOR UPDATE（PG 才有，SQLite 上靠上面那条 INSERT 拿到的整库写锁）：这一对的累计在 Python 里加，得先锁住行再读
+            select(FriendBond)
+            .where(FriendBond.user_low_id == low, FriendBond.user_high_id == high)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
     ).scalar_one()
     return bond
 
 
 async def _claim_day(db: AsyncSession, bond_id: int, day: date) -> FriendBondDay:
-    await db.execute(sqlite_insert(FriendBondDay.__table__).values(bond_id=bond_id, day=day).on_conflict_do_nothing(index_elements=["bond_id", "day"]))
+    await db.execute(upsert_insert(db, FriendBondDay.__table__).values(bond_id=bond_id, day=day).on_conflict_do_nothing(index_elements=["bond_id", "day"]))
     return (
-        await db.execute(select(FriendBondDay).where(FriendBondDay.bond_id == bond_id, FriendBondDay.day == day).execution_options(populate_existing=True))
+        await db.execute(
+            select(FriendBondDay).where(FriendBondDay.bond_id == bond_id, FriendBondDay.day == day).with_for_update().execution_options(populate_existing=True)
+        )
     ).scalar_one()
 
 
@@ -519,7 +525,7 @@ async def _sync_badges(db: AsyncSession, bond: FriendBond, friend_days: int, now
             if (series.key, level) in owned:
                 continue
             inserted = await db.execute(
-                sqlite_insert(FriendBadge.__table__)
+                upsert_insert(db, FriendBadge.__table__)
                 .values(bond_id=bond.id, series=series.key, level=level, unlocked_at=now)
                 .on_conflict_do_nothing(index_elements=["bond_id", "series", "level"])
             )
@@ -1096,7 +1102,7 @@ async def backfill(db: AsyncSession, *, now: datetime | None = None) -> dict[str
             values = {column.key: getattr(bond, column.key) for column in FriendBond.__table__.columns if column.key != "id"}
             async with shop_service._write_lock():
                 try:
-                    inserted = await db.execute(sqlite_insert(FriendBond.__table__).values(**values).on_conflict_do_nothing(index_elements=["user_low_id", "user_high_id"]))
+                    inserted = await db.execute(upsert_insert(db, FriendBond.__table__).values(**values).on_conflict_do_nothing(index_elements=["user_low_id", "user_high_id"]))
                     if inserted.rowcount != 1:
                         # 回填的同时这一对刚聊上：按实时的为准
                         await db.rollback()
@@ -1107,7 +1113,7 @@ async def backfill(db: AsyncSession, *, now: datetime | None = None) -> dict[str
                         for row in days[pair].values()
                     ]
                     if day_values:
-                        await db.execute(sqlite_insert(FriendBondDay.__table__), day_values)
+                        await db.execute(insert(FriendBondDay.__table__), day_values)
                     stored = (await db.execute(select(FriendBond).where(FriendBond.id == bond_id))).scalar_one()
                     fresh = await _sync_badges(db, stored, _friend_days(pairs[pair], today), now)
                     await db.commit()
@@ -1124,7 +1130,7 @@ async def backfill_once(db: AsyncSession, *, now: datetime | None = None) -> boo
     """上线后第一次启动时跑一次回填。两个 worker 同时启动时只有先插上标记的那个做。"""
     now = _aware(now) or _now()
     claimed = await db.execute(
-        sqlite_insert(SystemSetting.__table__).values(key=BACKFILL_KEY, value=None, created_at=now, updated_at=now).on_conflict_do_nothing(index_elements=["key"])
+        upsert_insert(db, SystemSetting.__table__).values(key=BACKFILL_KEY, value=None, created_at=now, updated_at=now).on_conflict_do_nothing(index_elements=["key"])
     )
     await db.commit()
     if claimed.rowcount != 1:

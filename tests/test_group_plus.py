@@ -37,6 +37,7 @@ from app.services import moderation as moderation_service
 from app.services import shop as shop_service
 from app.services.schema_extras import install_sqlite_extras
 from app.websocket.manager import manager
+from pg_redirect import requires_sqlite
 from integration_fakes import FakeCoinLedger
 
 OID_A, OID_B, OID_D = "a" * 24, "b" * 24, "d" * 24
@@ -433,6 +434,7 @@ class FeaturedTests(PlusCase):
             self.assertEqual((await self.code("POST", f"/conversations/{self.group_id}/messages/{ids[4]}/feature", 409))["tier"], "free")
             self.assertEqual(await self.feature(ids[3]), {"featured": False})
 
+    @requires_sqlite
     async def test_backfill_from_legacy_table(self) -> None:
         ids = await self.add_messages(1, sender="carol")
         async with self.sessions() as db:

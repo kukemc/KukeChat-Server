@@ -27,11 +27,11 @@ from typing import Any, Iterable, NamedTuple
 
 from fastapi import HTTPException
 from sqlalchemy import Date, and_, bindparam, case, distinct, func, or_, select
-from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
+from app.core.dialect import greatest, is_postgres, upsert_insert
 from app.models.account_level import AccountLevelDay, AccountLevelNotification
 from app.models.case import JuryMember, JuryReviewVote, JuryVote
 from app.models.conversation import Conversation
@@ -244,7 +244,7 @@ async def add_online_minutes(db: AsyncSession, user_ids: Iterable[int], *, now: 
         eligible.extend(rows.scalars().all())
     if not eligible:
         return [], 0
-    statement = sqlite_insert(_day_t)
+    statement = upsert_insert(db, _day_t)
     statement = statement.on_conflict_do_update(
         index_elements=[_day_t.c.user_id, _day_t.c.day],
         set_={
@@ -254,15 +254,18 @@ async def add_online_minutes(db: AsyncSession, user_ids: Iterable[int], *, now: 
         },
         where=_day_t.c.last_slot < statement.excluded.last_slot,
     )
-    result = await db.execute(
-        statement,
-        [
-            {"user_id": user_id, "day": day, "online_minutes": r.tick_minutes, "last_slot": slot, "created_at": now, "updated_at": now}
-            for user_id in sorted(eligible)
-        ],
-    )
+    rows = [
+        {"user_id": user_id, "day": day, "online_minutes": r.tick_minutes, "last_slot": slot, "created_at": now, "updated_at": now}
+        for user_id in sorted(eligible)
+    ]
+    if is_postgres(db):
+        # asyncpg 的 executemany 不报 rowcount：改成一条多行 INSERT ... RETURNING，返回几行就是记上了几个人
+        result = await db.execute(statement.values(rows).returning(_day_t.c.user_id))
+        credited = len(result.all())
+    else:
+        result = await db.execute(statement, rows)
+        credited = result.rowcount if result.rowcount is not None and result.rowcount >= 0 else len(eligible)
     await db.commit()
-    credited = result.rowcount if result.rowcount is not None and result.rowcount >= 0 else len(eligible)
     return sorted(eligible), int(credited)
 
 
@@ -426,11 +429,11 @@ _DAY_SETTLE = (
     .values(
         base_tenths=bindparam("p_base"),
         earned_tenths=bindparam("p_earned"),
-        streak_days=func.max(_day_t.c.streak_days, bindparam("p_streak")),
-        message_count=func.max(_day_t.c.message_count, bindparam("p_messages")),
-        night_messages=func.max(_day_t.c.night_messages, bindparam("p_night")),
+        streak_days=greatest(_day_t.c.streak_days, bindparam("p_streak")),
+        message_count=greatest(_day_t.c.message_count, bindparam("p_messages")),
+        night_messages=greatest(_day_t.c.night_messages, bindparam("p_night")),
         updated_at=bindparam("p_now"),
-        **{f"bonus_{key}": func.max(_day_t.c[f"bonus_{key}"], bindparam(f"p_bonus_{key}")) for key in BONUS_KEYS},
+        **{f"bonus_{key}": greatest(_day_t.c[f"bonus_{key}"], bindparam(f"p_bonus_{key}")) for key in BONUS_KEYS},
     )
 )
 # 用户：累计加上差额；p_touch = 1 时把连续天数写上（只往后写，不会被补结算的旧日期盖掉）。不动 updated_at —— 这不是资料修改
@@ -572,15 +575,19 @@ async def _write_changes(db: AsyncSession, changes: list[_Change], day: date) ->
     先整批写日活行。影响的行数对得上，说明每一行的条件都成立；对不上就是有的行刚被另一个 worker 结算过，
     这时整批撤掉、改成一行一行写，没写上的那些它已经记过了，跳过。
     """
-    result = await db.execute(_DAY_SETTLE, [change.day_params for change in changes])
-    if result.rowcount == len(changes):
-        written = changes
+    if is_postgres(db):
+        # asyncpg 的 executemany 不报影响的行数，没法判断整批是否都写上：直接一行一行写（不用撤整批）
+        written = [change for change in changes if (await db.execute(_DAY_SETTLE, change.day_params)).rowcount == 1]
     else:
-        await db.rollback()
-        written = []
-        for change in changes:
-            if (await db.execute(_DAY_SETTLE, change.day_params)).rowcount == 1:
-                written.append(change)
+        result = await db.execute(_DAY_SETTLE, [change.day_params for change in changes])
+        if result.rowcount == len(changes):
+            written = changes
+        else:
+            await db.rollback()
+            written = []
+            for change in changes:
+                if (await db.execute(_DAY_SETTLE, change.day_params)).rowcount == 1:
+                    written.append(change)
     credits = [
         {"p_id": change.user_id, "p_delta": change.delta, "p_touch": 0 if change.streak is None else 1, "p_streak": change.streak or 0, "p_day": day}
         for change in written
@@ -813,7 +820,7 @@ async def backfill_legacy(db: AsyncSession, *, now: datetime | None = None) -> b
     activity_t = GroupMemberDailyActivity.__table__
     try:
         claimed = await db.execute(
-            sqlite_insert(setting_t).values(key=BACKFILL_KEY, value=None, created_at=now, updated_at=now).on_conflict_do_nothing(index_elements=[setting_t.c.key])
+            upsert_insert(db, setting_t).values(key=BACKFILL_KEY, value=None, created_at=now, updated_at=now).on_conflict_do_nothing(index_elements=[setting_t.c.key])
         )
         if claimed.rowcount != 1:
             await db.rollback()

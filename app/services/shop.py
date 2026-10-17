@@ -39,6 +39,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal, release_connection
+from app.core.dialect import lock_for_update
 from app.integrations import CoinsUnavailable, get_coin_ledger
 from app.models.gift import GiftRecord
 from app.models.group_plus import GroupPlusRecord
@@ -768,6 +769,8 @@ async def purchase(db: AsyncSession, user: User, item_id: int) -> dict[str, Any]
         async with _write_lock():
             try:
                 if source == "purchase":
+                    # PG：先锁住自己的账户行，下面的余额检查才看得到别的进程刚提交的花币（见 lock_for_update）
+                    await lock_for_update(db, select(ShopAccount.user_id).where(ShopAccount.user_id == user_id))
                     # 余额够才扣。单条语句在数据库里是原子的，写事务又是串行的：并发的两次购买，后一个看到的是前一个扣完之后的余额
                     charged = await db.execute(
                         update(ShopAccount)
@@ -1358,7 +1361,10 @@ async def admin_revoke(db: AsyncSession, admin: User, user_id: int, item_id: int
     admin_id = admin.id
     user, item = await _grant_target(db, user_id, item_id)
     row = (
-        await db.execute(select(ShopPurchase).where(ShopPurchase.user_id == user_id, ShopPurchase.item_id == item_id, _live_clause()))
+        await db.execute(
+            # FOR UPDATE（PG 才有）：两次收回同时进行时后一个等前一个提交，再看这一行已经收回了 → 404，不会退两次钱
+            select(ShopPurchase).where(ShopPurchase.user_id == user_id, ShopPurchase.item_id == item_id, _live_clause()).with_for_update()
+        )
     ).scalar_one_or_none()
     if row is None:
         raise _error(status.HTTP_404_NOT_FOUND, "ownership_not_found", "这个用户没有这件商品")
@@ -1675,6 +1681,8 @@ async def admin_grant_coins(db: AsyncSession, admin: User, user_id: int, amount:
     outcome: dict[str, Any] = {}
     async with _write_lock():
         try:
+            # PG：先锁住他的账户行，下面算余额才看得到别的进程刚提交的花币（见 lock_for_update）
+            await lock_for_update(db, select(ShopAccount.user_id).where(ShopAccount.user_id == user_id))
             # 事务的第一条语句：从这里到提交一直拿着写锁。没有账户就建一行，这样他会出现在后台的账户列表里
             touched = await db.execute(
                 update(ShopAccount).where(ShopAccount.user_id == user_id).values(updated_at=now).execution_options(synchronize_session=False)

@@ -1948,6 +1948,10 @@ async def _worker(job: dict[str, Any]) -> Any:
 
 if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == "worker":
+        # 测试跑在 PostgreSQL 上时（TEST_DATABASE_URL），子进程连父进程分到的同一个 schema；否则原样用 SQLite 文件
+        from pg_redirect import for_worker
+
+        create_async_engine = for_worker(create_async_engine)
         print(json.dumps(asyncio.run(_worker(json.loads(sys.argv[2])))), flush=True)
     else:
         unittest.main()

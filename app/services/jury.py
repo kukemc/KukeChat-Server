@@ -21,6 +21,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.core.dialect import lock_row
 from app.models.case import JuryExamAttempt, JuryMember, JuryNotification, JuryOpinion, JuryPracticeAnswer, JuryVote, ReportCase
 from app.models.conversation import Conversation, ConversationMember
 from app.models.enums import ConversationType, UserStatus
@@ -1345,6 +1346,9 @@ async def cast_vote(db: AsyncSession, user: User, review_id: int, vote: str, not
     if rewards:
         points_service.reset_leaderboard_cache()
 
+    # PG：锁住案件这一行并读最新状态，同一个案件的投票在这里排队：下面数票看得到别人刚提交的票，
+    # 也不会两个人同时凑够票、把案件结两次（重复处罚）。SQLite 本来就是整库串行的，什么都不做。
+    await lock_row(db, case)
     if case.status != "open" or case.queue != "jury":
         # 投票期间案件已被管理员处理：这一票照常记，按已有结论计入一致率。
         if has_verdict(case):

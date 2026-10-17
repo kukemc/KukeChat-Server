@@ -153,7 +153,7 @@ class GroupTodo(MessageSnapshotMixin, Base):
     set_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
-# ---------------------------------------------------------------- 建表后的补充（只对 SQLite）
+# ---------------------------------------------------------------- 建表后的补充（SQLite / PostgreSQL 各一套）
 
 
 @event.listens_for(Base.metadata, "after_create")
@@ -162,8 +162,6 @@ def _after_create(target, connection, **_kw) -> None:  # noqa: ANN001
 
     放在 metadata 的 after_create 里：init_db 和只跑 create_all 的测试都会走到。
     """
-    if connection.dialect.name != "sqlite":
-        return
-    from app.services.schema_extras import install_sqlite_extras
+    from app.services.schema_extras import install_schema_extras
 
-    install_sqlite_extras(connection)
+    install_schema_extras(connection)

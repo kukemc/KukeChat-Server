@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
 from app.core.config import settings
+from app.core.dialect import greatest, hours_since, least
 from app.models.enums import ModerationStatus, PostNotificationType, PostVisibility
 from app.models.friend import Friendship
 from app.models.post import Post, PostComment, PostCommentLike, PostLike, PostMention, PostNotification, PostTopic, PostTopicLink
@@ -418,8 +419,8 @@ async def list_feed(
         )
         query = query.where(Post.created_at >= hot_since)
         query = query.outerjoin(like_counts, like_counts.c.post_id == Post.id).outerjoin(comment_counts, comment_counts.c.post_id == Post.id)
-        age_hours = (func.julianday(func.current_timestamp()) - func.julianday(Post.created_at)) * 24
-        heat_score = ((func.coalesce(like_counts.c.like_count, 0) * 3) + (func.coalesce(comment_counts.c.comment_count, 0) * 4) + (func.max(0, 72 - age_hours) * 0.8))
+        age_hours = hours_since(Post.created_at)
+        heat_score = ((func.coalesce(like_counts.c.like_count, 0) * 3) + (func.coalesce(comment_counts.c.comment_count, 0) * 4) + (greatest(0, 72 - age_hours) * 0.8))
         order_by = (heat_score.desc(), Post.created_at.desc(), Post.id.desc())
     else:
         order_by = (Post.pinned_at.desc().nullslast(), Post.id.desc()) if scope == "mine" else (Post.id.desc(),)
@@ -457,8 +458,8 @@ async def list_user_posts(
         )
         query = query.where(Post.created_at >= hot_since)
         query = query.outerjoin(like_counts, like_counts.c.post_id == Post.id).outerjoin(comment_counts, comment_counts.c.post_id == Post.id)
-        age_hours = (func.julianday(func.current_timestamp()) - func.julianday(Post.created_at)) * 24
-        heat_score = ((func.coalesce(like_counts.c.like_count, 0) * 3) + (func.coalesce(comment_counts.c.comment_count, 0) * 4) + (func.max(0, 72 - age_hours) * 0.8))
+        age_hours = hours_since(Post.created_at)
+        heat_score = ((func.coalesce(like_counts.c.like_count, 0) * 3) + (func.coalesce(comment_counts.c.comment_count, 0) * 4) + (greatest(0, 72 - age_hours) * 0.8))
         order_by = (heat_score.desc(), Post.created_at.desc(), Post.id.desc())
     else:
         order_by = (Post.pinned_at.desc().nullslast(), Post.id.desc())
@@ -977,7 +978,7 @@ async def list_trending_topics(db: AsyncSession, limit: int) -> list[PostTopicRe
         .group_by(PostTopicLink.topic_id)
         .subquery()
     )
-    heat_score = (func.coalesce(recent_counts.c.recent_count, 0) * 5) + func.min(PostTopic.post_count, 20)
+    heat_score = (func.coalesce(recent_counts.c.recent_count, 0) * 5) + least(PostTopic.post_count, 20)
     result = await db.execute(
         select(PostTopic)
         .outerjoin(recent_counts, recent_counts.c.topic_id == PostTopic.id)

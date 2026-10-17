@@ -40,6 +40,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal, release_connection
+from app.core.dialect import lock_for_update
 from app.integrations import get_coin_ledger
 from app.models.conversation import Conversation, ConversationMember
 from app.models.enums import ConversationType, MemberRole, MessageType
@@ -713,6 +714,8 @@ async def send_red_packet(db: AsyncSession, user: User, payload: dict[str, Any])
     message: Message | None = None
     async with shop_service._write_lock():
         try:
+            # PG：先锁住自己的账户行，下面的余额检查才看得到别的进程刚提交的花币（见 lock_for_update）
+            await lock_for_update(db, select(ShopAccount.user_id).where(ShopAccount.user_id == user_id))
             # 余额够才往下走。这是事务的第一条语句：从这里到提交一直拿着写锁，条件是对着最新的数据算的；
             # 红包的金额记在下面插入的行里（余额公式对它们求和），这条语句本身只是把关 + 占住写锁
             charged = await db.execute(
@@ -825,6 +828,8 @@ async def _end(
         clauses.append(RedPacket.expires_at <= now)
     async with shop_service._write_lock():
         try:
+            # PG：先锁住红包这一行，等正在抢的人提交之后再算「没领的」（见 _take_share）
+            await lock_for_update(db, select(RedPacket.id).where(RedPacket.id == packet_id))
             result = await db.execute(
                 update(RedPacket)
                 .where(*clauses)
@@ -1001,7 +1006,10 @@ async def _take_share(db: AsyncSession, packet_id: int, user_id: int, now: datet
     )
     async with shop_service._write_lock():
         try:
-            # 事务的第一条语句，也是唯一决定「谁拿到哪一份」的语句：一份只会被一条这样的 UPDATE 记到人头上
+            # PG：先锁住红包这一行。抢红包和结束红包（到期 / 撤回 / 清扫）都先锁它，彼此串行：下面的语句各自取新快照，
+            # 不会出现「同一份既被领走、又被算进退款」，多人同时抢也不会挑中同一份（见 lock_for_update）
+            await lock_for_update(db, select(RedPacket.id).where(RedPacket.id == packet_id))
+            # 事务的第一条写语句，也是唯一决定「谁拿到哪一份」的语句：一份只会被一条这样的 UPDATE 记到人头上
             taken = await db.execute(
                 update(RedPacketShare)
                 .where(RedPacketShare.id == free, RedPacketShare.user_id.is_(None), still_open, ~recalled)

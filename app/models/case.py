@@ -156,7 +156,8 @@ class JuryVote(Base):
     case_id: Mapped[int] = mapped_column(ForeignKey("report_cases.id", ondelete="CASCADE"), index=True)
     juror_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
     # none（不违规）/ l1 / l2 / l3 / abstain（看不懂）/ need_context（上下文不足）/ recuse（主动回避）
-    vote: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    # 原来是 String(10)，装不下 need_context（12 个字符）：SQLite 不管长度，PostgreSQL 会直接报错
+    vote: Mapped[str | None] = mapped_column(String(16), nullable=True)
     # 违规票可以带的类别；没带为空
     category: Mapped[str | None] = mapped_column(String(40), nullable=True)
     note: Mapped[str | None] = mapped_column(Text, nullable=True)

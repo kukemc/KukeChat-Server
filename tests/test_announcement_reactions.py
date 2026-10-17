@@ -13,7 +13,7 @@ from urllib.parse import quote
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException
-from sqlalchemy import event, func, select, text
+from sqlalchemy import event, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 import app.models  # noqa: F401
@@ -326,8 +326,7 @@ class ReactionServiceTests(ReactionTestCase):
                 self.assertEqual(await self._code(self._toggle(db, "alice", "🎉")), (429, "reaction_rate_limited"))
                 # 一分钟以前加的不算
                 await db.execute(
-                    text("UPDATE announcement_reactions SET created_at = :stamp WHERE emoji = '👍'"),
-                    {"stamp": (datetime.now(UTC) - timedelta(seconds=61)).strftime("%Y-%m-%d %H:%M:%S.%f")},
+                    update(AnnouncementReaction).where(AnnouncementReaction.emoji == "👍").values(created_at=datetime.now(UTC) - timedelta(seconds=61))
                 )
                 await db.commit()
                 await self._toggle(db, "alice", "🎉")
@@ -338,8 +337,9 @@ class ReactionServiceTests(ReactionTestCase):
             await self._toggle(db, "alice", "👀")
             await self._toggle(db, "bob", "🔥")
             await self._toggle(db, "bob", "🔥", self.second)
-            # 这个测试库的连接没开 PRAGMA foreign_keys，靠的是 admin_delete 里的显式删除
-            self.assertEqual((await db.execute(text("PRAGMA foreign_keys"))).scalar(), 0)
+            if db.get_bind().dialect.name == "sqlite":
+                # 这个测试库的连接没开 PRAGMA foreign_keys，靠的是 admin_delete 里的显式删除（PG 上外键总是生效的）
+                self.assertEqual((await db.execute(text("PRAGMA foreign_keys"))).scalar(), 0)
             await announcement_service.admin_delete(db, self.ids["admin"], self.first)
             self.assertEqual((await self._rows(db, self.first), await self._rows(db, self.second)), (0, 1))
             self.assertIsNone(await db.get(Announcement, self.first))
@@ -353,7 +353,8 @@ class ReactionServiceTests(ReactionTestCase):
             async with engine.begin() as connection:
                 await connection.run_sync(Base.metadata.create_all)
             async with async_sessionmaker(engine, expire_on_commit=False)() as db:
-                self.assertEqual((await db.execute(text("PRAGMA foreign_keys"))).scalar(), 1)
+                if db.get_bind().dialect.name == "sqlite":
+                    self.assertEqual((await db.execute(text("PRAGMA foreign_keys"))).scalar(), 1)
                 users = [User(username="u1", hashed_password="x"), User(username="u2", hashed_password="x")]
                 notices = [Announcement(title="甲", content="内容"), Announcement(title="乙", content="内容")]
                 db.add_all([*users, *notices])

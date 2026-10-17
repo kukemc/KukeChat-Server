@@ -96,7 +96,10 @@ class ConversationMember(Base):
     pinned: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
     do_not_disturb: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
     message_setting: Mapped[str] = mapped_column(String(20), default="notify", server_default="notify")
-    cleared_before_message_id: Mapped[int | None] = mapped_column(ForeignKey("messages.id", ondelete="SET NULL"), nullable=True)
+    # 「清空聊天记录」的水位线：id 不超过它的消息对这个成员不可见。只是一个数，不建外键 —— 那条消息被修剪 / 随发送者
+    # 注销级联删掉之后水位线也得留着，否则 ON DELETE SET NULL 会让清空过的旧消息重新冒出来（线上 SQLite 这一列是
+    # 后加的，本来就没有外键；PostgreSQL 会严格执行模型里的外键，所以这里不能写）。
+    cleared_before_message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # 最近一条点名 @这个成员 的消息（docs/chat-features.md 第 7 节）。比已读位置新就是「有人@我」
     last_mention_message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     title: Mapped[str | None] = mapped_column(String(40), nullable=True)

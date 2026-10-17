@@ -3,9 +3,10 @@
 搜的是用户**自己的**聊天记录：只在他是成员的会话里，且是他可见的消息（清空聊天记录之前的、「仅自己删除」的、
 已撤回的、已被修剪的都搜不到）。这里没有任何管理员 / 全站 / 按用户翻阅别人消息的入口，也不能有（CLAUDE.md 第一条）。
 
-索引：message_search_index（每条可搜消息一行，触发器随 messages 同步）+ message_search_fts（FTS5 外部内容表，
-trigram 分词，对中文是「任意连续 3 个字」的子串匹配）。建表和触发器在 services/schema_extras.py。
+索引：message_search_index（每条可搜消息一行，触发器随 messages 同步）。建表和触发器在 services/schema_extras.py。
+SQLite 上再加 message_search_fts（FTS5 外部内容表，trigram 分词，对中文是「任意连续 3 个字」的子串匹配）；
 关键词里少于 3 个字的词 trigram 搜不到，退回 LIKE（仍然限定在用户自己的会话里）。FTS5 不可用时整体退回 LIKE。
+PostgreSQL 上一律用 ILIKE（不区分大小写，和 FTS5 / SQLite 的 LIKE 一致），text 列上的 pg_trgm GIN 索引负责提速。
 """
 
 from __future__ import annotations
@@ -43,8 +44,10 @@ def _error(status_code: int, code: str, message: str, **extra: Any) -> HTTPExcep
     return HTTPException(status_code=status_code, detail={"code": code, "message": message, **extra})
 
 
-def _db_time(value: datetime) -> str:
-    """和 SQLAlchemy 往 SQLite 里存 DateTime 的格式一致（UTC，无时区后缀）。"""
+def _db_time(value: datetime, dialect: str = "sqlite") -> str | datetime:
+    """SQLite：和 SQLAlchemy 往 SQLite 里存 DateTime 的格式一致的字符串（UTC，无时区后缀）；PostgreSQL：带时区的 datetime。"""
+    if dialect == "postgresql":
+        return value.astimezone(UTC)
     return value.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S.%f")
 
 
@@ -101,8 +104,12 @@ class _Query:
         end: datetime | None,
         before_id: int | None,
         use_fts: bool,
+        dialect: str = "sqlite",
     ) -> None:
         self.params: dict[str, Any] = {"uid": user_id}
+        # SQLite 的 CROSS JOIN 用来钉死连接顺序；PG 不认 CROSS JOIN ... ON 的写法，顺序交给优化器
+        join = "JOIN" if dialect == "postgresql" else "CROSS JOIN"
+        like = "ILIKE" if dialect == "postgresql" else "LIKE"
         where = [
             "(cm.cleared_before_message_id IS NULL OR i.message_id > cm.cleared_before_message_id)",
             "NOT EXISTS (SELECT 1 FROM message_visibilities v WHERE v.message_id = i.message_id AND v.user_id = :uid)",
@@ -118,17 +125,17 @@ class _Query:
             self.params["cat"] = category
         if start is not None:
             where.append("i.created_at >= :df")
-            self.params["df"] = _db_time(start)
+            self.params["df"] = _db_time(start, dialect)
         if end is not None:
             where.append("i.created_at < :dt")
-            self.params["dt"] = _db_time(end)
+            self.params["dt"] = _db_time(end, dialect)
         if before_id is not None:
             where.append("i.message_id < :before")
             self.params["before"] = before_id
         long_tokens = [token for token in tokens if len(token) >= 3] if use_fts else []
         like_tokens = [token for token in tokens if token not in long_tokens]
         for index, token in enumerate(like_tokens):
-            where.append(f"i.text LIKE :like{index} ESCAPE '\\'")
+            where.append(f"i.text {like} :like{index} ESCAPE '\\'")
             self.params[f"like{index}"] = _like_pattern(token)
         self.cte = ""
         if long_tokens:
@@ -148,14 +155,18 @@ class _Query:
                     "CROSS JOIN conversation_members cm ON cm.conversation_id = i.conversation_id AND cm.user_id = :uid"
                 )
         else:
-            self.source = (
-                "conversation_members cm CROSS JOIN message_search_index i ON i.conversation_id = cm.conversation_id"
-            )
+            self.source = f"conversation_members cm {join} message_search_index i ON i.conversation_id = cm.conversation_id"
             where.append("cm.user_id = :uid")
         self.where = " AND ".join(where)
 
 
+def _dialect(db: AsyncSession) -> str:
+    return db.get_bind().dialect.name
+
+
 async def _fts_available(db: AsyncSession) -> bool:
+    if _dialect(db) != "sqlite":
+        return False
     row = await db.execute(text("SELECT 1 FROM sqlite_master WHERE name = 'message_search_fts'"))
     return row.first() is not None
 
@@ -304,6 +315,7 @@ async def search(
         end=end,
         before_id=before_id,
         use_fts=use_fts,
+        dialect=_dialect(db),
     )
     params = dict(query.params)
     params["limit"] = limit + 1
@@ -321,7 +333,7 @@ async def search(
         count_params = {key: value for key, value in query.params.items()}
         counted = int(
             await db.scalar(
-                text(f"{query.cte}SELECT count(*) FROM (SELECT 1 FROM {query.source} WHERE {query.where} LIMIT {TOTAL_CAP + 1})"),
+                text(f"{query.cte}SELECT count(*) FROM (SELECT 1 FROM {query.source} WHERE {query.where} LIMIT {TOTAL_CAP + 1}) AS capped"),
                 count_params,
             )
             or 0
@@ -384,7 +396,7 @@ async def summary(
     _validate(category, tokens, None, sender_id, start, end)
     use_fts = await _fts_available(db)
     query = _Query(
-        user_id, tokens=tokens, conversation_id=None, sender_id=sender_id, category=category, start=start, end=end, before_id=None, use_fts=use_fts
+        user_id, tokens=tokens, conversation_id=None, sender_id=sender_id, category=category, start=start, end=end, before_id=None, use_fts=use_fts, dialect=_dialect(db)
     )
     try:
         rows = (
