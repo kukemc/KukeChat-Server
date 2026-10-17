@@ -1396,13 +1396,14 @@ async def cast_vote(db: AsyncSession, user: User, review_id: int, vote: str, not
 
 
 def has_verdict(case: ReportCase) -> bool:
-    """案件有没有真正的结论。机器来源的案件没人能定案时是以「未作处理」结的（auto），那不是结论，票不计一致率。"""
-    return case.status != "open" and case.verdict_source != "auto"
+    """案件有没有真正的结论。机器来源的案件没人能定案时是以「未作处理」结的（auto），那不是结论，票不计一致率；
+    管理员一键归档的历史遗留案件（archived）也没有结论。"""
+    return case.status in case_service.VERDICT_STATUSES and case.verdict_source != "auto"
 
 
 async def settle_after_admin(db: AsyncSession, case: ReportCase) -> None:
     """管理员直接结案后调用，让已经投过票的委员也能计入一致率。调用方负责 commit。"""
-    if case.status != "open":
+    if case.status in case_service.VERDICT_STATUSES:
         await _settle_votes(db, case, case.status == "resolved")
 
 
@@ -1586,7 +1587,10 @@ async def case_detail(db: AsyncSession, user_id: int, review_id: int) -> dict[st
         # 定案前只给有效票数，不含弃权：避免从数字变化反推别人投了什么。质控题不透露真实案件的票。
         "votes_cast": 0 if quality_check else effective_votes(counts),
         "tally": tally,
-        "verdict": (quality_verdict_view(case) if quality_check else verdict_view(case)) if closed else None,
+        # 归档的案件（archived）没有结论
+        "verdict": (quality_verdict_view(case) if quality_check else verdict_view(case))
+        if closed and (quality_check or case.status in case_service.VERDICT_STATUSES)
+        else None,
         "is_quality_check": quality_check,
         "opinions_enabled": not quality_check,
         "opinion_count": 0 if quality_check else (await opinion_counts(db, [case.id])).get(case.id, 0),
@@ -1616,7 +1620,8 @@ async def history(db: AsyncSession, juror_id: int, limit: int = 50) -> list[dict
                 "voted_at": penalty_service.aware(vote.voted_at),
                 # 案件未结 / 弃权时为 null
                 "agreed": vote.agreed,
-                "outcome": None if case.status == "open" else ("violation" if case.status == "resolved" else "clean"),
+                # 归档的案件没有结论，也是 null
+                "outcome": None if case.status not in case_service.VERDICT_STATUSES else ("violation" if case.status == "resolved" else "clean"),
             }
         )
     return items
@@ -1687,7 +1692,8 @@ async def list_votes(
                 "stage": case_stage(case) if not recused else None,
                 # 这一票是哪一轮投的；stage 是案件现在所处的阶段
                 "vote_stage": vote.stage or "jury",
-                "outcome": ("violation" if case.status == "resolved" else "clean") if closed else None,
+                # 归档的案件（archived）算已结束，但没有结论
+                "outcome": ("violation" if case.status == "resolved" else "clean") if closed and case.status in case_service.VERDICT_STATUSES else None,
                 "verdict_source": case.verdict_source if closed else None,
                 "verdict_level": case.verdict_level if closed and case.status == "resolved" else None,
                 "closed_at": penalty_service.aware(case.closed_at) if not recused else None,

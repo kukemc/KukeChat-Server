@@ -158,6 +158,8 @@ class ReportRead(BaseModel):
     # 给举报人看的处理结果，未结案时为空
     result_title: str | None = None
     result_text: str | None = None
+    # 管理员把历史遗留案件一键归档了（action = archived）：status 是 rejected，但不是「未成立」，客户端显示成「已归档」
+    archived: bool = False
     reporter: UserPublic | None = None
     reviewer: UserPublic | None = None
     reported_user: UserPublic | None = None

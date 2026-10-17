@@ -214,16 +214,26 @@
 
 | 接口 | 说明 |
 | --- | --- |
-| `GET /admin/cases?status=open&queue=&q=&limit&offset` | `status` ∈ `open` / `resolved` / `dismissed`；`queue` ∈ `triage` / `jury` / `admin`。返回 `{ items: CaseRead[], total, open_counts: { triage, jury, admin } }`，未结案件按优先级排序 |
+| `GET /admin/cases?status=open&queue=&q=&sort=&limit&offset` | `status` ∈ `open` / `resolved` / `dismissed` / `archived`；`queue` ∈ `triage` / `jury` / `panel` / `admin`。返回 `{ items: CaseRead[], total, open_counts: { triage, jury, panel, admin } }`（`open_counts` 只数未结案件，不含已归档）。`sort` 只对未结案件生效：`newest` 创建时间从新到旧（默认）/ `oldest` 从旧到新 / `priority` 按排队优先级；已结、已归档的按结案时间倒序 |
 | `GET /admin/cases/{id}` | `CaseDetail` = `CaseRead` + `snapshot`（证据快照）+ `reports`（案件内全部举报）+ `votes`（风纪委员已投的票）。读取会写审计日志 |
 | `POST /admin/cases/{id}/resolve` | `{ outcome: "violation" \| "dismiss", category?, level?, delete_content?, penalty?, note?, malicious_reporter_ids? }` |
 | `POST /admin/cases/{id}/queue` | `{ queue: "jury" \| "admin" }`，手动改派；涉及私聊的案件不能派给风纪委员 |
+| `POST /admin/cases/archive` | 一键归档历史遗留案件，body `{ before: datetime, queue?: "admin" \| "triage" \| "jury" \| "panel", dry_run?: bool }` → `{ count, by_queue: { admin, jury, … }, dry_run }`。见下文 |
 
-`CaseRead` 字段：`id`、`target_type`、`target_id`、`conversation_id`、`message_id`、`reported_user_id`、`reported_user`、`status`、`queue`、`jury_eligible`、`report_count`、`primary_reason`、`priority`、`summary`、`machine_decision`（`allow` / `review` / `block`）、`machine_category`、`machine_level`、`machine_confidence`、`verdict_source`（`auto` / `jury` / `admin`）、`verdict_category`、`verdict_category_label`、`verdict_level`、`verdict_note`、`violation_id`、`first_report_id`、`created_at`、`closed_at`。
+`CaseRead` 字段：`id`、`target_type`、`target_id`、`conversation_id`、`message_id`、`reported_user_id`、`reported_user`、`status`、`queue`、`jury_eligible`、`report_count`、`primary_reason`、`priority`、`summary`、`machine_decision`（`allow` / `review` / `block`）、`machine_category`、`machine_level`、`machine_confidence`、`verdict_source`（`auto` / `jury` / `panel` / `admin` / `archive`）、`verdict_category`、`verdict_category_label`、`verdict_level`、`verdict_note`、`violation_id`、`first_report_id`、`created_at`、`closed_at`。
 
 - `outcome=violation`：`category` 缺省按举报理由映射，`level` 缺省取类别默认等级，`penalty` 缺省走阶梯；`delete_content` 默认 true（撤回消息 / 删除动态）。
 - `outcome=dismiss`：可用 `malicious_reporter_ids` 标出恶意举报人，会降低他们的举报额度。
 - 原有的 `POST /admin/reports/{id}/review` 仍可用：处理其中一条举报会让整个案件结案，同案的其它举报同步得到结论。
+
+**一键归档**（`POST /admin/cases/archive`）：把创建时间早于 `before`、仍未结的案件（可按 `queue` 只归档一个队列）收起来，用来清理没人处理的历史遗留举报。归档**不是结论**：
+
+- 案件：`status = "archived"`、`closed_at = 归档时间`、`verdict_source = "archive"`、`verdict_note = "历史遗留，未经审理直接归档"`。
+- 案件里的每条待处理举报：`status = "rejected"`、`action = "archived"`、`review_note` 同上。用户侧 `ReportRead.archived = true`，`result_title` / `result_text` 是「你的举报已归档」，客户端应显示成「已归档」而不是「未成立」。
+- 不记违规、不处罚任何人、不进题库、不结算委员的票、不能改判（`overturn` 返回 409 `case_not_closed`），也不给举报人推送 `report.resolved`。
+- 举报人信誉（`/reports/quota`）不计 `action = "archived"` 的举报。
+- 风纪委员和资深合议只取 `status = "open"` 的案件，归档后不会再分到；委员已投过票的，票不计一致率，「我的评审」里这类案件 `stage = closed`、`outcome = null`、`verdict = null`。
+- `dry_run = true` 只返回数量，不写库。真正归档时写审计日志 `case.archive`（`details` 里有 `before`、`queue`、`count`、`by_queue`、`case_ids`），并在后台通道广播 `admin.report.changed`：`{ action: "archived", count }`。
 
 `GET /admin/stats` 新增 `cases_admin_pending`、`cases_jury_pending`、`jury_applications_pending`。后台通道新增事件 `admin.case.changed`：`{ case_id, queue, status, action }`。
 

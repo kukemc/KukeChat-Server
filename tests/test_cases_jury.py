@@ -336,6 +336,99 @@ class CaseAndJuryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((queued.status, queued.queue, queued.machine_decision), ("open", "jury", "allow"))
             self.assertEqual((await db.get(ReportCase, private.case_id)).queue, "admin")
 
+    async def test_open_cases_sort_by_creation_time(self) -> None:
+        async with self.sessions() as db:
+            reports = [await self._report(db, "alice", self.group_message_id), await self._report(db, "bob", 3), await self._report(db, "alice", 1)]
+            ids = [report.case_id for report in reports]
+            now = datetime.now(UTC)
+            # 建案时间：第二个最早，第一个最新；优先级让第三个排最前
+            for case_id, days, priority in zip(ids, (1, 9, 5), (1.0, 2.0, 9.0)):
+                case = await db.get(ReportCase, case_id)
+                case.created_at, case.priority = now - timedelta(days=days), priority
+            await db.commit()
+            newest, _total, _counts = await case_service.list_cases(db)
+            self.assertEqual([case.id for case in newest], [ids[0], ids[2], ids[1]])
+            oldest, _total, _counts = await case_service.list_cases(db, sort="oldest")
+            self.assertEqual([case.id for case in oldest], [ids[1], ids[2], ids[0]])
+            by_priority, _total, _counts = await case_service.list_cases(db, sort="priority")
+            self.assertEqual([case.id for case in by_priority], [ids[2], ids[1], ids[0]])
+
+    async def test_archiving_old_cases_closes_them_without_a_verdict(self) -> None:
+        async with self.sessions() as db:
+            old_group = await self._report(db, "alice", self.group_message_id)
+            old_private = await self._report(db, "alice", self.direct_message_id)
+            fresh = await self._report(db, "bob", 3)
+            now = datetime.now(UTC)
+            for case_id, days, queue in ((old_group.case_id, 30, "jury"), (old_private.case_id, 10, "admin"), (fresh.case_id, 1, "admin")):
+                case = await db.get(ReportCase, case_id)
+                case.created_at, case.queue = now - timedelta(days=days), queue
+            await db.commit()
+            credit_before = await case_service.reporter_credit(db, self.ids["alice"])
+            # 委员先分到了这个旧案件，还没投
+            juror = await db.get(User, self.ids["juror1"])
+            assigned = await jury_service.next_case(db, juror)
+            self.assertEqual(await self._real(db, assigned["case_id"]), old_group.case_id)
+
+            before = now - timedelta(days=7)
+            preview = await case_service.archive_cases(db, before=before, dry_run=True, actor_id=self.ids["admin"])
+            self.assertEqual(preview, {"count": 2, "by_queue": {"jury": 1, "admin": 1}, "dry_run": True})
+            self.assertEqual((await case_service.archive_cases(db, before=before, queue="jury", dry_run=True, actor_id=self.ids["admin"]))["count"], 1)
+            self.assertEqual((await db.get(ReportCase, old_group.case_id)).status, "open")
+
+            result = await case_service.archive_cases(db, before=before, actor_id=self.ids["admin"])
+            self.assertEqual((result["count"], result["dry_run"]), (2, False))
+            for case_id in (old_group.case_id, old_private.case_id):
+                case = await db.get(ReportCase, case_id)
+                await db.refresh(case)
+                self.assertEqual((case.status, case.verdict_source, case.verdict_note), ("archived", "archive", case_service.ARCHIVE_NOTE))
+                self.assertIsNotNone(case.closed_at)
+                self.assertFalse(case.is_golden)
+            for report_id in (old_group.id, old_private.id):
+                report = await db.get(UserReport, report_id)
+                await db.refresh(report)
+                self.assertEqual((report.status, report.action, report.review_note), (ReportStatus.REJECTED, "archived", case_service.ARCHIVE_NOTE))
+                read = await report_service.build_report_read(db, await report_service.get_report(db, report_id), self.ids["alice"])
+                self.assertTrue(read.archived)
+                self.assertEqual(read.result_title, "你的举报已归档")
+            self.assertFalse((await report_service.build_report_read(db, await report_service.get_report(db, fresh.id), self.ids["bob"])).archived)
+            # 不处罚、不撤内容、不通知举报人
+            self.assertEqual((await db.execute(select(UserViolation))).scalars().all(), [])
+            self.assertIsNone((await db.get(Message, self.group_message_id)).recalled_at)
+            notifications = await notification_service.list_unified_notifications(db, self.ids["alice"])
+            self.assertEqual([item for item in notifications.items if item.type == "report_result"], [])
+            # 举报人信誉不变
+            credit_after = await case_service.reporter_credit(db, self.ids["alice"])
+            self.assertEqual((credit_after["score"], credit_after["dismissed"], credit_after["malicious"]), (credit_before["score"], 0, 0))
+            # 待处理列表里只剩新的；已归档能单独查；open_counts 不含已归档
+            open_items, open_total, counts = await case_service.list_cases(db)
+            self.assertEqual(([case.id for case in open_items], open_total, counts), ([fresh.case_id], 1, {"admin": 1}))
+            archived, archived_total, _counts = await case_service.list_cases(db, status_filter="archived")
+            self.assertEqual(({case.id for case in archived}, archived_total), ({old_group.case_id, old_private.case_id}, 2))
+            # 没有结论：不能改判
+            with self.assertRaises(HTTPException) as overturn:
+                await case_service.overturn_case(db, old_group.case_id, actor_id=self.ids["admin"], upheld=True, note="补判")
+            self.assertEqual(overturn.exception.status_code, 409)
+            # 委员再也取不到它（包括已经分到手的那一份）
+            self.assertIsNone(await jury_service.next_case(db, juror))
+            self.assertIsNone(await jury_service.next_case(db, await db.get(User, self.ids["juror2"])))
+            # 再归档一次什么也不做
+            self.assertEqual((await case_service.archive_cases(db, before=before, actor_id=self.ids["admin"]))["count"], 0)
+
+    async def test_late_vote_on_archived_case_is_not_scored(self) -> None:
+        async with self.sessions() as db:
+            report = await self._report(db, "alice", self.group_message_id)
+            await self._queue_for_jury(db, report.case_id)
+            juror = await db.get(User, self.ids["juror1"])
+            view = await jury_service.next_case(db, juror)
+            await case_service.archive_cases(db, before=datetime.now(UTC) + timedelta(minutes=1), actor_id=self.ids["admin"])
+            result = await jury_service.cast_vote(db, juror, view["case_id"], "l2", None)
+            self.assertFalse(result["settled"])
+            vote = (await db.execute(select(JuryVote).where(JuryVote.juror_id == juror.id))).scalar_one()
+            self.assertIsNone(vote.agreed)
+            self.assertIsNone((await jury_service.history(db, juror.id))[0]["outcome"])
+            items, _total = await jury_service.list_votes(db, juror.id)
+            self.assertEqual((items[0]["stage"], items[0]["outcome"]), ("closed", None))
+
     async def test_legacy_review_and_backfill(self) -> None:
         async with self.sessions() as db:
             first = await self._report(db, "alice", self.group_message_id)

@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import HTTPException, status
-from sqlalchemy import exists, func, or_, select
+from sqlalchemy import exists, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -65,6 +65,15 @@ CLEARED_SOURCES = ("jury", "panel", "admin")
 MACHINE_REASON_PREFIX = "机器筛查"
 # 按案件批量查东西时一批多少个：一条查询里的绑定参数要留在老版本 SQLite 的 999 个以内
 LOOKUP_BATCH = 200
+
+# 一键归档历史遗留案件（docs/moderation-v2.md）：未经审理直接收起来，不是结论。
+# 案件 status = archived、verdict_source = archive；举报 status = rejected、action = archived，不计入举报人信誉。
+ARCHIVED = "archived"
+ARCHIVE_SOURCE = "archive"
+ARCHIVE_ACTION = "archived"
+ARCHIVE_NOTE = "历史遗留，未经审理直接归档"
+# 真正下过结论的案件状态；open 和 archived 都不算
+VERDICT_STATUSES = ("resolved", "dismissed")
 
 _last_queue_event_at: float | None = None
 _jury_sweep_task: asyncio.Task[None] | None = None
@@ -129,12 +138,19 @@ def target_key(target_type: ReportTargetType, target_id: int, conversation_id: i
 
 
 async def reporter_credit(db: AsyncSession, reporter_id: int) -> dict[str, Any]:
-    """按近 90 天的举报结果算信誉。被认定恶意的举报按三次无效计。"""
+    """按近 90 天的举报结果算信誉。被认定恶意的举报按三次无效计。
+
+    被归档的举报（action = archived）不算：那是我们没处理，不是举报人乱举报。
+    """
     now = datetime.now(UTC)
     since = now - timedelta(days=CREDIT_WINDOW_DAYS)
     rows = await db.execute(
         select(UserReport.status, UserReport.malicious, func.count())
-        .where(UserReport.reporter_id == reporter_id, UserReport.created_at >= since)
+        .where(
+            UserReport.reporter_id == reporter_id,
+            UserReport.created_at >= since,
+            or_(UserReport.action.is_(None), UserReport.action != ARCHIVE_ACTION),
+        )
         .group_by(UserReport.status, UserReport.malicious)
     )
     upheld = dismissed = malicious = pending = 0
@@ -1060,7 +1076,8 @@ async def overturn_case(
     case = await db.get(ReportCase, case_id)
     if case is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Case not found")
-    if case.status == "open":
+    if case.status not in VERDICT_STATUSES:
+        # 未结和已归档的案件都没有结论
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail={"code": "case_not_closed", "message": "案件还没有结论，不能改判"})
     if upheld == (case.status == "resolved"):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail={"code": "verdict_unchanged", "message": "改判结果和现有结论相同"})
@@ -1162,6 +1179,8 @@ async def _broadcast_removed(db: AsyncSession, info: dict[str, Any]) -> None:
 
 def report_result_text(report: UserReport) -> tuple[str, str]:
     """给举报人看的处理结果 (标题, 正文)。不透露对被举报人的具体处罚。"""
+    if report.action == ARCHIVE_ACTION:
+        return "你的举报已归档", f"你举报的「{report.reason}」提交得比较早，没能及时处理，已归档。这不影响你的举报信誉，如果问题仍然存在可以重新举报。"
     if report.status == ReportStatus.REVIEWED:
         return "你的举报已处理", f"你举报的「{report.reason}」经核实属实，相关内容和账号已按社区规则处理。感谢你维护社区环境。"
     if report.malicious:
@@ -1261,9 +1280,12 @@ async def list_cases(
     status_filter: str | None = "open",
     queue: str | None = None,
     query: str | None = None,
+    sort: str = "newest",
     limit: int = 50,
     offset: int = 0,
 ) -> tuple[list[ReportCase], int, dict[str, int]]:
+    """sort 只对未结案件生效：newest 新的在前（默认）/ oldest 旧的在前 / priority 按排队优先级。
+    已结、已归档的列表固定按结案时间倒序。"""
     clauses = []
     if status_filter:
         clauses.append(ReportCase.status == status_filter)
@@ -1277,11 +1299,76 @@ async def list_cases(
             conditions.extend([ReportCase.id == number, ReportCase.reported_user_id == number, ReportCase.conversation_id == number])
         clauses.append(or_(*conditions))
     total = int((await db.execute(select(func.count(ReportCase.id)).where(*clauses))).scalar_one() or 0)
-    order = (ReportCase.priority.desc(), ReportCase.id.asc()) if status_filter == "open" else (ReportCase.closed_at.desc(), ReportCase.id.desc())
+    if status_filter != "open":
+        order = (ReportCase.closed_at.desc(), ReportCase.id.desc())
+    elif sort == "priority":
+        order = (ReportCase.priority.desc(), ReportCase.id.asc())
+    elif sort == "oldest":
+        order = (ReportCase.created_at.asc(), ReportCase.id.asc())
+    else:
+        order = (ReportCase.created_at.desc(), ReportCase.id.desc())
     result = await db.execute(select(ReportCase).where(*clauses).order_by(*order).offset(offset).limit(limit))
     counts_rows = await db.execute(select(ReportCase.queue, func.count()).where(ReportCase.status == "open").group_by(ReportCase.queue))
     counts = {queue_name: int(count) for queue_name, count in counts_rows.all()}
     return list(result.scalars().all()), total, counts
+
+
+async def archive_cases(
+    db: AsyncSession,
+    *,
+    before: datetime,
+    queue: str | None = None,
+    dry_run: bool = False,
+    actor_id: int | None,
+) -> dict[str, Any]:
+    """把创建时间早于 before 的未结案件一次性归档。返回 {"count", "by_queue", "dry_run"}。
+
+    归档不是结论：不记处罚、不进题库、不结算委员的票、不通知举报人，举报人信誉也不受影响（见 reporter_credit）。
+    dry_run 只数一下不写库。真正归档时提交事务，并通知后台 / 委员刷新。
+    """
+    if before.tzinfo is None:
+        before = before.replace(tzinfo=UTC)
+    clauses = [ReportCase.status == "open", ReportCase.created_at < before]
+    if queue:
+        clauses.append(ReportCase.queue == queue)
+    rows = await db.execute(select(ReportCase.queue, func.count()).where(*clauses).group_by(ReportCase.queue))
+    by_queue = {queue_name: int(count) for queue_name, count in rows.all()}
+    total = sum(by_queue.values())
+    if dry_run or total == 0:
+        return {"count": total, "by_queue": by_queue, "dry_run": dry_run}
+    now = datetime.now(UTC)
+    cases = list((await db.execute(select(ReportCase).where(*clauses))).scalars().all())
+    for case in cases:
+        case.status = ARCHIVED
+        case.verdict_source = ARCHIVE_SOURCE
+        case.verdict_note = ARCHIVE_NOTE
+        case.verdict_by_id = actor_id
+        case.closed_at = now
+        case.updated_at = now
+    case_ids = [case.id for case in cases]
+    for start in range(0, len(case_ids), LOOKUP_BATCH):
+        await db.execute(
+            update(UserReport)
+            .where(UserReport.case_id.in_(case_ids[start : start + LOOKUP_BATCH]), UserReport.status == ReportStatus.PENDING)
+            .values(status=ReportStatus.REJECTED, action=ARCHIVE_ACTION, review_note=ARCHIVE_NOTE, reviewer_id=actor_id, reviewed_at=now)
+            .execution_options(synchronize_session=False)
+        )
+    db.add(
+        AdminAuditLog(
+            actor_id=actor_id,
+            action="case.archive",
+            target_type="report_case",
+            target_id=None,
+            details=json.dumps(
+                {"before": before.isoformat(), "queue": queue, "count": len(case_ids), "by_queue": by_queue, "case_ids": case_ids},
+                ensure_ascii=False,
+            ),
+        )
+    )
+    await db.commit()
+    if by_queue.get("jury") or by_queue.get("panel"):
+        await notify_jury_queue_changed(db)
+    return {"count": len(case_ids), "by_queue": by_queue, "dry_run": False}
 
 
 async def recently_cleared_case(db: AsyncSession, key: str, now: datetime | None = None) -> ReportCase | None:

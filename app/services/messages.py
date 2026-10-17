@@ -1569,17 +1569,35 @@ async def mark_conversation_read(
         if message is None or message.conversation_id != conversation_id:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Message does not belong to this conversation")
 
+    from app.services import read_coalescer
+
     now = datetime.now(UTC)
-    membership.last_read_message_id = last_read_message_id
-    membership.last_read_at = now
-    await db.commit()
-    from app.services.conversations import mention_pending
+    current = max(membership.last_read_message_id or 0, read_coalescer.pending_for(conversation_id, user_id) or 0)
+    target = last_read_message_id or 0
+    if target <= current and membership.last_read_message_id is not None:
+        # 没往前推（重复上报、或者报了更早的一条）：不写库，返回现在的位置
+        last_read_message_id = current
+    elif read_coalescer.should_defer(membership.last_read_at, now):
+        # 几秒内刚写过：先攒着，后台合并写（见 read_coalescer）
+        read_coalescer.defer(conversation_id, user_id, target)
+    else:
+        membership.last_read_message_id = last_read_message_id
+        membership.last_read_at = now
+        await db.commit()
 
     conversation = await db.get(Conversation, conversation_id)
+    # 不改 membership 对象算 mention_pending：攒着没写的那部分也算已读
+    floor = max(last_read_message_id or 0, membership.cleared_before_message_id or 0)
+    pending: str | None = None
+    if conversation is not None:
+        if (membership.last_mention_message_id or 0) > floor:
+            pending = "me"
+        elif (conversation.last_mention_all_message_id or 0) > floor:
+            pending = "all"
     return ReadReceipt(
         conversation_id=conversation_id,
         user_id=user_id,
         last_read_message_id=last_read_message_id,
         last_read_at=now,
-        mention_pending=mention_pending(conversation, membership) if conversation is not None else None,
+        mention_pending=pending,
     )
