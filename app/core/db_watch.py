@@ -19,6 +19,9 @@ HOLD_WARN_SECONDS = 20.0
 SCAN_SECONDS = 5.0
 
 _holders: dict[int, tuple[float, asyncio.Task[Any] | None, bool]] = {}
+# 已经 flush 过写、还没提交 / 回滚的会话 = 正拿着 SQLite 整库写锁的一方（别人只能 database is locked）
+WRITE_WARN_SECONDS = 5.0
+_writers: dict[int, tuple[float, asyncio.Task[Any] | None, bool]] = {}
 _monitor: asyncio.Task[None] | None = None
 
 
@@ -30,13 +33,22 @@ def _current_task() -> asyncio.Task[Any] | None:
 
 
 def _app_stack(task: asyncio.Task[Any]) -> str:
-    frames = []
-    for frame in task.get_stack(limit=60):
-        code = frame.f_code
-        path = code.co_filename.replace("\\", "/")
-        if "/app/" in path and not path.endswith("/db_watch.py"):
-            frames.append(f"{path.split('/app/')[-1]}:{frame.f_lineno} {code.co_name}")
-    return " <- ".join(reversed(frames)) or (task.get_name() if task else "?")
+    """沿着 await 链从最外层一路走到最里层，只留 app/ 里的帧。
+
+    task.get_stack() 对挂起的协程只给最外层一帧（线上日志里全是中间件那一层，看不出卡在哪），所以自己走 cr_await。
+    """
+    frames: list[str] = []
+    coro: Any = task.get_coro()
+    depth = 0
+    while coro is not None and depth < 80:
+        depth += 1
+        frame = getattr(coro, "cr_frame", None) or getattr(coro, "gi_frame", None) or getattr(coro, "ag_frame", None)
+        if frame is not None:
+            path = frame.f_code.co_filename.replace("\\", "/")
+            if "/app/" in path and not path.endswith("/db_watch.py"):
+                frames.append(f"{path.split('/app/')[-1]}:{frame.f_lineno} {frame.f_code.co_name}")
+        coro = getattr(coro, "cr_await", None) or getattr(coro, "gi_yieldfrom", None) or getattr(coro, "ag_await", None)
+    return " -> ".join(frames) or task.get_name()
 
 
 async def _scan_forever() -> None:
@@ -45,6 +57,13 @@ async def _scan_forever() -> None:
         try:
             now = time.monotonic()
             slow = [(key, now - since, task) for key, (since, task, reported) in list(_holders.items()) if not reported and now - since >= HOLD_WARN_SECONDS]
+            slow_writers = [(key, now - since, task) for key, (since, task, reported) in list(_writers.items()) if not reported and now - since >= WRITE_WARN_SECONDS]
+            for key, held, task in slow_writers:
+                where = _app_stack(task) if task is not None and not task.done() else "（任务已结束但事务没提交）"
+                logger.warning("db WRITE LOCK held %.0fs (writers: %d): %s", held, len(_writers), where)
+                if key in _writers:
+                    since, owner, _ = _writers[key]
+                    _writers[key] = (since, owner, True)
             for key, held, task in slow:
                 where = _app_stack(task) if task is not None and not task.done() else "（借出的任务已结束但连接没还）"
                 logger.warning("db connection held %.0fs (pool in use: %d): %s", held, len(_holders), where)
@@ -55,19 +74,36 @@ async def _scan_forever() -> None:
             logger.debug("db_watch scan failed\n%s", traceback.format_exc())
 
 
+def _ensure_monitor() -> None:
+    global _monitor
+    if _monitor is None or _monitor.done():
+        try:
+            _monitor = asyncio.get_running_loop().create_task(_scan_forever())
+        except RuntimeError:
+            pass
+
+
 def install(sync_engine: Any) -> None:
     from sqlalchemy import event
 
     @event.listens_for(sync_engine, "checkout")
     def _on_checkout(_dbapi_connection, connection_record, _proxy) -> None:  # noqa: ANN001
-        global _monitor
-        task = _current_task()
-        _holders[id(connection_record)] = (time.monotonic(), task, False)
-        if _monitor is None or _monitor.done():
-            try:
-                _monitor = asyncio.get_running_loop().create_task(_scan_forever())
-            except RuntimeError:
-                pass
+        _holders[id(connection_record)] = (time.monotonic(), _current_task(), False)
+        _ensure_monitor()
+
+    from sqlalchemy.orm import Session
+
+    @event.listens_for(Session, "after_flush")
+    def _on_flush(session, _context) -> None:  # noqa: ANN001
+        _writers.setdefault(id(session), (time.monotonic(), _current_task(), False))
+        _ensure_monitor()
+
+    def _clear(session, *_args) -> None:  # noqa: ANN001
+        _writers.pop(id(session), None)
+
+    event.listen(Session, "after_commit", _clear)
+    event.listen(Session, "after_rollback", _clear)
+    event.listen(Session, "after_soft_rollback", _clear)
 
     @event.listens_for(sync_engine, "checkin")
     def _on_checkin(_dbapi_connection, connection_record) -> None:  # noqa: ANN001
