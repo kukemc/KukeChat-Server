@@ -61,7 +61,8 @@ async def flush() -> None:
     now = datetime.now(UTC)
     try:
         async with AsyncSessionLocal() as db:
-            for (conversation_id, user_id), message_id in batch.items():
+            # 按主键顺序更新：两个 worker 同时 flush、碰到同几行时加锁顺序一致，不会互相死锁
+            for (conversation_id, user_id), message_id in sorted(batch.items()):
                 await db.execute(
                     update(ConversationMember)
                     .where(
