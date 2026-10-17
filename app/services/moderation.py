@@ -21,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
 from app.core.config import settings
-from app.core.database import AsyncSessionLocal
+from app.core.database import AsyncSessionLocal, release_connection
 from app.models.conversation import Conversation
 from app.models.enums import MessageType, ModerationAction, ModerationSource, ModerationStatus, UserStatus
 from app.models.message import Message
@@ -474,6 +474,7 @@ async def _moderate_profile_cover_task(user_id: int) -> None:
                 await admin_manager.broadcast("admin.moderation.changed", {"profile_user_id": user.id, "action": ModerationAction.NONE.value, "moderation_status": user.profile_cover_moderation_status})
                 return
             image_url = user.profile_cover_pending_url
+            await _release_connection(db)
             result = await _call_image_moderation_for_user(image_url, user.id, context_id=f"profile-cover:{user.id}")
             record = _build_profile_cover_record(user, image_url, result)
             db.add(record)
@@ -580,10 +581,9 @@ async def _release_connection(db: AsyncSession) -> None:
     审核服务一慢，每条新消息都占住一条连接，几十条之后连接池被占满、整个服务卡死（2026-10-17 11:06，db_watch 抓到
     _moderate_message_task 占连接 85 秒）。这里只在会话里没有待写入的改动时提交：没改动的提交只是结束读事务，
     不会把调用方的半成品写进去；会话的对象不会过期（expire_on_commit=False），之后接着用。
+    已经 flush 过的写也算半成品（光看 db.new / dirty 看不出来），判断交给 app.core.database.release_connection。
     """
-    if db.new or db.dirty or db.deleted:
-        return
-    await db.commit()
+    await release_connection(db)
 
 
 async def _moderate_message_content(
@@ -653,6 +653,7 @@ def _teamup_profile_image_urls(profile: TeamupProfile) -> list[str]:
 
 
 async def _moderate_teamup_profile_content(db: AsyncSession, profile: TeamupProfile) -> list[ContentModerationRecord]:
+    await _release_connection(db)
     checks: list[tuple[str, str | None, str | None, dict[str, Any]]] = []
     text_parts = [part for part in (profile.headline, profile.intro, profile.contact_note) if part and part.strip()]
     text = "\n".join(text_parts).strip()
@@ -676,6 +677,7 @@ async def _moderate_teamup_profile_content(db: AsyncSession, profile: TeamupProf
 
 
 async def _moderate_teamup_comment_content(db: AsyncSession, comment: TeamupComment) -> list[ContentModerationRecord]:
+    await _release_connection(db)
     text = comment.content.strip()
     if not text:
         return []
@@ -687,6 +689,7 @@ async def _moderate_teamup_comment_content(db: AsyncSession, comment: TeamupComm
 
 
 async def _moderate_post_topic_content(db: AsyncSession, topic: PostTopic) -> ContentModerationRecord | None:
+    await _release_connection(db)
     text = topic.name.strip()
     if not text:
         return None

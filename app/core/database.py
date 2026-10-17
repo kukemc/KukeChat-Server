@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncGenerator
 
 from sqlalchemy import event, text
@@ -7,6 +8,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.orm import DeclarativeBase
 
 from app.core.config import settings
+
+
+logger = logging.getLogger(__name__)
 
 
 class Base(DeclarativeBase):
@@ -57,6 +61,43 @@ def configure_sqlite_connection(dbapi_connection, _connection_record) -> None:
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
     async with AsyncSessionLocal() as session:
         yield session
+
+
+async def has_uncommitted_write(db: AsyncSession) -> bool:
+    """会话里有没有还没提交的写：内存里待 flush 的改动，或者已经 flush / 直接执行过、但还没提交的写语句。
+
+    后一种光看 ``db.new / dirty / deleted`` 看不出来（flush 之后它们就清空了），要问驱动：sqlite3 只在
+    INSERT / UPDATE / DELETE 之前才隐式 BEGIN，所以连接上 ``in_transaction`` 为真就说明这条连接已经拿了
+    （或正在抢）SQLite 的写锁。看不出来的驱动按「有」算，宁可不提交。
+    """
+    if db.new or db.dirty or db.deleted:
+        return True
+    if not db.in_transaction():
+        return False
+    connection = await db.connection()
+    raw = await connection.get_raw_connection()
+    flag = getattr(raw.driver_connection, "in_transaction", None)
+    return True if flag is None else bool(flag)
+
+
+async def release_connection(db: AsyncSession) -> bool:
+    """去等网络 / 慢 IO（CCW、审核服务、对象存储、图片处理、sleep）之前，把这个会话借着的数据库连接还回池子。
+
+    会话第一次查询就借走一条连接，一直占到提交 / 回滚 / 关闭。带着它去等几秒到几十秒的外部服务，并发一上来就会
+    把连接池占满（线上已经出过几次）；要是这时还有已经 flush 的写，就更糟 —— SQLite 的写锁一直拿着，全站写操作
+    排队直到 ``database is locked``。
+
+    只在没有未提交的写时提交：没有写的提交只是结束读事务，不会把调用方的半成品写进去；会话用的是
+    ``expire_on_commit=False``，对象不过期，之后接着用。有未提交的写时不提交（那是调用方的顺序问题，该把网络调用
+    挪到写之前），只打一条日志，返回 False。
+    """
+    if not db.in_transaction() and not (db.new or db.dirty or db.deleted):
+        return True
+    if await has_uncommitted_write(db):
+        logger.warning("release_connection: session has uncommitted writes, keeping the connection", stack_info=True)
+        return False
+    await db.commit()
+    return True
 
 
 async def init_db() -> None:

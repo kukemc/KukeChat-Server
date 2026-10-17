@@ -39,7 +39,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.core.database import AsyncSessionLocal
+from app.core.database import AsyncSessionLocal, release_connection
 from app.integrations import get_coin_ledger
 from app.models.conversation import Conversation, ConversationMember
 from app.models.enums import ConversationType, MemberRole, MessageType
@@ -555,12 +555,14 @@ def _clean_chain_text(value: Any) -> str | None:
     return text
 
 
-async def _ensure_text_allowed(user: User, text: str, conversation_id: int, code: str, message: str) -> None:
+async def _ensure_text_allowed(db: AsyncSession, user: User, text: str, conversation_id: int, code: str, message: str) -> None:
     """发之前先过一遍文本审核，明确违规的不让发。审核服务不可用时放行，消息发出去之后仍会走异步审核。"""
     if not settings.content_moderation_enabled or user.content_moderation_whitelisted:
         return
     from app.services import moderation as moderation_service
 
+    # 审核服务可能要几秒：先结束请求的读事务、把数据库连接还回去，不带着连接等
+    await release_connection(db)
     try:
         result = await moderation_service._call_text_moderation_for_user(text, user.id, context_id=f"red_packet:{conversation_id}")
     except Exception:
@@ -569,11 +571,11 @@ async def _ensure_text_allowed(user: User, text: str, conversation_id: int, code
         raise _error(status.HTTP_422_UNPROCESSABLE_ENTITY, code, message)
 
 
-async def _ensure_greeting_allowed(user: User, greeting: str, conversation_id: int) -> None:
+async def _ensure_greeting_allowed(db: AsyncSession, user: User, greeting: str, conversation_id: int) -> None:
     """祝福语过审核（默认祝福语不送审）。"""
     if greeting == DEFAULT_GREETING:
         return
-    await _ensure_text_allowed(user, greeting, conversation_id, "greeting_rejected", "祝福语未通过审核，请修改后重试")
+    await _ensure_text_allowed(db, user, greeting, conversation_id, "greeting_rejected", "祝福语未通过审核，请修改后重试")
 
 
 def _invalid_target(reason: str, message: str) -> HTTPException:
@@ -694,9 +696,9 @@ async def send_red_packet(db: AsyncSession, user: User, payload: dict[str, Any])
     if oid is None:
         raise _error(status.HTTP_403_FORBIDDEN, "ccw_not_bound", "先绑定 CCW 账号才能发红包")
     conversation_type = "direct" if direct else "group"
-    await _ensure_greeting_allowed(user, greeting, conversation_id)
+    await _ensure_greeting_allowed(db, user, greeting, conversation_id)
     if chain_text is not None:
-        await _ensure_text_allowed(user, chain_text, conversation_id, "chain_text_rejected", "接龙口令未通过审核，请修改后重试")
+        await _ensure_text_allowed(db, user, chain_text, conversation_id, "chain_text_rejected", "接龙口令未通过审核，请修改后重试")
     if await _sent_today(db, user_id, _now()) >= config["daily_send_limit"]:
         raise _daily_limit(config["daily_send_limit"])
     # 和商店购买一样：累计投币得是刚向 CCW 核实过的，核实不了就 503，不扣币

@@ -12,6 +12,7 @@ from sqlalchemy.orm import joinedload
 
 from app.core import group_levels
 from app.core.config import settings
+from app.core.database import release_connection
 from app.models.conversation import Conversation, ConversationMember, GroupAnnouncement, GroupJoinRequest, TemporaryConversationBlock
 from app.models.enums import ConversationType, GroupJoinRequestStatus, MemberRole
 from app.models.friend import Friendship
@@ -778,6 +779,8 @@ async def _ensure_level_titles_allowed(db: AsyncSession, actor_id: int, conversa
     from app.services import moderation as moderation_service
 
     text = " ".join(entry["title"] for entry in titles)
+    # 审核服务可能要几秒：先结束请求的读事务、把数据库连接还回去，不带着连接等
+    await release_connection(db)
     try:
         result = await moderation_service._call_text_moderation_for_user(text, actor_id, context_id=f"level_titles:{conversation.id}")
     except Exception:

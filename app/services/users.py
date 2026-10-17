@@ -33,6 +33,13 @@ async def update_profile(db: AsyncSession, user: User, payload: UserUpdate) -> U
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid profile layout")
     if "profile_card_style" in updates and updates["profile_card_style"] and updates["profile_card_style"] not in PROFILE_CARD_STYLES:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid profile card style")
+    # 戳一戳文案要同步过审核（外部服务，可能要几秒）：在改 user 之前做 —— 审核前会提交掉请求的读事务、把连接还回去，
+    # 这时会话里不能有改了一半的 user
+    poke_suffix: str | None = None
+    if "poke_suffix" in updates:
+        poke_suffix = poke_service.normalize_suffix(updates.pop("poke_suffix"))
+        if poke_suffix != (user.poke_suffix or ""):
+            await poke_service.ensure_suffix_allowed(db, user, poke_suffix)
     if "profile_cover_url" in updates:
         cover_url = require_profile_cover_upload_url(updates.pop("profile_cover_url"))
         if cover_url:
@@ -52,11 +59,8 @@ async def update_profile(db: AsyncSession, user: User, payload: UserUpdate) -> U
     # 这两个字段不可为空，传 null 或空串表示恢复默认
     if "poke_action" in updates:
         user.poke_action = poke_service.normalize_action(updates.pop("poke_action"))
-    if "poke_suffix" in updates:
-        suffix = poke_service.normalize_suffix(updates.pop("poke_suffix"))
-        if suffix != (user.poke_suffix or ""):
-            await poke_service.ensure_suffix_allowed(user, suffix)
-        user.poke_suffix = suffix
+    if poke_suffix is not None:
+        user.poke_suffix = poke_suffix
     for key, value in updates.items():
         if isinstance(value, str):
             value = value.strip() or None

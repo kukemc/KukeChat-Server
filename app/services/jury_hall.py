@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from app.core.config import settings
+from app.core.database import release_connection
 from app.models.case import JuryMember
 from app.models.enums import PlatformRole
 from app.models.jury_hall import JuryHallComment, JuryHallPost, JuryHallReport, JuryHallVote
@@ -227,7 +228,7 @@ def _clean_post(title: str | None, content: str | None) -> tuple[str, str]:
     return title, content
 
 
-async def ensure_text_allowed(user: User, text: str, context_id: str) -> None:
+async def ensure_text_allowed(db: AsyncSession, user: User, text: str, context_id: str) -> None:
     """发表前过一遍同步的文本审核，明确违规的才拒绝。
 
     审核没启用、发言人在白名单里、或者审核服务不可用时都放行 —— 不能因为它挂了议事厅就发不了言。
@@ -236,6 +237,8 @@ async def ensure_text_allowed(user: User, text: str, context_id: str) -> None:
         return
     from app.services import moderation as moderation_service
 
+    # 审核服务可能要几秒：先结束请求的读事务、把数据库连接还回去，不带着连接等
+    await release_connection(db)
     try:
         result = await moderation_service._call_text_moderation_for_user(text, user.id, context_id=context_id)
     except Exception:
@@ -458,7 +461,7 @@ async def create_post(db: AsyncSession, user: User, kind: str | None, title: str
     # 公告不占发帖的额度（管理员本人如果也是委员）
     await _check_rate(db, JuryHallPost, user.id, POSTS_PER_DAY, "发帖数", now, JuryHallPost.kind != "announcement")
     # 标题也审，和正文一起送一次
-    await ensure_text_allowed(user, f"{title}\n{content}", f"jury_hall_post:{user.id}")
+    await ensure_text_allowed(db, user, f"{title}\n{content}", f"jury_hall_post:{user.id}")
     post = JuryHallPost(kind=kind, title=title, content=content, author_id=user.id, created_at=now, updated_at=now, last_activity_at=now)
     if kind == "proposal":
         post.vote_ends_at = now + timedelta(days=VOTE_DAYS)
@@ -501,7 +504,7 @@ async def update_post(db: AsyncSession, user: User, post_id: int, title: str | N
     new_title, new_content = _clean_post(title if title is not None else post.title, content if content is not None else post.content)
     if (new_title, new_content) != (post.title, post.content):
         if not announcement:
-            await ensure_text_allowed(user, f"{new_title}\n{new_content}", f"jury_hall_post:{user.id}")
+            await ensure_text_allowed(db, user, f"{new_title}\n{new_content}", f"jury_hall_post:{user.id}")
         post.title = new_title
         post.content = new_content
         post.updated_at = datetime.now(UTC)
@@ -640,7 +643,7 @@ async def create_comment(db: AsyncSession, user: User, post_id: int, content: st
         reply_to_id = parent.id if parent.parent_id is not None else None
     now = datetime.now(UTC)
     await _check_rate(db, JuryHallComment, user.id, COMMENTS_PER_DAY, "评论数", now)
-    await ensure_text_allowed(user, text, f"jury_hall_comment:{post.id}")
+    await ensure_text_allowed(db, user, text, f"jury_hall_comment:{post.id}")
     comment = JuryHallComment(post_id=post.id, author_id=user.id, parent_id=root_id, reply_to_id=reply_to_id, content=text, created_at=now)
     db.add(comment)
     post.last_activity_at = now

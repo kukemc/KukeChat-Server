@@ -72,11 +72,13 @@ def _display_name(user: User | None) -> str:
     return (user.nickname or "").strip() or (user.username or "").strip() or "某成员"
 
 
-async def _ensure_text_allowed(actor: User, text: str, context: str) -> None:
+async def _ensure_text_allowed(db: AsyncSession, actor: User, text: str, context: str) -> None:
     """Block disallowed task text via the content-moderation service (fail-open on errors)."""
     content = (text or "").strip()
     if not content or not settings.content_moderation_enabled or actor.content_moderation_whitelisted:
         return
+    # 审核服务可能要几秒：先结束请求的读事务、把数据库连接还回去，不带着连接等
+    await release_connection(db)
     try:
         result = await moderation_service._call_text_moderation_for_user(content, actor.id, context_id=context)
     except Exception:
@@ -583,7 +585,7 @@ async def create_task(db: AsyncSession, actor: User, payload: TaskCreate) -> tup
     member = await _member_or_403(db, conversation.id, actor.id)
     if conversation.task_creation_permission == "admins" and member.role not in STAFF_ROLES:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="仅管理员可以创建任务")
-    await _ensure_text_allowed(actor, f"{payload.title}\n{payload.description or ''}", f"task:{conversation.id}")
+    await _ensure_text_allowed(db, actor, f"{payload.title}\n{payload.description or ''}", f"task:{conversation.id}")
 
     if payload.parent_id is not None:
         parent = await db.get(Task, payload.parent_id)
@@ -724,7 +726,7 @@ async def update_task(db: AsyncSession, actor: User, task_id: int, payload: Task
     new_title = data.get("title") if "title" in data and data["title"] is not None else None
     new_desc = data.get("description") if "description" in data and data["description"] is not None else None
     if new_title is not None or new_desc is not None:
-        await _ensure_text_allowed(actor, f"{new_title or task.title}\n{new_desc if new_desc is not None else (task.description or '')}", f"task:{task.conversation_id}")
+        await _ensure_text_allowed(db, actor, f"{new_title or task.title}\n{new_desc if new_desc is not None else (task.description or '')}", f"task:{task.conversation_id}")
 
     if "title" in data and data["title"] is not None and data["title"] != task.title:
         task.title = data["title"]
@@ -946,7 +948,7 @@ async def create_task_comment(db: AsyncSession, actor: User, task_id: int, conte
     member = await _optional_member(db, task.conversation_id, actor.id)
     if member is None and not await _is_task_participant(db, task, actor.id):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You cannot comment on this task")
-    await _ensure_text_allowed(actor, content, f"task_comment:{task.id}")
+    await _ensure_text_allowed(db, actor, content, f"task_comment:{task.id}")
     comment = TaskComment(task_id=task.id, author_id=actor.id, content=content)
     db.add(comment)
     await db.flush()

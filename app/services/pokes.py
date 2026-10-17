@@ -17,6 +17,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.core.database import release_connection
 from app.models.conversation import ConversationMember
 from app.models.enums import ConversationType, MemberRole, MessageType
 from app.models.message import Message
@@ -70,7 +71,7 @@ def normalize_suffix(value: str | None) -> str:
     return suffix
 
 
-async def ensure_suffix_allowed(user: User, suffix: str) -> None:
+async def ensure_suffix_allowed(db: AsyncSession, user: User, suffix: str) -> None:
     """保存前过一遍文本审核，明确违规的不让存。
 
     戳一戳消息是系统消息，不走消息的异步审核，所以这里是这段文字唯一的一道机器检查。
@@ -80,6 +81,8 @@ async def ensure_suffix_allowed(user: User, suffix: str) -> None:
         return
     from app.services import moderation as moderation_service
 
+    # 审核服务可能要几秒：先结束请求的读事务、把数据库连接还回去，不带着连接等
+    await release_connection(db)
     try:
         result = await moderation_service._call_text_moderation_for_user(suffix, user.id, context_id=f"poke_suffix:{user.id}")
     except Exception:

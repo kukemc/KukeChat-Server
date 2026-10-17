@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
 from app.core.security import hash_password
+from app.core.database import release_connection
 from app.models.bot import Bot, BotInstallation, BotReview, BotReviewLike, BotReviewReply
 from app.models.conversation import Conversation, ConversationMember
 from app.models.enums import ConversationType, MemberRole, ModerationStatus, UserStatus
@@ -78,10 +79,12 @@ def _ensure_not_deleted(bot: Bot) -> None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bot not found")
 
 
-async def _review_moderation_status(user: User, text: str | None, context_id: str) -> str:
+async def _review_moderation_status(db: AsyncSession, user: User, text: str | None, context_id: str) -> str:
     content = (text or "").strip()
     if not content or user.content_moderation_whitelisted:
         return ModerationStatus.APPROVED.value
+    # 审核服务可能要几秒：先结束请求的读事务、把数据库连接还回去，不带着连接等
+    await release_connection(db)
     try:
         result = await moderation_service._call_text_moderation_for_user(content, user.id, context_id=context_id)
     except Exception:
@@ -540,7 +543,7 @@ async def upsert_bot_review(db: AsyncSession, bot_id: int, user: User, payload: 
         select(BotReview).options(joinedload(BotReview.user)).where(BotReview.bot_id == bot_id, BotReview.user_id == user.id, BotReview.deleted_at.is_(None))
     )
     review = result.scalar_one_or_none()
-    moderation_status = await _review_moderation_status(user, payload.content, context_id=f"bot_review:{bot_id}:{user.id}")
+    moderation_status = await _review_moderation_status(db, user, payload.content, context_id=f"bot_review:{bot_id}:{user.id}")
     if review is None:
         review = BotReview(bot_id=bot_id, user_id=user.id, rating=payload.rating, content=payload.content, moderation_status=moderation_status)
         if moderation_status == ModerationStatus.REJECTED.value:
@@ -567,7 +570,7 @@ async def create_bot_review_reply(db: AsyncSession, bot_id: int, review_id: int,
         parent_result = await db.execute(select(BotReviewReply).where(BotReviewReply.id == payload.parent_id, BotReviewReply.review_id == review_id))
         if parent_result.scalar_one_or_none() is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Parent reply not found")
-    moderation_status = await _review_moderation_status(user, payload.content, context_id=f"bot_review_reply:{bot_id}:{review_id}:{user.id}")
+    moderation_status = await _review_moderation_status(db, user, payload.content, context_id=f"bot_review_reply:{bot_id}:{review_id}:{user.id}")
     db.add(BotReviewReply(review_id=review_id, user_id=user.id, parent_id=payload.parent_id, content=payload.content, moderation_status=moderation_status, deleted_at=_now() if moderation_status == ModerationStatus.REJECTED.value else None))
     await db.commit()
     review_reload = await db.execute(select(BotReview).options(joinedload(BotReview.user)).where(BotReview.id == review_id))

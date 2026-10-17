@@ -38,7 +38,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.core.database import AsyncSessionLocal
+from app.core.database import AsyncSessionLocal, release_connection
 from app.integrations import CoinsUnavailable, get_coin_ledger
 from app.models.gift import GiftRecord
 from app.models.group_plus import GroupPlusRecord
@@ -1764,6 +1764,8 @@ async def admin_reconcile(db: AsyncSession, admin: User) -> dict[str, Any]:
     以及送礼的账守恒（gifts，见 gifts.ledger_check：每个人的心意值 = 他收到的礼物花掉的币之和）。
     """
     admin_id = admin.id
+    # 拉完整名单要等 CCW（可能好几秒）：先结束请求的读事务、把连接还回去；下面的读写都在拿到名单之后
+    await release_connection(db)
     try:
         donations = await get_coin_ledger().all_credits(fresh=True)
     except CoinsUnavailable:

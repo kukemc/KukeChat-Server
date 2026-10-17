@@ -15,6 +15,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.core.database import release_connection
 from app.models.conversation import Conversation
 from app.models.enums import ConversationType, MessageType
 from app.models.message import Message
@@ -64,12 +65,14 @@ def _normalize(payload: PollCreate) -> tuple[str, list[str], datetime | None]:
     return title, options, closes_at
 
 
-async def _ensure_text_allowed(actor: User, text: str, context: str) -> None:
+async def _ensure_text_allowed(db: AsyncSession, actor: User, text: str, context: str) -> None:
     """标题和选项先过一遍文本审核，明确违规的不让发。审核服务不可用时放行，消息仍会走异步审核。"""
     if not settings.content_moderation_enabled or actor.content_moderation_whitelisted:
         return
     from app.services import moderation as moderation_service
 
+    # 审核服务可能要几秒：先结束请求的读事务、把数据库连接还回去，不带着连接等
+    await release_connection(db)
     try:
         result = await moderation_service._call_text_moderation_for_user(text, actor.id, context_id=context)
     except Exception:
@@ -86,7 +89,7 @@ def fallback_text(title: str, options: list[str]) -> str:
 
 async def create_poll(db: AsyncSession, conversation_id: int, actor: User, payload: PollCreate) -> Message:
     title, options, closes_at = _normalize(payload)
-    await _ensure_text_allowed(actor, "\n".join([title, *options]), f"poll:{conversation_id}")
+    await _ensure_text_allowed(db, actor, "\n".join([title, *options]), f"poll:{conversation_id}")
     definition = {
         "id": None,
         "title": title,
