@@ -573,12 +573,26 @@ async def _moderate_teamup_comment_task(comment_id: int) -> None:
             await _record_moderation_error(db, None, ModerationSource.MESSAGE_AUTO, None, exc, teamup_comment_id=comment_id)
 
 
+async def _release_connection(db: AsyncSession) -> None:
+    """调外部审核服务（几秒到几十秒）之前把数据库连接还回池子。
+
+    会话在第一次查询时就借走一条连接，一直占到提交 / 回滚为止。之前审核任务查完消息就带着这条连接去等审核服务，
+    审核服务一慢，每条新消息都占住一条连接，几十条之后连接池被占满、整个服务卡死（2026-10-17 11:06，db_watch 抓到
+    _moderate_message_task 占连接 85 秒）。这里只在会话里没有待写入的改动时提交：没改动的提交只是结束读事务，
+    不会把调用方的半成品写进去；会话的对象不会过期（expire_on_commit=False），之后接着用。
+    """
+    if db.new or db.dirty or db.deleted:
+        return
+    await db.commit()
+
+
 async def _moderate_message_content(
     db: AsyncSession,
     message: Message,
     source: ModerationSource,
     report_id: int | None,
 ) -> list[ContentModerationRecord]:
+    await _release_connection(db)
     checks: list[tuple[str, str | None, str | None, dict[str, Any]]] = []
     metadata = _json_object(message.metadata_json)
     text = _text_to_moderate(message, metadata)
@@ -599,6 +613,7 @@ async def _moderate_message_content(
 
 
 async def _moderate_post_content(db: AsyncSession, post: Post) -> list[ContentModerationRecord]:
+    await _release_connection(db)
     checks: list[tuple[str, str | None, str | None, dict[str, Any]]] = []
     text = post.content.strip()
     if text:
@@ -616,6 +631,7 @@ async def _moderate_post_content(db: AsyncSession, post: Post) -> list[ContentMo
 
 
 async def _moderate_post_comment_content(db: AsyncSession, comment: PostComment) -> list[ContentModerationRecord]:
+    await _release_connection(db)
     text = comment.content.strip()
     if not text:
         return []

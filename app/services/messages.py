@@ -1494,7 +1494,8 @@ async def create_forward_bundle(
     if source_membership.cleared_before_message_id is not None:
         stmt = stmt.where(Message.id > source_membership.cleared_before_message_id)
     result = await db.execute(stmt)
-    visible_messages = sorted(result.scalars().all(), key=lambda message: message.id)
+    # 系统消息（戳一戳、入群提示）不进合并转发：没有发送者，旧客户端画转发记录时会崩。旧客户端多选里带上的悄悄去掉
+    visible_messages = sorted((message for message in result.scalars().all() if message.type != MessageType.SYSTEM), key=lambda message: message.id)
     if not visible_messages:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No visible messages to forward")
     # 红包不能转发，夹在合并转发里也不行（docs/red-packets.md）。引用红包消息不受影响
