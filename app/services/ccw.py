@@ -235,11 +235,15 @@ async def latest_binding_challenge(db: AsyncSession, user_id: int) -> CcwBinding
 async def check_binding_challenges_once(db: AsyncSession, user_id: int | None = None) -> int:
     now = datetime.now(UTC)
     await _expire_old_challenges(db, now)
+    # 下面要去 CCW 拉评论（慢的时候几十秒）。SQLite 是整库一把写锁：带着没提交的写（上面的过期标记）去等网络，
+    # 全站的写都会卡在 database is locked，连接池随之被占满（2026-10-17 12:42、12:58 两次）。所以先提交，空手去等
+    await db.commit()
     query = select(CcwBindingChallenge).where(CcwBindingChallenge.status == "pending", CcwBindingChallenge.expires_at > now)
     if user_id is not None:
         query = query.where(CcwBindingChallenge.user_id == user_id)
     result = await db.execute(query.order_by(CcwBindingChallenge.created_at.asc()))
     challenges = list(result.scalars().all())
+    await db.commit()
     if not challenges:
         return 0
     if not ccw_gateway_available():
@@ -250,6 +254,9 @@ async def check_binding_challenges_once(db: AsyncSession, user_id: int | None = 
     for challenge in challenges:
         if await _match_challenge(db, challenge, comments):
             matched += 1
+    checked_at = datetime.now(UTC)
+    for challenge in challenges:
+        challenge.last_checked_at = checked_at
     await db.commit()
     return matched
 
@@ -265,7 +272,6 @@ async def _expire_old_challenges(db: AsyncSession, now: datetime) -> None:
 
 async def _match_challenge(db: AsyncSession, challenge: CcwBindingChallenge, comments: list[dict[str, Any]]) -> bool:
     now = datetime.now(UTC)
-    challenge.last_checked_at = now
     code = challenge.code.upper()
     for comment in comments:
         content = _text(comment.get("content")) or ""
@@ -285,6 +291,8 @@ async def _match_challenge(db: AsyncSession, challenge: CcwBindingChallenge, com
         if user is None:
             challenge.status = "expired"
             return False
+        # 又要去 CCW 拉资料：同样先把前面的写提交掉，别带着写锁等网络
+        await db.commit()
         try:
             profile_payload, detail_payload = await fetch_student_payloads(student_oid.lower())
             data = normalize_student_profile(profile_payload, detail_payload, commenter)
