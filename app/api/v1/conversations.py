@@ -1443,9 +1443,10 @@ async def read_conversation(
     receipt = await message_service.mark_conversation_read(
         db, conversation_id, current_user.id, payload.last_read_message_id if payload is not None else None
     )
-    member_ids = await online_conversation_member_ids(db, conversation_id)
-    # mention_pending 是读的人自己的事：广播给全会话的那份不带它，只放在返回里、和发给本人的 conversation.updated 里
-    await manager.send_to_users(member_ids, "conversation.read", receipt.model_dump(exclude={"mention_pending"}))
+    # 只推给读的人自己（多设备同步未读数）。PC / 安卓都只处理 user_id 是自己的已读事件；
+    # 以前广播给全会话，大群里每次已读要推几百份，抢红包时把 CPU 吃满（2026-10-17）。
+    # mention_pending 只放在返回里、和发给本人的 conversation.updated 里
+    await manager.send_to_users({current_user.id}, "conversation.read", receipt.model_dump(exclude={"mention_pending"}))
     await send_conversation_patch(db, conversation_id, {current_user.id}, {"mention_pending": receipt.mention_pending})
     return receipt
 
