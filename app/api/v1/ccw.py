@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.core.dependencies import get_current_user
+from app.core.dependencies import get_current_user, get_current_user_then_release
 from app.integrations import CcwUnavailable
 from app.models.user import User
 from app.schemas.ccw import CcwBindingChallengeRead, CcwSyncProfilePayload
@@ -36,7 +36,7 @@ def _challenge_read(challenge) -> CcwBindingChallengeRead:
 @router.get("/creations/{oid}")
 async def ccw_creation_preview(
     oid: str,
-    current_user: Annotated[User, Depends(get_current_user)],
+    current_user: Annotated[User, Depends(get_current_user_then_release)],
     access_key: Annotated[str, Query(alias="accessKey", max_length=64)] = "",
 ) -> dict[str, Any]:
     del current_user

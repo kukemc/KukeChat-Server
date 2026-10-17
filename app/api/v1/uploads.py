@@ -7,7 +7,7 @@ from uuid import uuid4
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
 from pydantic import BaseModel
 
-from app.core.dependencies import get_current_user
+from app.core.dependencies import get_current_user_then_release
 from app.models.user import User
 from app.services.storage import MAX_AUDIO_UPLOAD_BYTES, image_upload_limits, process_audio_upload, process_image_upload, public_url_for_key, run_image_worker, store_processed_audio, store_processed_image
 
@@ -79,7 +79,7 @@ async def save_audio_upload(file: UploadFile, folder: str, request: Request) -> 
 async def upload_avatar(
     request: Request,
     file: Annotated[UploadFile, File()],
-    _current_user: Annotated[User, Depends(get_current_user)],
+    _current_user: Annotated[User, Depends(get_current_user_then_release)],
 ) -> UploadRead:
     return await save_image_upload(file, "avatars", request)
 
@@ -88,7 +88,7 @@ async def upload_avatar(
 async def upload_message_image(
     request: Request,
     file: Annotated[UploadFile, File()],
-    _current_user: Annotated[User, Depends(get_current_user)],
+    _current_user: Annotated[User, Depends(get_current_user_then_release)],
 ) -> UploadRead:
     return await save_image_upload(file, "messages", request)
 
@@ -97,7 +97,7 @@ async def upload_message_image(
 async def upload_post_image(
     request: Request,
     file: Annotated[UploadFile, File()],
-    _current_user: Annotated[User, Depends(get_current_user)],
+    _current_user: Annotated[User, Depends(get_current_user_then_release)],
 ) -> UploadRead:
     return await save_image_upload(file, "posts", request)
 
@@ -106,7 +106,7 @@ async def upload_post_image(
 async def upload_teamup_image(
     request: Request,
     file: Annotated[UploadFile, File()],
-    _current_user: Annotated[User, Depends(get_current_user)],
+    _current_user: Annotated[User, Depends(get_current_user_then_release)],
 ) -> UploadRead:
     return await save_image_upload(file, "teamup", request)
 
@@ -115,7 +115,7 @@ async def upload_teamup_image(
 async def upload_announcement_image(
     request: Request,
     file: Annotated[UploadFile, File()],
-    _current_user: Annotated[User, Depends(get_current_user)],
+    _current_user: Annotated[User, Depends(get_current_user_then_release)],
 ) -> UploadRead:
     return await save_image_upload(file, "announcements", request)
 
@@ -124,7 +124,7 @@ async def upload_announcement_image(
 async def upload_profile_cover(
     request: Request,
     file: Annotated[UploadFile, File()],
-    _current_user: Annotated[User, Depends(get_current_user)],
+    _current_user: Annotated[User, Depends(get_current_user_then_release)],
 ) -> UploadRead:
     return await save_image_upload(file, "profile-covers", request)
 
@@ -133,6 +133,6 @@ async def upload_profile_cover(
 async def upload_message_voice(
     request: Request,
     file: Annotated[UploadFile, File()],
-    _current_user: Annotated[User, Depends(get_current_user)],
+    _current_user: Annotated[User, Depends(get_current_user_then_release)],
 ) -> UploadRead:
     return await save_audio_upload(file, "messages", request)

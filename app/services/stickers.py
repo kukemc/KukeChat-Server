@@ -11,6 +11,7 @@ from sqlalchemy.orm import joinedload
 
 from app.models.sticker import FavoriteSticker, StickerAsset
 from app.schemas.sticker import FavoriteStickerRead
+from app.core.database import release_connection
 from app.services.storage import (
     create_compressed_sticker,
     delete_objects,
@@ -115,6 +116,8 @@ async def add_favorite_sticker(db: AsyncSession, user_id: int, source_url: str) 
     async with _source_lock(source_path):
         asset = await _get_sticker_asset(db, source_path)
         if asset is None:
+            # 去对象存储取原图、压缩、再传回去（几秒）：先结束读事务、把数据库连接还回去，不带着连接等
+            await release_connection(db)
             storage_path, content_type = await run_image_worker(_resolve_source, source_path)
             asset = StickerAsset(source_path=source_path, storage_path=storage_path, content_type=content_type if storage_path == source_path else COMPRESSED_STICKER_CONTENT_TYPE)
             db.add(asset)

@@ -16,7 +16,7 @@ from sqlalchemy.orm import joinedload
 
 from app.api.v1.conversations import display_name, emit_system_message, mute_duration_label, online_conversation_member_ids, schedule_realtime_task, send_admin_message_signal, send_bot_conversation_event, send_conversation_updates, send_message_updates, send_reaction_updates
 from app.api.v1.uploads import UploadRead, save_audio_upload, save_image_upload
-from app.core.database import get_db
+from app.core.database import get_db, release_connection
 from app.core.dependencies import get_current_bot
 from app.models.bot import Bot, BotInstallation
 from app.models.conversation import ConversationMember
@@ -828,7 +828,10 @@ async def bot_upload_image(
     request: Request,
     file: Annotated[UploadFile, File()],
     _context: Annotated[BotContext, Depends(get_current_bot)],
+    db: Annotated[AsyncSession, Depends(get_db)],
 ) -> UploadRead:
+    # 认完机器人就不再查库：先把连接还回去，别带着它等图片处理和对象存储
+    await release_connection(db)
     return await save_image_upload(file, "messages", request)
 
 
@@ -837,7 +840,9 @@ async def bot_upload_voice(
     request: Request,
     file: Annotated[UploadFile, File()],
     _context: Annotated[BotContext, Depends(get_current_bot)],
+    db: Annotated[AsyncSession, Depends(get_db)],
 ) -> UploadRead:
+    await release_connection(db)
     return await save_audio_upload(file, "messages", request)
 
 

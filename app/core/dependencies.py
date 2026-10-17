@@ -7,7 +7,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import bot_rate_limit
-from app.core.database import get_db
+from app.core.database import get_db, release_connection
 from app.core.security import decode_access_token
 from app.models.enums import PlatformRole
 from app.models.user import User
@@ -42,6 +42,20 @@ async def get_current_user(
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> User:
     return await get_current_user_from_token(db, credentials.credentials)
+
+
+async def get_current_user_then_release(
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> User:
+    """和 get_current_user 一样认人，认完就结束这个请求的读事务、把数据库连接还回池子。
+
+    给「认完人就去等网络 / 慢 IO」的接口用（上传图片和语音、CCW 作品卡片、B 站链接卡片）：请求的会话在认人时借走了
+    一条连接，不还的话会一直占到请求结束，几秒到几十秒；这类请求一多就能把连接池占满。之后要是还查库，会话会再借一条。
+    db 和 get_current_user 里的是同一个会话（FastAPI 在一个请求里只解析一次 get_db）。
+    """
+    await release_connection(db)
+    return user
 
 
 async def get_appeal_user(

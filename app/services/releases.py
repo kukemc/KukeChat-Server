@@ -23,6 +23,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.core.database import release_connection
 from app.models.enums import PlatformRole, UserStatus
 from app.models.release import AppRelease, AppReleaseArtifact, ReleaseApiToken
 from app.models.user import User
@@ -573,6 +574,13 @@ def _artifact(release: AppRelease, artifact_id: int) -> AppReleaseArtifact:
     raise _error(404, "artifact_not_found", "安装包不存在")
 
 
+def _ensure_name_free(release: AppRelease, file_name: str) -> None:
+    """同名的 ready 包 → 409。只读，不改 release.artifacts。"""
+    for artifact in release.artifacts:
+        if artifact.file_name == file_name and artifact.status == "ready":
+            raise _error(409, "artifact_exists", f"这个版本里已经有 {file_name} 了，先删掉旧的")
+
+
 async def _claim_name(db: AsyncSession, release: AppRelease, file_name: str) -> list[str]:
     """同名的 ready 包 → 409；同名的 pending 直传单 → 让位给新的。返回要删的对象 key。"""
     doomed: list[str] = []
@@ -623,6 +631,8 @@ async def complete_upload(db: AsyncSession, request: Request | None, actor: "Rel
     if artifact.status == "ready":
         return admin_view(release, request)
     key = artifact.storage_key or ""
+    # 去对象存储核对（网络）之前先结束读事务、把连接还回去
+    await release_connection(db)
     stored = await asyncio.to_thread(storage.object_size, key)
     if stored is None:
         raise _error(409, "upload_incomplete", "还没在存储里找到这个文件，传完再点完成")
@@ -668,25 +678,40 @@ async def upload_through_server(
     expected = _sha256(sha256, required=False)
     arch_value = _arch(arch)
     file_name = clean_filename(upload.filename)
+    # 同名 ready 包先挡掉（只读，不动 release.artifacts）；真正的占名在传完之后的写事务里做
+    _ensure_name_free(release, file_name)
+    key = _storage_key(release, file_name)
+    # 安装包可能上百 MB，传对象存储要很久：传之前先结束读事务、把数据库连接还回去。
+    # 以前是先 _claim_name（让位同名的 pending 单会 flush 一笔删除）再上传，整个上传期间都拿着 SQLite 的写锁
+    await release_connection(db)
     spool, size, actual = await _spool(upload)
     try:
         if size == 0:
             raise _error(422, "empty_file", "安装包是空的")
         if expected and expected != actual:
             raise _error(422, "sha256_mismatch", "服务器算出来的 sha256 和填的不一样，文件可能传坏了")
-        doomed = await _claim_name(db, release, file_name)
-        key = _storage_key(release, file_name)
         await asyncio.to_thread(storage.put_object, key, spool, storage.OCTET_STREAM)
     finally:
         spool.close()
-    release.artifacts.append(
-        AppReleaseArtifact(
-            source="upload", status="ready", file_name=file_name, storage_key=key, size=size, sha256=actual,
-            arch=arch_value, signature=(signature or "").strip() or None,
+    try:
+        # 上传期间版本可能被改过（别人传了同名包、删了版本）：重新读一遍再占名、记账，一个短事务提交
+        release = await db.get(AppRelease, release_id, populate_existing=True)
+        if release is None:
+            raise _error(404, "release_not_found", "版本不存在")
+        doomed = await _claim_name(db, release, file_name)
+        release.artifacts.append(
+            AppReleaseArtifact(
+                source="upload", status="ready", file_name=file_name, storage_key=key, size=size, sha256=actual,
+                arch=arch_value, signature=(signature or "").strip() or None,
+            )
         )
-    )
-    await _audit(db, actor, "release.artifact.add", release.id, {"version": release.version, "file_name": file_name, "size": size, "source": "upload"})
-    await db.commit()
+        await _audit(db, actor, "release.artifact.add", release.id, {"version": release.version, "file_name": file_name, "size": size, "source": "upload"})
+        await db.commit()
+    except BaseException:
+        # 没记上账：刚传上去的对象删掉（key 带随机段，不会误删别人的）
+        await db.rollback()
+        await asyncio.to_thread(storage.delete_objects, [key])
+        raise
     if doomed:
         await asyncio.to_thread(storage.delete_objects, doomed)
     if release.published:

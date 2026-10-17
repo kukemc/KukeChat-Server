@@ -11,6 +11,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.core.database import release_connection
 from app.models.poll import GroupEmoji
 from app.models.sticker import StickerAsset
 from app.models.user import User
@@ -66,7 +67,7 @@ async def list_emojis(db: AsyncSession, conversation_id: int, user_id: int) -> l
     return [(emoji, asset) for emoji, asset in rows.all()]
 
 
-async def _ensure_image_allowed(actor: User, asset: StickerAsset, conversation_id: int) -> None:
+async def _ensure_image_allowed(actor: User, storage_path: str, conversation_id: int) -> None:
     """群表情全群可见，先过图片审核。只有明确违规才拒绝；审核服务不可用时放行。"""
     if not settings.content_moderation_enabled or actor.content_moderation_whitelisted:
         return
@@ -74,7 +75,7 @@ async def _ensure_image_allowed(actor: User, asset: StickerAsset, conversation_i
 
     try:
         result = await moderation_service._call_image_moderation_for_user(
-            public_url_for_key(asset.storage_path), actor.id, context_id=f"group_emoji:{conversation_id}"
+            public_url_for_key(storage_path), actor.id, context_id=f"group_emoji:{conversation_id}"
         )
         decision = moderation_service._normalize_result(result, "image")["decision"]
     except Exception:
@@ -101,26 +102,28 @@ async def create_emoji(db: AsyncSession, conversation_id: int, actor: User, name
         raise _error("invalid_emoji_image", "表情图片必须是已上传的图片") from exc
     async with sticker_service._source_lock(source_path):
         asset = await sticker_service._get_sticker_asset(db, source_path)
+        # 下面取图、压缩、过图片审核都要等网络（对象存储、审核服务，几秒到几十秒）：先结束读事务、把数据库连接还回去，
+        # 网络都做完了再写。以前是先插入 StickerAsset 并 flush 再去等这些，整段时间都拿着 SQLite 的写锁
+        await release_connection(db)
         if asset is None:
             storage_path, content_type = await run_image_worker(sticker_service._resolve_source, source_path)
-            asset = StickerAsset(
-                source_path=source_path,
-                storage_path=storage_path,
-                content_type=content_type if storage_path == source_path else sticker_service.COMPRESSED_STICKER_CONTENT_TYPE,
-            )
-            db.add(asset)
-            await db.flush()
+            if storage_path != source_path:
+                content_type = sticker_service.COMPRESSED_STICKER_CONTENT_TYPE
+        else:
+            storage_path, content_type = asset.storage_path, asset.content_type
         try:
-            stored = await run_image_worker(get_object, asset.storage_path, MAX_EMOJI_BYTES)
+            stored = await run_image_worker(get_object, storage_path, MAX_EMOJI_BYTES)
         except HTTPException as exc:
-            await db.rollback()
             if exc.status_code == status.HTTP_413_REQUEST_ENTITY_TOO_LARGE:
                 raise _error("emoji_too_large", "表情图片不能超过 1MB", status.HTTP_413_REQUEST_ENTITY_TOO_LARGE) from exc
             raise
         if len(stored.data) > MAX_EMOJI_BYTES:
-            await db.rollback()
             raise _error("emoji_too_large", "表情图片不能超过 1MB", status.HTTP_413_REQUEST_ENTITY_TOO_LARGE)
-        await _ensure_image_allowed(actor, asset, conversation_id)
+        await _ensure_image_allowed(actor, storage_path, conversation_id)
+        if asset is None:
+            asset = StickerAsset(source_path=source_path, storage_path=storage_path, content_type=content_type)
+            db.add(asset)
+            await db.flush()
         emoji = GroupEmoji(conversation_id=conversation_id, name=cleaned, asset_id=asset.id, created_by_id=actor.id)
         db.add(emoji)
         try:

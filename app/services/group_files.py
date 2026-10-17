@@ -34,7 +34,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import group_plus_tiers as tiers
-from app.core.database import AsyncSessionLocal
+from app.core.database import AsyncSessionLocal, release_connection
 from app.models.conversation import Conversation, ConversationMember
 from app.models.enums import ConversationType, MemberRole, MessageType
 from app.models.group_plus import GroupFile, GroupFileFolder, GroupFileUpload
@@ -435,6 +435,9 @@ async def upload_file(
     name = clean_filename(upload.filename)
     content_type = _clean_content_type(upload.content_type)
     quota = await quota_of(db, conversation, now)
+    # 读上传内容、传对象存储可能要几十秒（文件大）：先结束读事务、把数据库连接还回去。
+    # 下面 _commit_file 会在写事务里按那时的剩余空间重新定一遍，这里读到的 quota 只用来挡明显超限的
+    await release_connection(db)
     spool, size = await _spool(upload, quota["max_file_bytes"])
     try:
         _check_size(quota, size)
@@ -544,9 +547,12 @@ async def complete_upload(
         # 开单之后可能被禁言了、群升级到期了：不让落库，传上去的对象删掉
         conversation, _is_staff, _at = await _uploadable(db, user, conversation_id)
     except HTTPException:
+        await release_connection(db)
         await asyncio.to_thread(storage.delete_objects, [key])
         await _drop_upload(db, upload_id)
         raise
+    # 下面要去对象存储核对（网络）：先结束读事务、把连接还回去
+    await release_connection(db)
     stored_size = await asyncio.to_thread(storage.object_size, key)
     if stored_size is None:
         raise _error(status.HTTP_409_CONFLICT, "upload_incomplete", "文件还没传完")
@@ -605,6 +611,8 @@ async def download(db: AsyncSession, user_id: int, conversation_id: int, file_id
     path = storage.local_path_for_key(key)
     if path is not None:
         return FileResponse(path, media_type="application/octet-stream", headers=headers)
+    # 从对象存储整份读下来可能要很久（文件大）：先结束读事务、把连接还回去
+    await release_connection(db)
     try:
         stored = await asyncio.to_thread(storage.get_object, key)
     except HTTPException:
