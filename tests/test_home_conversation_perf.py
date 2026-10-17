@@ -15,6 +15,7 @@ from app.models.message import Message, MessageVisibility
 from app.models.user import User
 from app.services import home, response_cache
 from app.services.conversations import build_conversation_reads
+from pg_redirect import requires_sqlite
 
 
 class _SharedFakeRedis:
@@ -90,6 +91,7 @@ class HomeConversationPerfTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(reads[0].last_message)
             self.assertEqual(reads[0].unread_count, 0)
 
+    @requires_sqlite
     async def test_latest_query_uses_conversation_message_index(self):
         # Synthetic SQLite EXPLAIN only: never open local/production database files.
         # 两种边界：可见历史、以及清空游标后的空历史（执行计划与数据量无关）。
@@ -151,6 +153,7 @@ class HomeConversationPerfTests(unittest.IsolatedAsyncioTestCase):
                         latest = reads[0].last_message
                         self.assertEqual(latest.id if latest else None, messages[3].id if cleared is None or cleared < messages[3].id else None)
 
+    @requires_sqlite
     async def test_unread_correlated_count_uses_range_and_many_groups(self):
         async with self.sessions() as db:
             viewer, peer = User(username="many_reader", hashed_password="x"), User(username="many_writer", hashed_password="x")

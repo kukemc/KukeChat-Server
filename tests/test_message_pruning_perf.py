@@ -14,6 +14,7 @@ from app.models.message import Message, MessageBookmark, MessageReaction
 from app.models.report import UserReport
 from app.models.user import User
 from app.services import messages as message_service
+from pg_redirect import requires_sqlite
 
 
 class MessagePruningTests(unittest.IsolatedAsyncioTestCase):
@@ -27,7 +28,8 @@ class MessagePruningTests(unittest.IsolatedAsyncioTestCase):
 
         @event.listens_for(self.engine.sync_engine, "connect")
         def enable_foreign_keys(connection, _record):
-            connection.execute("PRAGMA foreign_keys=ON")
+            if "sqlite" in type(connection).__module__:  # PG（tests/conftest.py）上外键总是生效的
+                connection.execute("PRAGMA foreign_keys=ON")
 
         self.sessions = async_sessionmaker(self.engine, expire_on_commit=False)
         async with self.engine.begin() as connection:
@@ -37,7 +39,7 @@ class MessagePruningTests(unittest.IsolatedAsyncioTestCase):
                         Message.__table__, MessageReaction.__table__, MessageBookmark.__table__,
                         UserReport.__table__],
             )
-            await connection.execute(text("CREATE INDEX ix_messages_conversation_id_id ON messages (conversation_id, id)"))
+            await connection.execute(text("CREATE INDEX IF NOT EXISTS ix_messages_conversation_id_id ON messages (conversation_id, id)"))
         async with self.sessions() as db:
             user = User(username="prune-user", hashed_password="x")
             chats = [Conversation(type=ConversationType.DIRECT), Conversation(type=ConversationType.DIRECT)]
@@ -120,6 +122,7 @@ class MessagePruningTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone((await db.execute(select(Message.id).where(Message.conversation_id == second))).scalar_one())
             self.assertFalse(hasattr(message_service, "schedule_delete_upload_files"))
 
+    @requires_sqlite
     async def test_indexed_cutoff_avoids_table_scan(self) -> None:
         async with self.sessions() as db:
             plan = await db.execute(text(

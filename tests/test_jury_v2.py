@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException
-from sqlalchemy import event, select
+from sqlalchemy import event, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 import app.models  # noqa: F401
@@ -106,8 +106,12 @@ class JuryV2TestCase(unittest.IsolatedAsyncioTestCase):
             db.add(post)
             for name in JURORS:
                 db.add(JuryMember(user_id=self.ids[name], status="active", term_ends_at=datetime.now(UTC) + timedelta(days=30)))
-            # 占位用的分配记录：不属于任何委员，指向一个不存在的案件
-            db.add(JuryVote(id=REVIEW_ID_OFFSET, case_id=0, juror_id=self.ids["admin"], vote="recuse", recused_at=datetime.now(UTC) - timedelta(days=365)))
+            if db.get_bind().dialect.name == "postgresql":
+                # PG 严格执行外键，也不会因为插了显式 id 就推进自增序列：直接把序列拨到偏移量上，效果和下面的占位记录一样
+                await db.execute(text("SELECT setval(pg_get_serial_sequence('jury_votes', 'id'), :n)"), {"n": REVIEW_ID_OFFSET})
+            else:
+                # 占位用的分配记录：不属于任何委员，指向一个不存在的案件
+                db.add(JuryVote(id=REVIEW_ID_OFFSET, case_id=0, juror_id=self.ids["admin"], vote="recuse", recused_at=datetime.now(UTC) - timedelta(days=365)))
             await db.commit()
             self.post_id = post.id
 

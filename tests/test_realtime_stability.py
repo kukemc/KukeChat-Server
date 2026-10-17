@@ -24,6 +24,7 @@ from app.models.user import User
 from app.services import task as task_service
 from app.websocket import routes
 from app.websocket.manager import ConnectionManager, GameConnectionManager, WEBSOCKET_SEND_QUEUE_SIZE
+from pg_redirect import requires_sqlite
 
 
 class FakeWebSocket:
@@ -166,6 +167,7 @@ class RealtimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await channel.online_user_ids_among([2, 3]), {2})
         self.assertEqual(redis.smembers_calls, 0)
 
+    @requires_sqlite
     async def test_sqlite_legacy_parameter_limit_batches_large_group_presence(self):
         engine = create_async_engine("sqlite+aiosqlite:///:memory:")
         sessions = async_sessionmaker(engine, expire_on_commit=False)

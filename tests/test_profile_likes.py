@@ -27,6 +27,7 @@ from app.models.profile_like import ProfileLike
 from app.models.user import User
 from app.schemas.user import UserPublic, UserRead
 from app.services import profile_likes as like_service
+from pg_redirect import requires_sqlite
 
 # 只建用得到的表：点赞本身只碰前两张，后两张是冒烟测试里 /users/{id}/level 要读的
 TABLES = [Base.metadata.tables[name] for name in ("users", "profile_likes", "account_level_days", "system_settings")]
@@ -283,7 +284,8 @@ class LikeServiceTests(LikeTestCase):
             self.assertEqual((await self._state(db, "carol", "bob"))["like_count"], 6)
             updates = [statement for statement in seen if statement.startswith("UPDATE users")]
             self.assertEqual(len(updates), 1)
-            self.assertIn("profile_like_count=(users.profile_like_count + ?)", updates[0])
+            # 占位符 SQLite 是 ?，PG 是 $1::INTEGER
+            self.assertRegex(updates[0], r"profile_like_count=\(users\.profile_like_count \+ (\?|\$\d+::INTEGER)\)")
             # 明细在前、计数在后，同一个事务
             kinds = [statement.split()[0] for statement in seen]
             self.assertLess(kinds.index("INSERT"), kinds.index("UPDATE"))
@@ -530,7 +532,8 @@ class LikeStorageTests(unittest.IsolatedAsyncioTestCase):
         await self._attempt("carol", "bob")
         await self._attempt("bob", "dave")
         async with self.sessions() as db:
-            self.assertEqual((await db.execute(text("PRAGMA foreign_keys"))).scalar(), 1)
+            if db.get_bind().dialect.name == "sqlite":
+                self.assertEqual((await db.execute(text("PRAGMA foreign_keys"))).scalar(), 1)
             # 点赞人注销：他点的那一行跟着没，对方的累计数不减（只增不减）
             await db.execute(text("DELETE FROM users WHERE id = :id"), {"id": self.ids["alice"]})
             await db.commit()
@@ -543,6 +546,7 @@ class LikeStorageTests(unittest.IsolatedAsyncioTestCase):
             await db.commit()
             self.assertEqual(int(await db.scalar(select(func.count(ProfileLike.id)))), 0)
 
+    @requires_sqlite
     async def test_schema_has_the_unique_constraint_and_both_indexes(self) -> None:
         async with self.sessions() as db:
             indexes = {row[1]: bool(row[2]) for row in (await db.execute(text("PRAGMA index_list(profile_likes)"))).all()}
@@ -575,6 +579,7 @@ class LikeStorageTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("TEMP B-TREE", plans[2])
 
 
+@requires_sqlite
 class InitDbTests(unittest.IsolatedAsyncioTestCase):
     async def test_init_db_adds_the_column_and_table_to_an_existing_database(self) -> None:
         """老库：users 上没有 profile_like_count，也没有 profile_likes 表。init_db 补上，重复执行无害。"""

@@ -16,17 +16,17 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 from fastapi import Depends, FastAPI
-from sqlalchemy import event, func, select
-from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy import event, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 import app.models  # noqa: F401
+from app.core.dialect import upsert_insert
 from app.api.v1.router import api_router
 from app.core.config import settings
 from app.core.database import Base, get_db
 from app.core.dependencies import get_current_user
 from app.models.account_level import AccountLevelDay, AccountLevelNotification
-from app.models.case import JuryMember, JuryNotification, JuryReviewVote, JuryVote
+from app.models.case import JuryMember, JuryNotification, JuryReview, JuryReviewVote, JuryVote, ReportCase
 from app.models.conversation import Conversation
 from app.models.enums import ConversationType, MessageType, PlatformRole, UserStatus
 from app.models.group_activity import GroupCheckin, GroupMemberDailyActivity
@@ -54,7 +54,9 @@ TABLES = [
         GroupMemberDailyActivity,
         GroupCheckin,
         JuryMember,
+        ReportCase,
         JuryVote,
+        JuryReview,
         JuryReviewVote,
         SystemSetting,
         AdminAuditLog,
@@ -206,6 +208,15 @@ class AccountLevelTestCase(unittest.IsolatedAsyncioTestCase):
             await db.commit()
             self.ids = {user.username: user.id for user in users}
             self.group_id, self.other_group_id, self.direct_id = group.id, other_group.id, direct.id
+            # 下面的测试里委员的票指向案件 1、2，复审票指向复审 1：先把它们建出来（PG 严格执行外键，SQLite 测试库不查）
+            db.add_all([ReportCase(id=case_id, target_key=f"message:{case_id}", target_type="message", target_id=case_id) for case_id in (1, 2)])
+            db.add(JuryReview(id=1, kind="appeal", requester_id=users[0].id, expires_at=local(D + timedelta(days=3))))
+            await db.commit()
+            if db.get_bind().dialect.name == "postgresql":
+                # 显式给的 id 不会推进 PG 的自增序列
+                for table, last in (("report_cases", 2), ("jury_reviews", 1)):
+                    await db.execute(text(f"SELECT setval(pg_get_serial_sequence('{table}', 'id'), {last})"))
+                await db.commit()
 
     async def _create_tables(self) -> None:
         async with self.engine.begin() as connection:
@@ -222,7 +233,7 @@ class AccountLevelTestCase(unittest.IsolatedAsyncioTestCase):
     async def _minutes(self, db: AsyncSession, name: str, day: date, minutes: int) -> None:
         """直接把某天的在线分钟设成这个数（不经过在线循环）。"""
         now = local(day, 0, 0)
-        statement = sqlite_insert(DAY).values(user_id=self.ids[name], day=day, online_minutes=minutes, last_slot=0, created_at=now, updated_at=now)
+        statement = upsert_insert(db, DAY).values(user_id=self.ids[name], day=day, online_minutes=minutes, last_slot=0, created_at=now, updated_at=now)
         await db.execute(statement.on_conflict_do_update(index_elements=[DAY.c.user_id, DAY.c.day], set_={"online_minutes": minutes}))
         await db.commit()
 
@@ -336,6 +347,9 @@ class TwoWorkerTests(unittest.IsolatedAsyncioTestCase):
         url = f"sqlite+aiosqlite:///{Path(self.directory, 'level.db').as_posix()}"
         self.engines = [create_async_engine(url, connect_args={"timeout": 15}) for _ in range(2)]
         for engine in self.engines:
+            if engine.dialect.name != "sqlite":
+                # 测试跑在 PostgreSQL 上时（tests/conftest.py）两个引擎连同一个 schema，不需要 PRAGMA
+                continue
 
             @event.listens_for(engine.sync_engine, "connect")
             def _configure(dbapi_connection, _record) -> None:
