@@ -14,7 +14,11 @@ class Settings(BaseSettings):
     app_name: str = "KukeChat API"
     # Opt in for bounded, anonymized HTTP ASGI byte/latency logs per worker.
     transport_metrics_enabled: bool = False
+    # SQLite：sqlite+aiosqlite:///./kukechat.db；PostgreSQL：postgresql+asyncpg://用户:密码@127.0.0.1:5432/库名
     database_url: str = "sqlite+aiosqlite:///./kukechat.db"
+    # 只对 PostgreSQL 生效：每个 worker 的连接池大小 / 溢出上限（两个 worker 就是两倍）
+    database_pool_size: int = 10
+    database_max_overflow: int = 10
     # 没有默认值：缺失或仍是占位值时启动即失败，见下方 validator。
     # 一个可预测的签名密钥等于任何人都能伪造任意用户的令牌。
     jwt_secret_key: str = Field(default="")

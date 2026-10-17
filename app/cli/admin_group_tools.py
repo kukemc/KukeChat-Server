@@ -21,7 +21,7 @@ import asyncio
 import sys
 from typing import Any
 
-from sqlalchemy import func, select, text
+from sqlalchemy import func, inspect, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import group_plus_tiers as tiers
@@ -55,8 +55,15 @@ async def _member_count(db: AsyncSession, conversation_id: int) -> int:
 
 async def _check_schema(db: AsyncSession) -> None:
     """新列要等新版本的后端启动过一次（init_db 会补上）才有。没有就别往下走。"""
-    columns = {row[1] for row in await db.execute(text("PRAGMA table_info(conversations)"))}
-    tables = {row[0] for row in await db.execute(text("SELECT name FROM sqlite_master WHERE type='table'"))}
+    connection = await db.connection()
+
+    def _snapshot(sync_conn: Any) -> tuple[set[str], set[str]]:
+        inspector = inspect(sync_conn)
+        tables = set(inspector.get_table_names())
+        columns = {column["name"] for column in inspector.get_columns("conversations")} if "conversations" in tables else set()
+        return tables, columns
+
+    tables, columns = await connection.run_sync(_snapshot)
     missing = []
     if "member_limit_override" not in columns:
         missing.append("conversations.member_limit_override")

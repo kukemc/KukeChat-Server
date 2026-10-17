@@ -13,6 +13,7 @@ from sqlalchemy.orm import joinedload
 from app.core import group_levels
 from app.core.config import settings
 from app.core.database import release_connection
+from app.core.dialect import greatest
 from app.models.conversation import Conversation, ConversationMember, GroupAnnouncement, GroupJoinRequest, TemporaryConversationBlock
 from app.models.enums import ConversationType, GroupJoinRequestStatus, MemberRole
 from app.models.friend import Friendship
@@ -1447,7 +1448,7 @@ async def build_conversation_reads(db: AsyncSession, conversations: list[Convers
             Message.conversation_id == ConversationMember.conversation_id,
             Message.sender_id != current_user_id,
             Message.id.not_in(hidden_message_ids),
-            Message.id > func.max(
+            Message.id > greatest(
                 func.coalesce(ConversationMember.last_read_message_id, 0),
                 func.coalesce(ConversationMember.cleared_before_message_id, 0),
             ),
