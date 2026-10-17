@@ -24,6 +24,7 @@ from app.schemas.message import MessageRead
 from app.schemas.poll import (
     GroupEmojiCreate,
     GroupEmojiRead,
+    GroupEmojiOrder,
     GroupEmojiUpdate,
     PollCreate,
     PollState,
@@ -191,6 +192,20 @@ async def rename_group_emoji(
     emoji, asset = await emoji_service.rename_emoji(db, conversation_id, emoji_id, current_user, payload.name)
     await _notify_emojis_changed(db, conversation_id)
     return emoji_service.build_read(emoji, asset, request)
+
+
+@router.put("/{conversation_id}/emojis/order", response_model=list[GroupEmojiRead])
+async def reorder_group_emojis(
+    conversation_id: int,
+    payload: GroupEmojiOrder,
+    request: Request,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> list[GroupEmojiRead]:
+    await emoji_service.reorder_emojis(db, conversation_id, current_user, payload.emoji_ids)
+    await _notify_emojis_changed(db, conversation_id)
+    items = await emoji_service.list_emojis(db, conversation_id, current_user.id)
+    return [emoji_service.build_read(emoji, asset, request) for emoji, asset in items]
 
 
 @router.delete("/{conversation_id}/emojis/{emoji_id}", response_model=MessageResponse)

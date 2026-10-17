@@ -21,7 +21,7 @@ from app.services.storage import get_object, public_url_for_key, run_image_worke
 
 MAX_EMOJIS_PER_GROUP = 60
 MAX_EMOJI_NAME_LENGTH = 12
-MAX_EMOJI_BYTES = 512 * 1024
+MAX_EMOJI_BYTES = 1024 * 1024
 
 
 def _error(code: str, message: str, status_code: int = status.HTTP_422_UNPROCESSABLE_ENTITY) -> HTTPException:
@@ -61,7 +61,7 @@ async def list_emojis(db: AsyncSession, conversation_id: int, user_id: int) -> l
         select(GroupEmoji, StickerAsset)
         .join(StickerAsset, StickerAsset.id == GroupEmoji.asset_id)
         .where(GroupEmoji.conversation_id == conversation_id)
-        .order_by(GroupEmoji.id.asc())
+        .order_by(GroupEmoji.sort_order.is_(None), GroupEmoji.sort_order.asc(), GroupEmoji.id.asc())
     )
     return [(emoji, asset) for emoji, asset in rows.all()]
 
@@ -115,11 +115,11 @@ async def create_emoji(db: AsyncSession, conversation_id: int, actor: User, name
         except HTTPException as exc:
             await db.rollback()
             if exc.status_code == status.HTTP_413_REQUEST_ENTITY_TOO_LARGE:
-                raise _error("emoji_too_large", "表情图片不能超过 512KB", status.HTTP_413_REQUEST_ENTITY_TOO_LARGE) from exc
+                raise _error("emoji_too_large", "表情图片不能超过 1MB", status.HTTP_413_REQUEST_ENTITY_TOO_LARGE) from exc
             raise
         if len(stored.data) > MAX_EMOJI_BYTES:
             await db.rollback()
-            raise _error("emoji_too_large", "表情图片不能超过 512KB", status.HTTP_413_REQUEST_ENTITY_TOO_LARGE)
+            raise _error("emoji_too_large", "表情图片不能超过 1MB", status.HTTP_413_REQUEST_ENTITY_TOO_LARGE)
         await _ensure_image_allowed(actor, asset, conversation_id)
         emoji = GroupEmoji(conversation_id=conversation_id, name=cleaned, asset_id=asset.id, created_by_id=actor.id)
         db.add(emoji)
@@ -157,6 +157,18 @@ async def rename_emoji(db: AsyncSession, conversation_id: int, emoji_id: int, ac
     asset = await db.get(StickerAsset, emoji.asset_id)
     assert asset is not None
     return emoji, asset
+
+
+async def reorder_emojis(db: AsyncSession, conversation_id: int, actor: User, emoji_ids: list[int]) -> None:
+    """按给定顺序重排。列表必须正好是这个群当前全部表情（防止并发增删时把别人刚加的那张挤丢）。"""
+    await _require_staff(db, conversation_id, actor.id)
+    emojis = list((await db.execute(select(GroupEmoji).where(GroupEmoji.conversation_id == conversation_id))).scalars().all())
+    if len(set(emoji_ids)) != len(emoji_ids) or set(emoji_ids) != {emoji.id for emoji in emojis}:
+        raise _error("emoji_order_mismatch", "表情列表已经变了，请刷新后再排序", status.HTTP_409_CONFLICT)
+    position = {emoji_id: index for index, emoji_id in enumerate(emoji_ids)}
+    for emoji in emojis:
+        emoji.sort_order = position[emoji.id]
+    await db.commit()
 
 
 async def delete_emoji(db: AsyncSession, conversation_id: int, emoji_id: int, actor: User) -> None:

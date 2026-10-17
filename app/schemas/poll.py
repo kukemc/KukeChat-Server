@@ -60,5 +60,10 @@ class GroupEmojiCreate(BaseModel):
     image_url: str = Field(max_length=500)
 
 
+class GroupEmojiOrder(BaseModel):
+    # 这个群全部表情的 id，按想要的顺序；必须一个不多一个不少
+    emoji_ids: list[int] = Field(min_length=1, max_length=200)
+
+
 class GroupEmojiUpdate(BaseModel):
     name: str

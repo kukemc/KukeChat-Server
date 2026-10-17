@@ -826,6 +826,8 @@ async def init_db() -> None:
             for table_name, column_name, column_sql in (
                 ("red_packets", "chain_text", "chain_text VARCHAR(60)"),
                 ("red_packets", "target_user_id", "target_user_id INTEGER"),
+                # 群表情手动排序（docs/chat-features.md 群表情一节）
+                ("group_emojis", "sort_order", "sort_order INTEGER"),
             ):
                 if table_name not in table_names:
                     continue

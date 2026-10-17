@@ -59,4 +59,6 @@ class GroupEmoji(Base):
     name: Mapped[str] = mapped_column(String(24))
     asset_id: Mapped[int] = mapped_column(ForeignKey("sticker_assets.id", ondelete="CASCADE"))
     created_by_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # 群主 / 管理员手动排过序后才有值；没排过（或排序之后新加）的为 null，排在后面、按添加顺序
+    sort_order: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)

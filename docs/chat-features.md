@@ -137,9 +137,9 @@
 上传分两步：先用现有的 `POST /uploads/message-image` 上传图片，再把返回的地址作为 `image_url` 提交。服务端会把图片另存一份（和收藏表情同一套机制），之后与原图无关。
 
 - 名称 1–12 字，同群不重复，空格会被去掉。
-- 每个群最多 60 个；单张最终不超过 512KB；png / jpg / webp / gif。**非 GIF 图片会被转成 JPEG**（透明底会变成不透明），GIF 保留动画原样保存 —— 这是上传链路现有的行为。
+- 每个群最多 60 个；单张最终不超过 1MB；png / jpg / webp / gif。**非 GIF 图片会被转成 JPEG**（透明底会变成不透明），GIF 保留动画原样保存 —— 这是上传链路现有的行为。
 - 图片会过图片审核，明确违规的拒绝。
-- 没有排序接口，顺序就是添加顺序。
+- 排序：`PUT /conversations/{cid}/emojis/order`，群主 / 管理员，body `{ emoji_ids: [...] }` 必须正好是当前全部表情的 id（多了、少了、重复都返回 409 `emoji_order_mismatch`，客户端刷新后重试），返回排好的 `GroupEmojiRead[]`，并推 `conversation.emojis.updated`。没排过序的和排序之后新加的排在后面，按添加顺序。
 - 只做群聊；私聊调用返回 400。
 
 错误：
@@ -151,7 +151,7 @@
 | 409 | `emoji_name_taken` | 同群已有同名表情 |
 | 409 | `emoji_limit_reached` | 已达 60 个上限 |
 | 422 | `invalid_emoji_image` | `image_url` 不是已上传的图片 |
-| 413 | `emoji_too_large` | 超过 512KB |
+| 413 | `emoji_too_large` | 超过 1MB |
 | 422 | `emoji_rejected` | 图片未通过审核 |
 
 实时事件 `conversation.emojis.updated`：`{ "conversation_id": 5 }`，新增 / 改名 / 删除后发给群里的在线成员，收到后重拉列表。

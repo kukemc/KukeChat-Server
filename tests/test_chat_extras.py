@@ -281,9 +281,26 @@ class GroupEmojiTests(ChatExtrasBase):
                 await emoji_service.delete_emoji(db, self.group_id, second.id, owner)
                 self.assertEqual(len(await emoji_service.list_emojis(db, self.group_id, alice.id)), 1)
 
+    async def test_reorder(self) -> None:
+        resolve, fetch = self._storage()
+        with resolve, fetch:
+            async with self.sessions() as db:
+                owner, alice = await self._user(db, "owner"), await self._user(db, "alice")
+                ids = [(await emoji_service.create_emoji(db, self.group_id, owner, name, f"/uploads/messages/{name}.png"))[0].id for name in ("一", "二", "三")]
+                with self.assertRaises(HTTPException):
+                    await emoji_service.reorder_emojis(db, self.group_id, alice, list(reversed(ids)))
+                with self.assertRaises(HTTPException) as caught:
+                    await emoji_service.reorder_emojis(db, self.group_id, owner, ids[:2])
+                self.assertEqual(caught.exception.detail["code"], "emoji_order_mismatch")
+                await emoji_service.reorder_emojis(db, self.group_id, owner, [ids[2], ids[0], ids[1]])
+                # 排序之后新加的排在最后
+                await emoji_service.create_emoji(db, self.group_id, owner, "四", "/uploads/messages/四.png")
+                listed = await emoji_service.list_emojis(db, self.group_id, alice.id)
+                self.assertEqual([item.name for item, _ in listed], ["三", "一", "二", "四"])
+
     async def test_limits(self) -> None:
         resolve, _ = self._storage()
-        big = patch.object(emoji_service, "get_object", lambda key, max_bytes=None: StoredObject(data=b"x" * (600 * 1024), content_type="image/gif"))
+        big = patch.object(emoji_service, "get_object", lambda key, max_bytes=None: StoredObject(data=b"x" * (1100 * 1024), content_type="image/gif"))
         with resolve, big:
             async with self.sessions() as db:
                 owner = await self._user(db, "owner")
