@@ -4,7 +4,7 @@ import asyncio
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path, PurePosixPath
-from typing import BinaryIO, Callable
+from typing import Any, BinaryIO, Callable
 from urllib.parse import quote, unquote, urlsplit
 
 import boto3
@@ -399,6 +399,23 @@ def get_object(key: str, max_bytes: int | None = None) -> StoredObject:
     if file_path is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Stored object was not found")
     return StoredObject(data=_read_local_object(file_path, max_bytes), content_type=_content_type_for_key(normalized))
+
+
+def open_object_stream(key: str) -> tuple[Any, int | None] | None:
+    """打开对象存储里的对象、返回 (流, 字节数)，调用方分块读、读完 close。本地存储返回 None（走 FileResponse）。
+
+    大文件（群文件可能上百 MB）不能像 get_object 那样整份读进内存：几个人同时下载就能把内存吃光。
+    在线程里调用（会发网络请求）。对象不存在抛 404。
+    """
+    normalized = _normalize_key(key)
+    if settings.storage_backend != "s3":
+        return None
+    try:
+        response = _client_for(_bucket_for(normalized)).get_object(Bucket=_bucket_for(normalized), Key=normalized)
+    except (BotoCoreError, ClientError) as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Stored object was not found") from exc
+    length = response.get("ContentLength")
+    return response["Body"], int(length) if length is not None else None
 
 
 def _read_local_object(file_path: Path, max_bytes: int | None) -> bytes:

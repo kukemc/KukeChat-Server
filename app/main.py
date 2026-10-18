@@ -156,7 +156,8 @@ class UploadAwareGZipMiddleware(GZipMiddleware):
             and settings.storage_backend == "local"
             and path.startswith("/uploads/")
             and CachedUploadFiles.is_public_media_path(path[len("/uploads/"):])
-        ):
+        ) or (scope["type"] == "http" and path.endswith("/download")):
+            # 文件下载（群文件等）是二进制大文件：apk、视频压不小，gzip 只会在事件循环里白烧 CPU、多占一份内存
             await self.app(scope, receive, send)
             return
         await super().__call__(scope, receive, send)
