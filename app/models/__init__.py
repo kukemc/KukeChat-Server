@@ -16,6 +16,7 @@ from app.models.case import (
     ReportCase,
 )
 from app.models.bot import Bot, BotInstallation, BotReview, BotReviewLike, BotReviewReply
+from app.models.device import DeviceBan, DeviceSignal
 from app.models.conversation import Conversation, ConversationMember, GroupAnnouncement, GroupAnnouncementReceipt, GroupJoinRequest, TemporaryConversationBlock
 from app.models.friend import FriendRequest, Friendship
 from app.models.gift import Gift, GiftRecord
@@ -142,4 +143,6 @@ __all__ = [
     "AppRelease",
     "AppReleaseArtifact",
     "ReleaseApiToken",
+    "DeviceSignal",
+    "DeviceBan",
 ]

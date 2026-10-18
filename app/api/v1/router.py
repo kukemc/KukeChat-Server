@@ -94,3 +94,8 @@ api_router.include_router(releases.admin_router, prefix="/admin", tags=["admin"]
 from app.api.v1 import group_announcements  # noqa: E402
 
 api_router.include_router(group_announcements.router, prefix="/conversations", tags=["conversations"])
+
+# 防小号：设备信号与设备封禁（docs/device-bans.md）。后台 /admin/users/{id}/devices、/admin/device-bans/...
+from app.api.v1 import admin_devices  # noqa: E402
+
+api_router.include_router(admin_devices.router, prefix="/admin", tags=["admin"])

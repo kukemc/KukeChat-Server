@@ -15,9 +15,10 @@ import app.models  # noqa: F401
 from app.api.v1 import auth as auth_routes
 from app.core.config import settings
 from app.core.database import Base, get_db
+from app.models.device import DeviceBan
 from app.models.enums import UserStatus
 from app.models.user import AuthSession, User
-from app.services import auth
+from app.services import auth, device_bans
 
 UTC = timezone.utc
 START = datetime(2030, 1, 1, tzinfo=UTC)
@@ -32,7 +33,9 @@ class CookieSessionWriteLoadTests(unittest.IsolatedAsyncioTestCase):
         self.engine = create_async_engine("sqlite+aiosqlite:///:memory:")
         self.sessions = async_sessionmaker(self.engine, expire_on_commit=False)
         async with self.engine.begin() as connection:
-            await connection.run_sync(Base.metadata.create_all, tables=[User.__table__, AuthSession.__table__])
+            # device_bans：/auth/session 会查设备封禁（进程内缓存，30 秒才重读一次）
+            await connection.run_sync(Base.metadata.create_all, tables=[User.__table__, AuthSession.__table__, DeviceBan.__table__])
+        device_bans.reset_cache()
         async with self.sessions() as db:
             user = User(username="cookie_reader", hashed_password="unused", nickname="initial")
             db.add(user)

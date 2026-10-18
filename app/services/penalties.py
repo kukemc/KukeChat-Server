@@ -297,6 +297,10 @@ async def record_violation(
     elif penalty.kind == "ban":
         ends_at = await _apply_ban(db, user, penalty.hours, text_reason, now)
         banned = True
+        # 设置打开时把这个账号的设备令牌、机器码一起封（docs/device-bans.md 第 5 节，默认关）
+        from app.services import device_bans
+
+        await device_bans.propagate_account_ban(db, user)
 
     violation = UserViolation(
         user_id=user_id,
@@ -681,6 +685,10 @@ async def lift_ban(db: AsyncSession, user: User, *, actor_id: int | None) -> Non
     user.banned_until = None
     user.banned_at = None
     user.ban_reason = None
+    # 当初随账号封禁自动带上的设备封禁一起解除
+    from app.services import device_bans
+
+    await device_bans.lift_propagated(db, user.id, actor_id)
 
 
 async def lift_mute(db: AsyncSession, user: User) -> None:

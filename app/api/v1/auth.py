@@ -9,8 +9,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.core.config import settings
 from app.core.dependencies import get_current_user
+from app.core.device import context_for_request
 from app.models.user import User
 from app.schemas.auth import AccountLookupRead, CcwPasswordChallengeCreate, CcwPasswordChallengeRead, CcwPasswordChangeConfirm, CcwPasswordResetConfirm, CookieSessionRead, IpLoginStatus, PasswordResetRequestCreate, PasswordResetRequestRead, Token, UserLogin, UserRegister
+from app.schemas.device import DeviceIssueRead
 from app.schemas.user import UserRead
 from app.services.auth import CCW_PASSWORD_CHALLENGE_MINUTES, confirm_ccw_password_challenge, cookie_login_user, create_ccw_password_challenge, create_password_reset_request, ensure_aware_utc, get_cookie_session_user, get_user_by_username_or_email, login_user, lookup_account, register_user, revoke_cookie_session
 from app.websocket.manager import admin_manager
@@ -35,14 +37,25 @@ def get_client_ip(request: Request) -> str:
     return "unknown"
 
 
+@router.get("/device", response_model=DeviceIssueRead)
+async def device(request: Request) -> DeviceIssueRead:
+    """拿设备令牌（docs/device-bans.md 第 1 节）。带了有效令牌原样返回；没带就发一个新的（响应头 X-Kuke-Device-Issue 里也有）。
+    客户端启动时手里没有令牌就调一次，保证第一次注册就带着令牌。不查库。"""
+    context = context_for_request(request)
+    token = request.headers.get("x-kuke-device", "").strip()
+    if context.has_device:
+        return DeviceIssueRead(device=token, issued=False)
+    return DeviceIssueRead(device=context.ensure_issued(), issued=True)
+
+
 @router.post("/register", response_model=Token, status_code=201)
 async def register(payload: UserRegister, request: Request, db: Annotated[AsyncSession, Depends(get_db)]) -> Token:
-    return await register_user(db, payload, get_client_ip(request))
+    return await register_user(db, payload, get_client_ip(request), context_for_request(request))
 
 
 @router.post("/login", response_model=Token)
 async def login(payload: UserLogin, request: Request, db: Annotated[AsyncSession, Depends(get_db)]) -> Token:
-    return await login_user(db, payload, get_client_ip(request))
+    return await login_user(db, payload, get_client_ip(request), context_for_request(request))
 
 
 def set_session_cookie(response: Response, token: str, max_age: int | None) -> None:
@@ -60,7 +73,9 @@ def set_session_cookie(response: Response, token: str, max_age: int | None) -> N
 
 @router.post("/cookie-login", response_model=CookieSessionRead)
 async def cookie_login(payload: UserLogin, request: Request, response: Response, db: Annotated[AsyncSession, Depends(get_db)]) -> CookieSessionRead:
-    raw_token, session = await cookie_login_user(db, payload, get_client_ip(request), request.headers.get("user-agent"), settings.cookie_session_days)
+    raw_token, session = await cookie_login_user(
+        db, payload, get_client_ip(request), request.headers.get("user-agent"), settings.cookie_session_days, context_for_request(request)
+    )
     max_age = settings.cookie_session_days * 24 * 60 * 60 if payload.remember_me else None
     set_session_cookie(response, raw_token, max_age)
     return session
@@ -68,7 +83,9 @@ async def cookie_login(payload: UserLogin, request: Request, response: Response,
 
 @router.get("/session", response_model=CookieSessionRead)
 async def session(request: Request, db: Annotated[AsyncSession, Depends(get_db)]) -> CookieSessionRead:
-    return await get_cookie_session_user(db, request.cookies.get(settings.cookie_session_name), get_client_ip(request), request.headers.get("user-agent"))
+    return await get_cookie_session_user(
+        db, request.cookies.get(settings.cookie_session_name), get_client_ip(request), request.headers.get("user-agent"), context_for_request(request)
+    )
 
 
 @router.post("/session/logout")

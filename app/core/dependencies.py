@@ -2,15 +2,17 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import Depends, Header, HTTPException, status
+from fastapi import Depends, Header, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import bot_rate_limit
 from app.core.database import get_db, release_connection
+from app.core.device import context_for_request
 from app.core.security import decode_access_token
 from app.models.enums import PlatformRole
 from app.models.user import User
+from app.services import device_bans
 from app.services.auth import APPEAL_TOKEN_SCOPE, ensure_user_not_disabled, get_user_by_id
 from app.services.bots import BotContext, authenticate_bot_key
 
@@ -38,10 +40,14 @@ async def get_current_user_from_token(db: AsyncSession, token: str) -> User:
 
 
 async def get_current_user(
+    request: Request,
     credentials: Annotated[HTTPAuthorizationCredentials, Depends(bearer_scheme)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> User:
-    return await get_current_user_from_token(db, credentials.credentials)
+    user = await get_current_user_from_token(db, credentials.credentials)
+    # 设备封禁（docs/device-bans.md）：查的是进程内缓存；信号只在内存里记一笔，后台循环合并写库
+    await device_bans.guard_request(db, context_for_request(request), user)
+    return user
 
 
 async def get_current_user_then_release(

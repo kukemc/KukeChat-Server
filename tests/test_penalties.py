@@ -20,8 +20,8 @@ from app.services.penalties import Penalty, compute_penalty
 
 def _create_tables(connection) -> None:
     # 只建引擎用到的表：全量建表在这台机器上一次要二十多秒。
-    # 申诉会读风纪开关（system_settings）、查有没有资深复审（jury_reviews）。
-    names = ("users", "auth_sessions", "user_violations", "admin_audit_logs", "system_settings", "jury_reviews")
+    # 申诉会读风纪开关（system_settings）、查有没有资深复审（jury_reviews）；封号 / 解封会看要不要连带设备（device_*）。
+    names = ("users", "auth_sessions", "user_violations", "admin_audit_logs", "system_settings", "jury_reviews", "device_signals", "device_bans")
     Base.metadata.create_all(connection, tables=[Base.metadata.tables[name] for name in names])
 
 

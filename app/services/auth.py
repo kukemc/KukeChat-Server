@@ -10,6 +10,7 @@ from fastapi import HTTPException, status
 from sqlalchemy import delete, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.device import DeviceContext
 from app.core.security import create_access_token, hash_password, verify_password
 from app.models.conversation import Conversation, ConversationMember
 from app.models.enums import ConversationType, MemberRole, PasswordResetStatus
@@ -17,6 +18,7 @@ from app.models.enums import UserStatus
 from app.models.report import PasswordResetRequest
 from app.models.user import AuthSession, CcwPasswordChallenge, User
 from app.schemas.auth import AccountLookupRead, CookieSessionRead, PasswordResetRequestCreate, Token, UserLogin, UserRegister
+from app.services import device_bans, device_signals
 from app.services.ccw import CHALLENGE_ALPHABET, ccw_gateway_available, fetch_comment_page
 
 
@@ -47,17 +49,23 @@ async def create_cookie_session(db: AsyncSession, user: User, client_ip: str, us
     return raw_token, session
 
 
-async def cookie_login_user(db: AsyncSession, payload: UserLogin, client_ip: str, user_agent: str | None, days: int) -> tuple[str, CookieSessionRead]:
+async def cookie_login_user(
+    db: AsyncSession, payload: UserLogin, client_ip: str, user_agent: str | None, days: int, device: DeviceContext | None = None
+) -> tuple[str, CookieSessionRead]:
     user = await get_user_by_username_or_email(db, payload.username_or_email)
     if user is None or not verify_password(payload.password, user.hashed_password):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid username/email or password")
+    await device_bans.on_login(db, user, device)
     await ensure_user_not_disabled(db, user, issue_appeal_token=True)
+    await device_bans.guard(db, device, user)
     mark_user_seen(user, client_ip, login=True)
     raw_token, session = await create_cookie_session(db, user, client_ip, user_agent, days)
     return raw_token, CookieSessionRead(access_token=create_access_token(user.id), user=user, expires_at=session.expires_at)
 
 
-async def get_cookie_session_user(db: AsyncSession, session_token: str | None, client_ip: str, user_agent: str | None) -> CookieSessionRead:
+async def get_cookie_session_user(
+    db: AsyncSession, session_token: str | None, client_ip: str, user_agent: str | None, device: DeviceContext | None = None
+) -> CookieSessionRead:
     if not session_token:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="No active session")
 
@@ -74,6 +82,7 @@ async def get_cookie_session_user(db: AsyncSession, session_token: str | None, c
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="No active session")
 
     await ensure_user_not_disabled(db, user)
+    await device_bans.guard_request(db, device, user)
     # A missing User-Agent historically leaves the stored value unchanged.
     current_user_agent = user_agent[:500] if user_agent else session.user_agent
     session_seen_recently = (
@@ -163,7 +172,7 @@ async def get_user_by_registration_ip(db: AsyncSession, client_ip: str) -> User 
     return result.scalar_one_or_none()
 
 
-async def register_user(db: AsyncSession, payload: UserRegister, client_ip: str) -> Token:
+async def register_user(db: AsyncSession, payload: UserRegister, client_ip: str, device: DeviceContext | None = None) -> Token:
     email = str(payload.email) if payload.email is not None else None
     checks = [User.username == payload.username]
     if email is not None:
@@ -176,6 +185,8 @@ async def register_user(db: AsyncSession, payload: UserRegister, client_ip: str)
     ip_user = await get_user_by_registration_ip(db, client_ip)
     if ip_user is not None:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="This IP address has already registered an account")
+    # 防小号（docs/device-bans.md 第 4 节）：设备被封、这台设备注册的号太多、同一网段今天注册太多
+    await device_bans.check_registration(db, device)
 
     user = User(
         username=payload.username,
@@ -189,6 +200,9 @@ async def register_user(db: AsyncSession, payload: UserRegister, client_ip: str)
         last_seen_at=datetime.now(UTC),
     )
     db.add(user)
+    if device is not None:
+        await db.flush()
+        await device_signals.record_now(db, user.id, device, registered=True)
     await db.commit()
     await db.refresh(user)
     await add_user_to_official_group(db, user.id)
@@ -213,11 +227,14 @@ async def add_user_to_official_group(db: AsyncSession, user_id: int) -> None:
     await db.commit()
 
 
-async def login_user(db: AsyncSession, payload: UserLogin, client_ip: str) -> Token:
+async def login_user(db: AsyncSession, payload: UserLogin, client_ip: str, device: DeviceContext | None = None) -> Token:
     user = await get_user_by_username_or_email(db, payload.username_or_email)
     if user is None or not verify_password(payload.password, user.hashed_password):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid username/email or password")
+    # 先记下这次用的设备（被封的号来登录也记，这样才知道它换到了哪台设备上），再判断账号和设备是否被封
+    await device_bans.on_login(db, user, device)
     await ensure_user_not_disabled(db, user, issue_appeal_token=True)
+    await device_bans.guard(db, device, user)
     mark_user_seen(user, client_ip, login=True)
     await db.commit()
     await db.refresh(user)

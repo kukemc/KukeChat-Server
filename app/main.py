@@ -20,6 +20,7 @@ from app.core.config import settings
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import AsyncSessionLocal, get_db, init_db
+from app.core.device import ISSUE_HEADER, DeviceTokenMiddleware
 from app.core.request_guard import ClientProofMiddleware
 from app.core.transport_metrics import TransportMetrics, TransportMetricsMiddleware
 from app.services.legacy_uploads import migrate_legacy_upload_response
@@ -27,6 +28,7 @@ from app.services.account_levels import start_account_level_worker, stop_account
 from app.services.intimacy import start_intimacy_worker, stop_intimacy_worker
 from app.services.sparks import start_spark_worker, stop_spark_worker
 from app.services.read_coalescer import start_read_coalescer, stop_read_coalescer
+from app.services.device_signals import start_device_signal_worker, stop_device_signal_worker
 from app.core import loop_watch
 from app.services.cases import start_jury_sweep_worker, stop_jury_sweep_worker
 from app.services.ccw import start_ccw_binding_worker, stop_ccw_binding_worker
@@ -124,6 +126,8 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
     start_spark_worker()
     # 已读位置：几秒内的连续推进合并成一次写库
     start_read_coalescer()
+    # 设备信号：已登录请求上记下的信号每 30 秒合并写一次库（docs/device-bans.md）
+    start_device_signal_worker()
     if transport_metrics is not None:
         await transport_metrics.start()
     try:
@@ -131,6 +135,7 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
     finally:
         await loop_watch.stop()
         await stop_read_coalescer()
+        await stop_device_signal_worker()
         await stop_intimacy_worker()
         await stop_spark_worker()
         await stop_group_file_worker()
@@ -171,6 +176,8 @@ app = FastAPI(title=settings.app_name, lifespan=lifespan)
 Path(settings.upload_dir).mkdir(parents=True, exist_ok=True)
 app.add_middleware(UploadAwareGZipMiddleware, minimum_size=1024, compresslevel=4)
 app.add_middleware(ClientProofMiddleware)
+# 设备令牌（docs/device-bans.md）：纯 ASGI，不碰数据库；没带有效令牌的响应加 X-Kuke-Device-Issue
+app.add_middleware(DeviceTokenMiddleware)
 
 
 app.add_middleware(
@@ -180,6 +187,8 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    # 浏览器端要读到新发的设备令牌
+    expose_headers=[ISSUE_HEADER],
 )
 # Last registered means outermost: records ASGI body bytes *after* gzip/CORS.
 # With the default disabled, no per-request observer or background task exists.
