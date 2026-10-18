@@ -105,6 +105,27 @@ KukeChat 自己的发版服务：安装包放在我们的对象存储里（或�
 
 按版本号从新到旧排。
 
+### 2.3 实时事件 `release.published`
+
+版本从草稿变成已发布（`POST /admin/releases/{id}/publish`，后台和发版令牌都走这里）提交成功后，后端通过用户 WebSocket
+（`/ws`）给**所有在线用户**广播一次：
+
+```json
+{ "type": "release.published",
+  "data": { "platform": "windows", "channel": "stable", "version": "2.0.8", "build": 208,
+            "min_supported_version": "2.0.0", "forced": true } }
+```
+
+- 只是「去查一下」的提醒，**不能**拿它直接弹窗或下载：客户端收到后按自己的平台 / 渠道过滤（`stable` 的事件 beta 用户也要处理，
+  因为 beta 渠道包含 stable），随机等 0–30 秒（错开请求），再按正常流程调 `GET /releases/latest`，用返回的 `update_available` / `forced`
+  决定弹不弹窗，「跳过此版本」照旧生效。
+- `forced` 只表示这个版本设了 `min_supported_version`；某个客户端是否被强制更新以 `/releases/latest` 带 `current` 的结果为准。
+- 已发布的版本再点发布、撤回、改更新日志都不推送。推送失败只记日志，不影响发布。
+- 不在线的用户收不到，靠客户端自己的定时检查：桌面端启动 8 秒后查一次、之后每 1 小时一次，窗口重新获得焦点时距上次检查超过 1 小时也会查；
+  安卓启动时查一次，回到前台时距上次检查超过 1 小时再查。
+- `/releases/latest` 每个 worker 各自缓存 30 秒，发布只清掉处理发布请求的那个 worker 的缓存；多 worker 部署时极少数客户端可能在
+  这 30 秒里查到旧结果，下一次定时 / 回前台检查会补上。
+
 ## 3. 后台接口（`/admin/releases/*`）
 
 鉴权二选一：

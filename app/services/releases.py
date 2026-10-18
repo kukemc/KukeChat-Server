@@ -551,7 +551,31 @@ async def publish_release(db: AsyncSession, request: Request | None, actor: "Rel
         await _audit(db, actor, "release.publish", release.id, {"platform": release.platform, "channel": release.channel, "version": release.version, "force": force})
         await db.commit()
         invalidate_cache()
+        await _notify_published(release)
     return admin_view(await _reload(db, release.id), request)
+
+
+def published_event(release: AppRelease) -> dict[str, Any]:
+    """`release.published` 实时事件的内容。forced 只表示这个版本设了最低支持版本；
+    具体某个客户端是不是被强制更新，要它自己带 current 去问 /releases/latest。"""
+    return {
+        "platform": release.platform,
+        "channel": release.channel,
+        "version": release.version,
+        "build": release.build,
+        "min_supported_version": release.min_supported_version,
+        "forced": bool(release.min_supported_version),
+    }
+
+
+async def _notify_published(release: AppRelease) -> None:
+    """发布成功（已提交）后通知所有在线用户去查一次更新。推送失败只记日志，不影响发布本身。"""
+    try:
+        from app.websocket.manager import manager
+
+        await manager.broadcast("release.published", published_event(release))
+    except Exception:
+        logger.exception("Release publish broadcast failed for release %s", release.id)
 
 
 async def unpublish_release(db: AsyncSession, request: Request | None, actor: "ReleaseActor", release_id: int) -> dict[str, Any]:

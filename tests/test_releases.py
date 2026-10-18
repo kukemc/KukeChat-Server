@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 from fastapi import FastAPI
@@ -299,6 +299,25 @@ class AdminReleaseTests(ReleaseCase):
         self.assertEqual(([item["version"] for item in history["items"]], history["total"]), (["2.0.0", "1.9.0"], 2))
         beta_history = await self.call("GET", "/releases?platform=android&channel=beta&limit=1", 200, who=None)
         self.assertEqual(([item["version"] for item in beta_history["items"]], beta_history["total"]), (["2.1.0-beta.1"], 3))
+
+    async def test_publish_broadcasts_to_online_users(self) -> None:
+        from app.websocket.manager import manager
+
+        with patch.object(manager, "broadcast", AsyncMock()) as broadcast:
+            release = await self.ship("2.0.1", build=201, min_supported_version="1.3.0")
+            broadcast.assert_awaited_once_with(
+                "release.published",
+                {"platform": "android", "channel": "stable", "version": "2.0.1", "build": 201, "min_supported_version": "1.3.0", "forced": True},
+            )
+            # 已经发布过的再点发布不重复推送
+            await self.call("POST", f"/admin/releases/{release['id']}/publish", 200, json={})
+            self.assertEqual(broadcast.await_count, 1)
+        # 推送失败不影响发布
+        with patch.object(manager, "broadcast", AsyncMock(side_effect=RuntimeError("redis down"))) as broken:
+            with self.assertLogs("app.services.releases", "ERROR"):
+                published = await self.ship("2.0.2", build=202)
+            self.assertTrue(published["published"])
+            self.assertEqual(broken.await_args.args[1]["forced"], False)
 
     async def test_release_tokens(self) -> None:
         created = await self.call("POST", "/admin/releases/tokens", 201, json={"label": "我的电脑"})
