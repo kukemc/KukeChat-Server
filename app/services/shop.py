@@ -45,6 +45,7 @@ from app.models.gift import GiftRecord
 from app.models.group_plus import GroupPlusRecord
 from app.models.red_packet import RedPacket, RedPacketShare
 from app.models.shop import CoinGrant, ShopAccount, ShopItem, ShopPurchase
+from app.models.spark import SparkRelight
 from app.models.user import User
 from app.schemas.user import UserPublic, load_cosmetics, parse_cosmetics
 from app.services.reports import log_admin_action
@@ -379,6 +380,18 @@ def _shared_group_plus_query(user_id: Any, oid: Any) -> Any:
     )
 
 
+def _spark_out_query(user_id: Any) -> Any:
+    """这个人重燃好友火花花掉了多少（docs/sparks.md）：他名下 spark_relights 的 amount 之和。不退款。"""
+    return select(func.coalesce(func.sum(SparkRelight.amount), 0)).where(SparkRelight.user_id == user_id)
+
+
+def _shared_spark_query(user_id: Any, oid: Any) -> Any:
+    """这个 CCW 账号的币被「别的」KukeChat 账号拿去重燃火花花掉了多少。和 _shared_gift_query 是同一条规则（换绑防二次花）。"""
+    return select(func.coalesce(func.sum(SparkRelight.amount), 0)).where(
+        SparkRelight.ccw_oid == oid, SparkRelight.user_id != user_id, SparkRelight.amount > 0
+    )
+
+
 def _granted_query(user_id: Any) -> Any:
     """后台给这个人加 / 扣的金币净额（coin_grants.amount 之和，扣除是负数）。记在 KukeChat 账号上，不跟 CCW 账号走。"""
     return select(func.coalesce(func.sum(CoinGrant.amount), 0)).where(CoinGrant.user_id == user_id)
@@ -397,9 +410,11 @@ def available_expression(user_id: int, oid: str) -> Any:
         - _shared_packet_query(user_id, oid).scalar_subquery()
         - _shared_gift_query(user_id, oid).scalar_subquery()
         - _shared_group_plus_query(user_id, oid).scalar_subquery()
+        - _shared_spark_query(user_id, oid).scalar_subquery()
         - _packet_out_query(user_id).scalar_subquery()
         - _gift_out_query(user_id).scalar_subquery()
         - _group_plus_out_query(user_id).scalar_subquery()
+        - _spark_out_query(user_id).scalar_subquery()
         + _packet_in_query(user_id).scalar_subquery()
         + _granted_query(user_id).scalar_subquery()
     )
@@ -431,8 +446,11 @@ async def _balance(db: AsyncSession, user_id: int, oid: str | None) -> dict[str,
         spent += int(await db.scalar(_shared_gift_query(user_id, oid)) or 0)
         # 买群升级同理
         spent += int(await db.scalar(_shared_group_plus_query(user_id, oid)) or 0)
+        # 重燃火花同理
+        spent += int(await db.scalar(_shared_spark_query(user_id, oid)) or 0)
     gift_spent = int(await db.scalar(_gift_out_query(user_id)) or 0)
     group_plus_spent = int(await db.scalar(_group_plus_out_query(user_id)) or 0)
+    spark_spent = int(await db.scalar(_spark_out_query(user_id)) or 0)
     sent, refunded = (
         await db.execute(
             select(func.coalesce(func.sum(RedPacket.total), 0), func.coalesce(func.sum(RedPacket.refunded_amount), 0)).where(RedPacket.sender_id == user_id)
@@ -454,7 +472,7 @@ async def _balance(db: AsyncSession, user_id: int, oid: str | None) -> dict[str,
         "bound": oid is not None,
         "donated": donated,
         "spent": spent,
-        "balance": donated - spent - gift_spent - group_plus_spent - sent + received + refunded + granted,
+        "balance": donated - spent - gift_spent - group_plus_spent - spark_spent - sent + received + refunded + granted,
         "verified_at": _aware(account.verified_at) if current else None,
         "stale": stale,
         "red_packet_sent": sent,
@@ -462,6 +480,7 @@ async def _balance(db: AsyncSession, user_id: int, oid: str | None) -> dict[str,
         "red_packet_refunded": refunded,
         "gift_spent": gift_spent,
         "group_plus_spent": group_plus_spent,
+        "spark_spent": spark_spent,
         "granted": granted,
     }
 
@@ -1536,9 +1555,11 @@ def _account_columns() -> tuple[Any, Any, Any, Any, Any, Any, Any, Any, Any, Any
         + _shared_packet_query(User.id, User.ccw_student_oid).correlate(User).scalar_subquery()
         + _shared_gift_query(User.id, User.ccw_student_oid).correlate(User).scalar_subquery()
         + _shared_group_plus_query(User.id, User.ccw_student_oid).correlate(User).scalar_subquery()
+        + _shared_spark_query(User.id, User.ccw_student_oid).correlate(User).scalar_subquery()
     )
     gifted = _gift_out_query(User.id).correlate(User).scalar_subquery()
-    plus = _group_plus_out_query(User.id).correlate(User).scalar_subquery()
+    # 群升级和重燃火花（docs/sparks.md）都记在「群升级等其他消费」这一栏
+    plus = _group_plus_out_query(User.id).correlate(User).scalar_subquery() + _spark_out_query(User.id).correlate(User).scalar_subquery()
     sent = select(func.coalesce(func.sum(RedPacket.total), 0)).where(RedPacket.sender_id == User.id).correlate(User).scalar_subquery()
     refunded = select(func.coalesce(func.sum(RedPacket.refunded_amount), 0)).where(RedPacket.sender_id == User.id).correlate(User).scalar_subquery()
     received = _packet_in_query(User.id).correlate(User).scalar_subquery()

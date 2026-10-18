@@ -96,6 +96,19 @@ async def conversation_bots(
     return [BotInstallationRead.model_validate(item) for item in await bot_service.list_conversation_bots(db, conversation_id, current_user.id)]
 
 
+@router.get("/by-user/{user_id}", response_model=BotRead)
+async def bot_detail_by_user(
+    user_id: int,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> BotRead:
+    """按机器人的用户账号 id 取机器人详情（聊天里点机器人头像 / 名字时用），权限同 GET /bots/{bot_id}。"""
+    bot = await bot_service.get_bot_by_user_id(db, user_id)
+    if not bot.is_public and bot.owner_id != current_user.id:
+        await bot_service.get_bot_for_owner(db, bot.id, current_user.id)
+    return await serialize_bot_with_reviews(db, bot, current_user.id)
+
+
 @router.get("/{bot_id}/dashboard", response_model=BotDashboardRead)
 async def bot_dashboard(
     bot_id: int,

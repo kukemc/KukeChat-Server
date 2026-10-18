@@ -1242,7 +1242,7 @@ async def build_conversation_read(db: AsyncSession, conversation: Conversation, 
 
         last_message_read = await message_service.build_message_read(db, last_message, current_user_id)
 
-    return ConversationRead(
+    read = ConversationRead(
         id=conversation.id,
         type=conversation.type,
         title=conversation.title,
@@ -1285,6 +1285,11 @@ async def build_conversation_read(db: AsyncSession, conversation: Conversation, 
         group_todo=(await _group_todo_views(db, [conversation])).get(conversation.id),
         **_plus_fields(conversation),
     )
+    # 好友火花（docs/sparks.md）。延迟导入：sparks → shop → reports → messages → 这里
+    from app.services import sparks as spark_service
+
+    await spark_service.attach_to_reads(db, [read], current_user_id)
+    return read
 
 
 async def build_conversation_reads(db: AsyncSession, conversations: list[Conversation], current_user_id: int) -> list[ConversationRead]:
@@ -1490,4 +1495,8 @@ async def build_conversation_reads(db: AsyncSession, conversations: list[Convers
             )
         )
 
+    # 好友火花（docs/sparks.md）：一条查询取齐。延迟导入：sparks → shop → reports → messages → 这里
+    from app.services import sparks as spark_service
+
+    await spark_service.attach_to_reads(db, reads, current_user_id)
     return reads

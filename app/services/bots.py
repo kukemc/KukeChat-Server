@@ -154,6 +154,18 @@ async def get_bot(db: AsyncSession, bot_id: int) -> Bot:
     return bot
 
 
+async def get_bot_by_user_id(db: AsyncSession, user_id: int) -> Bot:
+    """按机器人对应的用户账号（users.is_bot）找机器人；客户端点聊天里的机器人头像时用。"""
+    result = await db.execute(
+        select(Bot).options(joinedload(Bot.user), joinedload(Bot.owner)).where(Bot.user_id == user_id)
+    )
+    bot = result.scalar_one_or_none()
+    if bot is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bot not found")
+    _ensure_not_deleted(bot)
+    return bot
+
+
 async def get_bot_for_owner(db: AsyncSession, bot_id: int, owner_id: int) -> Bot:
     bot = await get_bot(db, bot_id)
     if bot.owner_id != owner_id:

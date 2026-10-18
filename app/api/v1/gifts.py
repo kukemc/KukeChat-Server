@@ -18,6 +18,7 @@ from app.models.user import User
 from app.schemas.gift import CharmBoard, GiftCatalog, GiftCreate, GiftMinePage, GiftRecordPage, GiftSendResult, GiftWall
 from app.services import gifts as gift_service
 from app.services import intimacy as intimacy_service
+from app.services import sparks as spark_service
 from app.services import messages as message_service
 from app.services import moderation as moderation_service
 from app.services import response_cache
@@ -53,6 +54,8 @@ async def send_gift(
     if message is None:
         return GiftSendResult(record=result["record"], message=None, balance=result["balance"])
     conversation_id = message.conversation_id
+    # 好友火花（docs/sparks.md）：在私聊里送礼也算发言
+    spark_service.schedule_message(conversation_id, user_id, message.type, message.created_at, bind=db.bind)
     message_data = message_service.build_new_message_read(message, user_id)
     member_ids = await online_conversation_member_ids(db, conversation_id)
     response_cache.invalidate_user_conversations(set(member_ids) | {user_id})

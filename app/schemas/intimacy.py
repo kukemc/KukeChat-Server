@@ -155,6 +155,8 @@ class FriendIntimacyDetail(BaseModel):
     badge_count: int
     total_badges: int
     series: list[SeriesView]
+    # 好友火花（docs/sparks.md），结构同 GET /friends/{id}/spark 的 spark
+    spark: dict | None = None
 
 
 class BadgeDisplayWrite(BaseModel):

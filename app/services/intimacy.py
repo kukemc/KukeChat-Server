@@ -917,7 +917,19 @@ async def friend_detail(db: AsyncSession, user: User, friend_id: int) -> dict[st
         "badge_count": len(badges),
         "total_badges": catalog.TOTAL_BADGES,
         "series": [_series_view(series, stats[series.stat], by_series.get(series.key, {}), seen_column) for series in catalog.SERIES],
+        # 好友火花（docs/sparks.md）：好友详情页一次拿齐，不用再单独请求
+        "spark": await _spark_view(db, user_id, friend_id),
     }
+
+
+async def _spark_view(db: AsyncSession, user_id: int, friend_id: int) -> dict[str, Any] | None:
+    from app.services import sparks as spark_service
+
+    try:
+        return await spark_service.view_for(db, user_id, friend_id)
+    except Exception:
+        logger.exception("Failed to load spark for intimacy detail")
+        return None
 
 
 async def set_display(db: AsyncSession, user: User, friend_id: int, choice: Any) -> dict[str, Any]:

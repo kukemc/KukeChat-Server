@@ -71,6 +71,11 @@ from app.api.v1 import admin_intimacy, intimacy  # noqa: E402
 api_router.include_router(intimacy.router, prefix="/intimacy", tags=["intimacy"])
 api_router.include_router(admin_intimacy.router, prefix="/admin", tags=["admin"])
 
+# 好友火花（docs/sparks.md）：/sparks、/sparks/rules、/friends/{id}/spark、/friends/{id}/spark/relight（路径写全，不加前缀）
+from app.api.v1 import sparks  # noqa: E402
+
+api_router.include_router(sparks.router, tags=["sparks"])
+
 # 群升级、群文件、群待办、聊天记录搜索（docs/group-plus.md）。conversation_router 和 conversations 用同一个前缀
 from app.api.v1 import admin_group_plus, group_plus  # noqa: E402
 

@@ -64,6 +64,7 @@ from app.services import bots as bot_service
 from app.services import conversations as conversation_service
 from app.services import group_activity as group_activity_service
 from app.services import intimacy as intimacy_service
+from app.services import sparks as spark_service
 from app.services import messages as message_service
 from app.services import moderation as moderation_service
 from app.services import pokes as poke_service
@@ -1216,6 +1217,8 @@ async def send_message(
         moderation_service.schedule_message_moderation(message.id)
     # 好友之间的私聊涨亲密度（docs/intimacy.md）：后台用自己的会话记，不拖慢发送，失败只记日志
     intimacy_service.schedule_message(conversation_id, current_user.id, message.type, message.created_at, bind=db.bind)
+    # 好友火花（docs/sparks.md）：同样提交之后另起任务
+    spark_service.schedule_message(conversation_id, current_user.id, message.type, message.created_at, bind=db.bind)
     return message_data
 
 
@@ -1260,6 +1263,7 @@ async def forward_bundle(
     if not current_user.content_moderation_whitelisted:
         moderation_service.schedule_message_moderation(message.id)
     intimacy_service.schedule_message(target_conversation_id, current_user.id, message.type, message.created_at, bind=db.bind)
+    spark_service.schedule_message(target_conversation_id, current_user.id, message.type, message.created_at, bind=db.bind)
     return message_data
 
 
@@ -1276,6 +1280,8 @@ async def recall_message(
     await send_message_updates(db, "message.recalled", message, member_ids)
     await send_admin_message_signal("admin.message.changed", message, "recalled")
     await send_conversation_updates(db, conversation_id, member_ids)
+    # 好友火花：今天唯一的一条发言撤回了，今天就不算续上（docs/sparks.md）
+    spark_service.schedule_recall(message.id, bind=db.bind)
     return message_data
 
 

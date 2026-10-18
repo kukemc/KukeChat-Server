@@ -58,7 +58,7 @@ class ShopBalance(BaseModel):
     # 服务端核实到的累计投币
     donated: int = 0
     spent: int = 0
-    # donated − spent − gift_spent − group_plus_spent − red_packet_sent + red_packet_received + red_packet_refunded + granted；换绑过 CCW 账号的人可能是负数
+    # donated − spent − gift_spent − group_plus_spent − spark_spent − red_packet_sent + red_packet_received + red_packet_refunded + granted；换绑过 CCW 账号的人可能是负数
     balance: int = 0
     # 上次向 CCW 核实成功的时间；从没核实过为 null
     verified_at: datetime | None = None
@@ -72,6 +72,8 @@ class ShopBalance(BaseModel):
     gift_spent: int = 0
     # 买群升级花掉的币（docs/group-plus.md）：不退款
     group_plus_spent: int = 0
+    # 重燃好友火花花掉的币（docs/sparks.md）：不退款
+    spark_spent: int = 0
     # 后台赠送的金币净额（赠送 − 扣除，docs/shop.md 5.2）
     granted: int = 0
 
@@ -223,7 +225,7 @@ class AdminShopAccountRead(BaseModel):
     red_packet_refunded: int = 0
     # 送礼物 / 送商品花掉的币
     gift_spent: int = 0
-    # 买群升级花掉的币
+    # 买群升级（以及重燃好友火花，docs/sparks.md）花掉的币
     group_plus_spent: int = 0
     # 后台赠送的金币净额（赠送 − 扣除）
     granted: int = 0

@@ -33,6 +33,7 @@ from app.models.red_packet import RedPacket, RedPacketShare
 from app.models.release import AppRelease, AppReleaseArtifact, ReleaseApiToken
 from app.models.report import AdminAuditLog, ContentModerationRecord, PasswordResetRequest, UserReport
 from app.models.shop import CoinGrant, ShopAccount, ShopItem, ShopPurchase
+from app.models.spark import FriendSpark, SparkRelight
 from app.models.sticker import FavoriteSticker, StickerAsset
 from app.models.system import SystemSetting
 from app.models.task import Task, TaskActivity, TaskAssignee, TaskComment, TaskGroup, TaskGroupItem, TaskList, TaskWatcher
@@ -60,6 +61,8 @@ __all__ = [
     "FriendBond",
     "FriendBondDay",
     "FriendBadge",
+    "FriendSpark",
+    "SparkRelight",
     "GroupCheckin",
     "GroupMemberDailyActivity",
     "GroupMemberExpLog",

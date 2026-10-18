@@ -188,6 +188,8 @@ class ConversationRead(BaseModel):
     file_default_ttl_hours: int = 24
     # 群待办：{ message_id, message_exists, summary, snapshot, set_by, set_at … }，没有为 null
     group_todo: dict | None = None
+    # 好友火花（docs/sparks.md）：好友私聊才有，没有可画的为 null。结构同 GET /friends/{id}/spark 的 spark
+    spark: dict | None = None
 
 
 class GroupDiscoveryRead(BaseModel):

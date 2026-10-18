@@ -15,6 +15,7 @@ from app.models.user import User
 from app.schemas.message import MessageRead
 from app.schemas.red_packet import RedPacketClaimResult, RedPacketConfig, RedPacketCreate, RedPacketPage, RedPacketPending, RedPacketPendingList, RedPacketRead, RedPacketSendResult
 from app.services import intimacy as intimacy_service
+from app.services import sparks as spark_service
 from app.services import messages as message_service
 from app.services import moderation as moderation_service
 from app.services import red_packets as red_packet_service
@@ -46,6 +47,8 @@ async def send_red_packet(
     user_id, whitelisted = current_user.id, current_user.content_moderation_whitelisted
     result, message = await red_packet_service.send_red_packet(db, current_user, payload.model_dump())
     message_data = await _deliver_created(db, message, user_id)
+    # 好友火花（docs/sparks.md）：在私聊里发红包也算发言
+    spark_service.schedule_message(message.conversation_id, user_id, message.type, message.created_at, bind=db.bind)
     if not whitelisted:
         # 祝福语、接龙口令发之前已经审过一遍；这里和别的消息一样再走一次异步审核（审核服务当时不可用的话靠它兜底）
         moderation_service.schedule_message_moderation(message.id)
@@ -123,4 +126,5 @@ async def claim_red_packet(
         # 不再单独送异步审核：口令是发红包的人写的，发之前审过，红包消息的异步审核也会再看一遍（算在发的人头上）
         message_data = await _deliver_created(db, chain_message, user_id)
         intimacy_service.schedule_message(chain_message.conversation_id, user_id, chain_message.type, chain_message.created_at, bind=db.bind)
+        spark_service.schedule_message(chain_message.conversation_id, user_id, chain_message.type, chain_message.created_at, bind=db.bind)
     return RedPacketClaimResult(**result, message=message_data)
