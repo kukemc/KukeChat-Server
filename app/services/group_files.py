@@ -28,7 +28,7 @@ from urllib.parse import quote
 from uuid import uuid4
 
 from fastapi import HTTPException, UploadFile, status
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, RedirectResponse, Response, StreamingResponse
 from sqlalchemy import case, delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -615,6 +615,11 @@ async def download(db: AsyncSession, user_id: int, conversation_id: int, file_id
     path = storage.local_path_for_key(key)
     if path is not None:
         return FileResponse(path, media_type="application/octet-stream", headers=headers)
+    if storage.direct_transfer_enabled():
+        # 开了直连：302 到对象存储的预签名地址，文件不经过我们的服务器（安卓 2.0.3 及更早只会调这个接口）。
+        # 客户端跳到别的域名时会丢掉 Authorization（OkHttp / 浏览器 / reqwest 都是），不会和签名冲突
+        url = storage.presign_get(key, DOWNLOAD_URL_TTL_SECONDS, _disposition(name))
+        return RedirectResponse(url, status_code=status.HTTP_302_FOUND, headers={"Cache-Control": "private, no-store"})
     # 从对象存储整份读下来可能要很久（文件大）：先结束读事务、把连接还回去
     await release_connection(db)
     try:
