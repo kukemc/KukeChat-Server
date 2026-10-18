@@ -16,7 +16,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from fastapi import HTTPException, status
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
@@ -30,6 +30,8 @@ from app.models.penalty import UserViolation
 from app.models.report import AdminAuditLog, ContentModerationRecord
 from app.models.teamup import TeamupComment, TeamupProfile
 from app.models.user import User
+from app.services import jury_settings
+from app.services import moderation_judge
 from app.services import penalties as penalty_service
 from app.services.email import send_email_internal
 from app.services.storage import get_object, storage_key_from_url
@@ -48,6 +50,16 @@ HIGH_CONFIDENCE_ABUSE_PATTERNS = tuple(
         r"草泥马",
     )
 )
+# 二审结果（ContentModerationRecord.judge_outcome，docs/moderation-v2.md 1.10）
+JUDGE_PENDING = "pending"
+JUDGE_CONFIRMED = "confirmed"
+JUDGE_DOWNGRADED = "downgraded"
+JUDGE_CLEARED = "cleared"
+JUDGE_FLAGGED = "flagged"
+JUDGE_SCORED = "scored"
+JUDGE_UNAVAILABLE = "unavailable"
+# 二审等到一半进程退出留下的 pending，这么久以前的就不再补做了
+JUDGE_RECOVERY_MAX_AGE = timedelta(days=2)
 _moderation_retry_task: asyncio.Task | None = None
 _last_moderation_alert_at: datetime | None = None
 _moderation_alert_lock = threading.Lock()
@@ -64,6 +76,7 @@ def start_moderation_retry_worker() -> None:
 
 async def stop_moderation_retry_worker() -> None:
     global _moderation_retry_task
+    await moderation_judge.stop_worker()
     task = _moderation_retry_task
     _moderation_retry_task = None
     if task is None or task.done():
@@ -178,6 +191,13 @@ async def _moderation_retry_worker() -> None:
             raise
         except Exception:
             logger.exception("Pending post moderation retry failed")
+
+        try:
+            await recover_stale_judgements()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Stale moderation judgement recovery failed")
 
         now = time.monotonic()
         if now - _last_log_cleanup_at >= MODERATION_LOG_CLEANUP_INTERVAL_SECONDS:
@@ -316,17 +336,8 @@ async def _moderate_message_task(
         if not records:
             return
 
-        worst = _worst_record(records)
-        action = ModerationAction.NONE if source == ModerationSource.REPORT_REVIEW and worst.decision != "block" else await _apply_moderation_action(session, message, worst)
-        for record in records:
-            record.action_taken = action
-            if action != ModerationAction.NONE:
-                record.acted_at = datetime.now(UTC)
-
-        await session.commit()
-        await penalty_service.flush_notifications(session)
-        await _broadcast_moderation_action(session, message, action)
-        await _offer_machine_case(session, message, records, action, source)
+        await _second_opinion(session, message, records, source)
+        await _finish_message_moderation(session, message, records, source)
     except Exception as exc:
         await session.rollback()
         penalty_service.discard_notifications(session)
@@ -334,6 +345,201 @@ async def _moderate_message_task(
     finally:
         if owns_session:
             await session.close()
+
+
+async def _finish_message_moderation(
+    session: AsyncSession,
+    message: Message,
+    records: list[ContentModerationRecord],
+    source: ModerationSource,
+) -> None:
+    """按审核结论（已经算上二审）处理消息、落库、通知，最后看要不要交给风纪委员。"""
+    worst = _worst_record(records)
+    if source == ModerationSource.REPORT_REVIEW and _effective_decision(worst) != "block":
+        action = ModerationAction.NONE
+    else:
+        action = await _apply_moderation_action(session, message, worst)
+    for record in records:
+        record.action_taken = action
+        if action != ModerationAction.NONE:
+            record.acted_at = datetime.now(UTC)
+
+    await session.commit()
+    await penalty_service.flush_notifications(session)
+    await _broadcast_moderation_action(session, message, action)
+    await _offer_machine_case(session, message, records, action, source)
+
+
+# ---------------------------------------------------------------- 二审（docs/moderation-v2.md 1.10）
+
+
+def _judge_candidate(message: Message, records: list[ContentModerationRecord], source: ModerationSource) -> ContentModerationRecord | None:
+    """这次审核里要送二审的那条文本记录；不送返回 None。
+
+    只送纯文本消息：实时审核里一审 block / review（含出错）的，举报复审里全部。同一条消息里的图片没被放行时不送 ——
+    图片照旧只看一审，二审不该替图片的结论做主。"""
+    if not moderation_judge.is_active() or message.type != MessageType.TEXT:
+        return None
+    texts = [record for record in records if record.content_type == "text"]
+    if len(texts) != 1 or not (texts[0].content_text or "").strip():
+        return None
+    if any(record.decision != "allow" for record in records if record.content_type != "text"):
+        return None
+    record = texts[0]
+    if source == ModerationSource.REPORT_REVIEW:
+        return record
+    if source == ModerationSource.MESSAGE_AUTO and record.decision in {"block", "review"}:
+        return record
+    return None
+
+
+def _judge_outcome(decision: str, p: float, source: ModerationSource) -> str:
+    if decision == "block":
+        return JUDGE_CONFIRMED if p >= settings.moderation_judge_block_threshold else JUDGE_DOWNGRADED
+    if source == ModerationSource.REPORT_REVIEW:
+        # 举报不会因为二审被驳回，概率只用来排队
+        return JUDGE_SCORED
+    return JUDGE_CLEARED if p < settings.moderation_judge_allow_threshold else JUDGE_FLAGGED
+
+
+async def _previous_judgement(db: AsyncSession, message_id: int, exclude_record_id: int | None) -> moderation_judge.JudgeVerdict | None:
+    """这条消息以前二审过（发送时的实时审核）就直接用那次的概率：同一段文字和上文，没必要再算一遍。"""
+    stmt = select(ContentModerationRecord.judge_p, ContentModerationRecord.judge_ms).where(
+        ContentModerationRecord.message_id == message_id, ContentModerationRecord.judge_p.is_not(None)
+    )
+    if exclude_record_id is not None:
+        stmt = stmt.where(ContentModerationRecord.id != exclude_record_id)
+    row = (await db.execute(stmt.order_by(ContentModerationRecord.id.desc()).limit(1))).first()
+    return moderation_judge.JudgeVerdict(p=float(row[0]), latency_ms=row[1], model=None) if row else None
+
+
+async def _second_opinion(db: AsyncSession, message: Message, records: list[ContentModerationRecord], source: ModerationSource) -> None:
+    """一审之后、处理之前问一次二审，结论写在文本记录的 judge_* 上（_needs_action / _verdict_for_record 按它办）。
+
+    消息已经送达，这里在后台任务里等。一审 block 的消息在等二审的这几秒到几十秒里先不撤回：要防的就是误罚，
+    宁可晚一点处理。二审出任何问题都记成 unavailable，照一审结论办。"""
+    record = _judge_candidate(message, records, source)
+    if record is None:
+        return
+    try:
+        if not await jury_settings.is_enabled(db, "machine_judge"):
+            return
+        reported = source == ModerationSource.REPORT_REVIEW
+        verdict = await _previous_judgement(db, message.id, record.id) if reported else None
+        if verdict is None:
+            context, after = await moderation_judge.message_context(db, message, after=moderation_judge.REPORT_AFTER_MESSAGES if reported else 0)
+            if reported:
+                priority = moderation_judge.PRIORITY_REPORT
+            else:
+                priority = moderation_judge.PRIORITY_BLOCK if record.decision == "block" else moderation_judge.PRIORITY_FLAGGED
+            # 一审结论先落库、连接还回池子：二审要排队加推理，几秒到几十秒（见 _release_connection）。
+            # 进程在这期间退出留下的 pending，由重试循环按一审结论补做（recover_stale_judgements）
+            record.judge_outcome = JUDGE_PENDING
+            await db.commit()
+            verdict = await moderation_judge.judge(
+                moderation_judge.clean_text(record.content_text, moderation_judge.TEXT_CHARS), context, after, priority=priority
+            )
+            # 等的这段时间里发送者可能自己撤回了：后面按最新状态处理
+            await db.refresh(message, attribute_names=["recalled_at", "recalled_by_id"])
+        if verdict is None:
+            record.judge_outcome = JUDGE_UNAVAILABLE
+            return
+        record.judge_p = round(verdict.p, 4)
+        record.judge_ms = verdict.latency_ms
+        record.judge_outcome = _judge_outcome(record.decision, verdict.p, source)
+    except Exception:
+        logger.exception("Moderation judge step failed; keeping the first-stage verdict", extra={"message_id": message.id})
+        record.judge_outcome = JUDGE_UNAVAILABLE
+
+
+async def judge_reported_message(db: AsyncSession, message_id: int) -> float | None:
+    """举报并进一个已经在排队、还没有二审概率的案件时补一次二审，只返回概率（不写审核记录）。不可用返回 None。"""
+    if not moderation_judge.is_active() or not await jury_settings.is_enabled(db, "machine_judge"):
+        return None
+    previous = await _previous_judgement(db, message_id, None)
+    if previous is not None:
+        return round(previous.p, 4)
+    message = await db.get(Message, message_id)
+    if message is None or message.type != MessageType.TEXT or message.recalled_at is not None:
+        return None
+    text = _text_to_moderate(message, _json_object(message.metadata_json))
+    if not text:
+        return None
+    context, after = await moderation_judge.message_context(db, message, after=moderation_judge.REPORT_AFTER_MESSAGES)
+    await _release_connection(db)
+    verdict = await moderation_judge.judge(
+        moderation_judge.clean_text(text, moderation_judge.TEXT_CHARS), context, after, priority=moderation_judge.PRIORITY_REPORT
+    )
+    return round(verdict.p, 4) if verdict is not None else None
+
+
+async def recover_stale_judgements() -> int:
+    """二审等到一半进程退出（发版重启）留下的 pending：照一审结论补做，和二审不可用时一样。返回处理的条数。"""
+    now = datetime.now(UTC)
+    cutoff = now - timedelta(seconds=settings.moderation_judge_timeout_seconds + 120)
+    async with AsyncSessionLocal() as db:
+        rows = await db.execute(
+            select(ContentModerationRecord.id)
+            .where(
+                ContentModerationRecord.judge_outcome == JUDGE_PENDING,
+                ContentModerationRecord.created_at < cutoff,
+                ContentModerationRecord.created_at > now - JUDGE_RECOVERY_MAX_AGE,
+            )
+            .order_by(ContentModerationRecord.id.asc())
+            .limit(50)
+        )
+        record_ids = list(rows.scalars().all())
+    recovered = 0
+    for record_id in record_ids:
+        try:
+            recovered += int(await _recover_judgement(record_id))
+        except Exception:
+            logger.exception("Failed to recover a pending moderation judgement", extra={"record_id": record_id})
+    if recovered:
+        logger.warning("Recovered %d moderation records left waiting for the judge", recovered)
+    return recovered
+
+
+async def _recover_judgement(record_id: int) -> bool:
+    async with AsyncSessionLocal() as db:
+        # 先认领（每个 worker 进程都在跑这个循环），和后面的处理在同一个事务里：处理失败就回滚，下一轮再来
+        claimed = await db.execute(
+            update(ContentModerationRecord)
+            .where(ContentModerationRecord.id == record_id, ContentModerationRecord.judge_outcome == JUDGE_PENDING)
+            .values(judge_outcome=JUDGE_UNAVAILABLE)
+        )
+        if claimed.rowcount != 1:
+            await db.rollback()
+            return False
+        record = await db.get(ContentModerationRecord, record_id)
+        message = None
+        if record is not None and record.message_id is not None:
+            message = (
+                await db.execute(select(Message).options(joinedload(Message.sender)).where(Message.id == record.message_id))
+            ).scalar_one_or_none()
+        if record is None or message is None or message.recalled_at is not None:
+            await db.commit()
+            return True
+        if record.source == ModerationSource.REPORT_REVIEW:
+            # 举报预审被打断了：案件还停在 triage 就重新预审一遍（会重新审、重新问二审）
+            from app.models.case import ReportCase
+            from app.services import cases as case_service
+
+            case_id = None
+            if record.report_id is not None:
+                case_id = (
+                    await db.execute(
+                        select(ReportCase.id).where(
+                            ReportCase.first_report_id == record.report_id, ReportCase.status == "open", ReportCase.queue == "triage"
+                        )
+                    )
+                ).scalar_one_or_none()
+            await db.commit()
+            if case_id is not None:
+                case_service.schedule_triage(case_id)
+            return True
+        await _finish_message_moderation(db, message, [record], record.source)
+        return True
 
 
 async def _offer_machine_case(
@@ -1329,10 +1535,21 @@ def _action_details(action: ModerationAction, user_id: int, record: ContentModer
     }
 
 
+def _effective_decision(record: ContentModerationRecord) -> str:
+    """算上二审之后的结论：一审 block 但二审没把握的按 review 办，一审拿不准、二审认为没问题的按 allow 办。
+    记录上的 decision 始终是一审原样，便于对照和评测。"""
+    if record.judge_outcome == JUDGE_DOWNGRADED:
+        return "review"
+    if record.judge_outcome == JUDGE_CLEARED:
+        return "allow"
+    return record.decision
+
+
 def _needs_action(record: ContentModerationRecord) -> bool:
-    if record.decision == "block":
+    decision = _effective_decision(record)
+    if decision == "block":
         return True
-    if record.decision == "allow" and record.severity <= 0:
+    if record.judge_outcome == JUDGE_CLEARED or (decision == "allow" and record.severity <= 0):
         return False
     # 剩下的都是模型「拿不准」，不是违规结论，只留记录等人工看。图片在这一档的
     # 误判最多，永远不动；文本是否先撤回由配置决定。无论哪种都不记违规。
@@ -1376,8 +1593,8 @@ def _raw_result(record: ContentModerationRecord) -> dict[str, Any]:
 
 
 def _verdict_for_record(record: ContentModerationRecord) -> tuple[str, int] | None:
-    """返回这条审核记录对应的 (违规类别, 等级)；None 表示不构成违规认定。"""
-    if record.decision != "block":
+    """返回这条审核记录对应的 (违规类别, 等级)；None 表示不构成违规认定（含一审 block 但二审没把握的）。"""
+    if _effective_decision(record) != "block":
         return None
     raw = _raw_result(record)
     category, level = raw.get("category"), raw.get("level")

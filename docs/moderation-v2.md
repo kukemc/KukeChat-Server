@@ -159,6 +159,50 @@
 
 复核结论同时是评测审核模型用的标注数据，所以即使不需要处罚，也请把误判的记录判成 `clean`。
 
+### 1.10 二审（机器复判，已实现）
+
+一审是审核服务的规则 + 分类器，每天约 1.7 万条，97% 直接放行。被它标出来的文本（`block` / `review` / 出错，约 2–3%）
+再交给审核机上的判定小模型（StartLux-Decision 4B，看上下文）问一次「是否违规」，拿到违规概率 `p` 再决定怎么办。
+审核机只有 CPU，一次 4–6 秒，所以只有这一小部分会送过去，一次一个。
+
+**只对纯文本消息**（`type=text`，群聊和私聊都算）生效。图片照旧只看一审：同一条消息里有图片没被放行时整条不送二审。
+动态、评论、话题、组队的文字暂不走二审（它们发出前要等审核，二审会把发布再拖几秒到几十秒）。
+
+| 一审 | 二审 `p` | 结果（`judge_outcome`） |
+| --- | --- | --- |
+| block | ≥ 0.9 | `confirmed`：照旧撤回 + 按阶梯处罚 |
+| block | < 0.9 | `downgraded`：**不处罚**，按「拿不准」处理（默认也不撤回；`CONTENT_MODERATION_TEXT_REVIEW_RECALL=true` 时和拿不准一样先撤回）—— 进机器案件（`machine_review` 开着时），排在机器案件最前面，不占每日名额 |
+| review / 出错 | < 0.1 | `cleared`：放行，不建案件；`CONTENT_MODERATION_TEXT_REVIEW_RECALL=true` 时也不撤回 |
+| review / 出错 | ≥ 0.1 | `flagged`：和原来的「拿不准」一样进机器案件，按 `p` 排先后（一审出错的原来不进，现在也进） |
+| 任意 | 二审不可用 | `unavailable`：完全照一审结论办，和没有二审时一样 |
+
+- **时机**：消息照常立刻送达，审核本来就在后台任务里跑。一审 `block` 的消息**等二审出结果再处理**（最多约 45 秒），这段时间里
+  消息是可见的 —— 用户投诉的是误罚，宁可晚一点撤回。二审不可用时立刻按原来的规矩撤回 + 处罚。
+- **二审不可用**：二审没开、后台开关关着、排队满了、排队加调用超过 `MODERATION_JUDGE_TIMEOUT_SECONDS`、审核服务报错或连不上，
+  都算不可用，照一审结论办。连不上 / 审核机关了二审时 60 秒内不再去问。等二审期间进程退出（发版重启）留下的 `pending` 记录，
+  由审核重试循环（每 `CONTENT_MODERATION_RETRY_INTERVAL_SECONDS`）按一审结论补做，不会丢。
+- **排队**：每个后端进程一个有界优先队列（`MODERATION_JUDGE_QUEUE_SIZE`，默认 16）、同一时刻最多一个请求在路上；
+  审核机上还有一道全局并发 1。先做一审 `block` 的，再做一审拿不准的，最后是举报。
+- **上下文**：只给送二审的消息查一次同会话里之前的 `MODERATION_JUDGE_CONTEXT_MESSAGES`（默认 5）条（举报的消息另带后 3 条），
+  撤回的和系统消息不带，正文截断。发言人匿名成「被举报人」（待审消息的作者）和 成员A / 成员B …，`@昵称` 换成 `@某人`，
+  不带用户名、昵称、ID。上下文只发给我们自己的审核机做自动判断（每条消息本来就会单独送审），不落库，管理员看不到私聊上下文。
+- **举报**：新举报的消息在机器预审时同样问二审（复用这条消息发送时的二审结果，没有才问）。一审 `block` 也要二审 ≥ 0.9 才当场
+  处罚结案，否则按「拿不准」分到委员 / 管理员。并进已有案件、而案件还没有二审概率的，后台补问一次。`p` 写在案件的 `judge_p`
+  上，排队优先级乘以 `0.5 + p`（只调先后）。**二审永远不会驳回举报。**
+- **开关**：部署配置 `MODERATION_JUDGE_ENABLED`（默认 true，且只在 `CONTENT_MODERATION_ENABLED` 时生效）；后台「风纪 › 设置」
+  的 `machine_judge`（默认开，`PUT /admin/jury/settings` 可改，几秒内对所有进程生效）。两个都开才生效。
+  阈值 `MODERATION_JUDGE_BLOCK_THRESHOLD=0.9`、`MODERATION_JUDGE_ALLOW_THRESHOLD=0.1` 来自 88 件人工核实案件的离线评测：
+  ≥ 0.9 没有误罚，< 0.1 漏掉 3.6% 的违规。
+
+接口变化：
+
+- `ContentModerationRecordRead`（`GET /admin/moderation-records`）新增 `judge_p`（违规概率）、`judge_ms`（审核服务报的耗时，含它那边的排队）、
+  `judge_outcome`（`pending` / `confirmed` / `downgraded` / `cleared` / `flagged` / `scored` / `unavailable`；`scored` 是举报预审里只打分的）。
+  没送二审的三个都是 null。记录的 `decision` 始终是一审原样。
+- `CaseRead` 新增 `judge_p`。不给委员看（`JuryCaseView` 里没有），免得影响他们的判断。
+- 审核服务新增 `POST /judge/text`（和 `/moderate*` 同一个 `X-Moderation-Token`）：body `{ text, context: [str], after?: [str] }`，
+  返回 `{ p_violation, latency_ms, model }`；不可用时 503，`detail.code` ∈ `judge_disabled` / `judge_busy` / `judge_timeout` / `judge_unavailable` / `judge_bad_response`。
+
 ## 2. 举报案件（已实现）
 
 同一个目标的所有举报并成一个**案件**，只审一次，结论回写给案件里的每条举报。
@@ -209,7 +253,7 @@
 
 ### 2.3 案件怎么流转
 
-1. 新案件先过机器预审（仅消息）：明确违规的当场撤回、处罚、结案。
+1. 新案件先过机器预审（仅消息）：明确违规的（文本消息还要二审确认，见 1.10）当场撤回、处罚、结案。
 2. 其余的：**群聊消息**和**公开动态**进风纪委员队列；私聊、举报用户、举报群聊只进管理员队列。
 3. 风纪委员 72 小时没有结论、或投票没有共识的，转给管理员。
 
@@ -223,7 +267,7 @@
 | `POST /admin/cases/{id}/queue` | `{ queue: "jury" \| "admin" }`，手动改派；涉及私聊的案件不能派给风纪委员 |
 | `POST /admin/cases/archive` | 一键归档历史遗留案件，body `{ before: datetime, queue?: "admin" \| "triage" \| "jury" \| "panel", dry_run?: bool }` → `{ count, by_queue: { admin, jury, … }, dry_run }`。见下文 |
 
-`CaseRead` 字段：`id`、`target_type`、`target_id`、`conversation_id`、`message_id`、`reported_user_id`、`reported_user`、`status`、`queue`、`jury_eligible`、`report_count`、`primary_reason`、`priority`、`summary`、`machine_decision`（`allow` / `review` / `block`）、`machine_category`、`machine_level`、`machine_confidence`、`verdict_source`（`auto` / `jury` / `panel` / `admin` / `archive`）、`verdict_category`、`verdict_category_label`、`verdict_level`、`verdict_note`、`violation_id`、`first_report_id`、`created_at`、`closed_at`。
+`CaseRead` 字段：`id`、`target_type`、`target_id`、`conversation_id`、`message_id`、`reported_user_id`、`reported_user`、`status`、`queue`、`jury_eligible`、`report_count`、`primary_reason`、`priority`、`summary`、`machine_decision`（`allow` / `review` / `block`，已算上二审）、`machine_category`、`machine_level`、`machine_confidence`、`judge_p`（二审违规概率，见 1.10）、`verdict_source`（`auto` / `jury` / `panel` / `admin` / `archive`）、`verdict_category`、`verdict_category_label`、`verdict_level`、`verdict_note`、`violation_id`、`first_report_id`、`created_at`、`closed_at`。
 
 - `outcome=violation`：`category` 缺省按举报理由映射，`level` 缺省取类别默认等级，`penalty` 缺省走阶梯；`delete_content` 默认 true（撤回消息 / 删除动态）。
 - `outcome=dismiss`：可用 `malicious_reporter_ids` 标出恶意举报人，会降低他们的举报额度。

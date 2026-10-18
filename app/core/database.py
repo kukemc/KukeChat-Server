@@ -357,6 +357,11 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("group_announcements", "new_members_since", "new_members_since DATETIME"),
     ("group_announcements", "guide_nickname", "guide_nickname BOOLEAN NOT NULL DEFAULT 0"),
     ("group_announcements", "edited_at", "edited_at DATETIME"),
+    # 二审（docs/moderation-v2.md 1.10）
+    ("content_moderation_records", "judge_p", "judge_p FLOAT"),
+    ("content_moderation_records", "judge_ms", "judge_ms INTEGER"),
+    ("content_moderation_records", "judge_outcome", "judge_outcome VARCHAR(12)"),
+    ("report_cases", "judge_p", "judge_p FLOAT"),
 )
 
 _ADDED_INDEXES: tuple[tuple[str, str], ...] = (
@@ -417,6 +422,11 @@ _ADDED_INDEXES: tuple[tuple[str, str], ...] = (
     # 群升级、群文件（docs/group-plus.md）
     ("conversations", "CREATE INDEX IF NOT EXISTS ix_conversations_plus_expires ON conversations (plus_expires_at)"),
     ("group_files", "CREATE INDEX IF NOT EXISTS ix_group_files_folder ON group_files (conversation_id, folder_id)"),
+    # 二审等到一半进程退出留下的 pending：重试循环按这个找（部分索引，平时几乎是空的）
+    (
+        "content_moderation_records",
+        "CREATE INDEX IF NOT EXISTS ix_moderation_records_judge_pending ON content_moderation_records (created_at) WHERE judge_outcome = 'pending'",
+    ),
 )
 
 # 存量数据的回填，可重复执行（WHERE 条件挡住已经回填过的行）。布尔值一律走绑定参数，SQLite 的 1 / PG 的 true 由驱动处理。

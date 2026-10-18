@@ -375,7 +375,7 @@
 | 接口 | 说明 |
 | --- | --- |
 | `GET /admin/jury/settings` | 三个开关的当前值、全部阈值的当前值（只读展示） |
-| `PUT /admin/jury/settings` | `{ auto_appoint?, appeals?, machine_review?, public_group_content?, opinions_open_to_jurors?, exam_required? }`（最后一个二期起），写审计日志，几秒内对所有进程生效 |
+| `PUT /admin/jury/settings` | `{ auto_appoint?, appeals?, machine_review?, public_group_content?, opinions_open_to_jurors?, exam_required?, machine_judge? }`（`exam_required` 二期起；`machine_judge` 是机器二审，见 moderation-v2.md 1.10，**默认开**，其余默认关），写审计日志，几秒内对所有进程生效 |
 | `POST /admin/jury/members/{user_id}/review` | 原有。`approve` / `reinstate` 新增可选的 `tier`（创始任命：直接任命为任意层级）；新增 `action: "set_tier"` |
 | `GET /admin/jury/opinions?state=&reported=&case_id=&limit&offset` | 观点列表，带真实作者和举报记录 |
 | `POST /admin/jury/opinions/{id}/moderate` | `{ action: "delete" \| "restore" \| "dismiss_reports", note? }` |
@@ -809,6 +809,8 @@
 - 这类案件超时或无共识时不转管理员：有资深委员就进合议，否则直接以「未作处理」结案，不记任何处罚。
 - 委员看到的 `JuryCaseView`（以及 `PanelCaseView`、`JuryCaseDetail`、公示栏的条目和详情）新增 `case_origin`：`report` / `machine`。机器来源的案件 `report_count` 为 0，`reasons` 是一项 `{ "reason": "机器筛查 · 辱骂骚扰", "count": 1 }`。
 - 认定违规后和举报案件一样：撤回内容、按阶梯处罚、进公示栏（群聊消息不带内容）。
+- 二审（moderation-v2.md 1.10）之后：二审认为没问题的不进；一审出错、二审认为值得看的也进；一审判 `block` 但二审没把握、因此没处罚的也进，
+  而且不占每日名额。机器案件之间按二审概率排（降级的那种整体在前），仍然全部排在真实举报后面。
 
 ### 3.4 判例
 

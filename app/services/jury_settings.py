@@ -19,8 +19,14 @@ from app.models.system import SystemSetting
 
 # 前三个会改变「谁能处罚用户」：auto_appoint 二期起生效（通过考试直接任命），另两个三期才产生行为。
 # exam_required：申请是否必须先通过入门考试。默认关 —— 已发布的旧客户端没有考试入口。
-SWITCHES: tuple[str, ...] = ("auto_appoint", "appeals", "machine_review", "public_group_content", "opinions_open_to_jurors", "exam_required")
+# machine_judge：机器二审（docs/moderation-v2.md 1.10）。不归风纪管，但它决定一审 block 的内容罚不罚、拿不准的进不进委员队列，
+# 放在这里和 machine_review 一起开关。
+SWITCHES: tuple[str, ...] = (
+    "auto_appoint", "appeals", "machine_review", "public_group_content", "opinions_open_to_jurors", "exam_required", "machine_judge",
+)
 PUBLIC_SWITCHES: tuple[str, ...] = ("auto_appoint", "appeals", "machine_review")
+# 没设置过时默认开的开关；其余没设置过的一律是关
+DEFAULT_ON: frozenset[str] = frozenset({"machine_judge"})
 _KEY_PREFIX = "jury.switch."
 # 服务跑两个 worker 进程，另一个进程改了开关后最多这么久才能看到。
 CACHE_SECONDS = 5.0
@@ -34,14 +40,14 @@ def reset_cache() -> None:
 
 
 async def get_switches(db: AsyncSession, *, fresh: bool = False) -> dict[str, bool]:
-    """全部开关的当前值，没设置过的一律是关。"""
+    """全部开关的当前值，没设置过的除 DEFAULT_ON 外一律是关。"""
     now = time.monotonic()
     cached = _cache["values"]
     if not fresh and cached is not None and now - _cache["at"] < CACHE_SECONDS:
         return dict(cached)
     rows = await db.execute(select(SystemSetting.key, SystemSetting.value).where(SystemSetting.key.like(f"{_KEY_PREFIX}%")))
     stored = {key[len(_KEY_PREFIX) :]: value for key, value in rows.all()}
-    values = {name: stored.get(name) == "1" for name in SWITCHES}
+    values = {name: stored.get(name, "1" if name in DEFAULT_ON else "0") == "1" for name in SWITCHES}
     _cache["at"] = now
     _cache["values"] = values
     return dict(values)

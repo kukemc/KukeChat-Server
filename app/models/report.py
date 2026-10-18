@@ -101,6 +101,13 @@ class ContentModerationRecord(Base):
     human_level: Mapped[int | None] = mapped_column(Integer, nullable=True)
     human_by_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     human_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 二审（docs/moderation-v2.md 1.10），只有文本消息的记录会有：违规概率、审核服务报的耗时（含排队）、结果。
+    # judge_outcome：pending 等二审 / confirmed 一审 block 且二审确认 / downgraded 一审 block 但二审不够把握（不处罚）/
+    # cleared 一审拿不准、二审认为没问题（放行）/ flagged 一审拿不准、二审认为值得人看 / scored 举报复审只打分 /
+    # unavailable 二审不可用，照一审结论办。没送二审为空
+    judge_p: Mapped[float | None] = mapped_column(Float, nullable=True)
+    judge_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    judge_outcome: Mapped[str | None] = mapped_column(String(12), nullable=True)
 
     message: Mapped["Message | None"] = relationship(foreign_keys=[message_id])
     post: Mapped["Post | None"] = relationship(foreign_keys=[post_id])

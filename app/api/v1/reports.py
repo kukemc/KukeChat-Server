@@ -29,6 +29,9 @@ async def create_report(
     new_case_id = getattr(report, "_new_case_id", None)
     if new_case_id is not None:
         case_service.schedule_triage(new_case_id)
+    judge_case_id = getattr(report, "_judge_case_id", None)
+    if judge_case_id is not None:
+        case_service.schedule_case_judge(judge_case_id)
     await admin_manager.broadcast("admin.report.changed", {"report_id": report.id, "action": "created"})
     return await report_service.build_report_read(db, report, current_user.id)
 

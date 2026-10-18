@@ -4,6 +4,10 @@
 会建成一个没有举报人的案件，直接进委员队列。图片、私聊、色情类不进；每天有上限；排在所有真实举报的后面。
 之后有人举报同一条内容，举报会并进这个案件（cases.attach_report 按 target_key 找到它）。
 
+二审（docs/moderation-v2.md 1.10）之后：二审认为没问题的（cleared）不进；一审出错或拿不准、二审认为值得看的（flagged）照常进，
+按违规概率排先后；一审判 block 但二审没把握、因此没处罚的（downgraded）也进，排在机器案件的最前面，而且不占每天的名额 ——
+它们原本是要直接处罚的。
+
 由 moderation.py 在审核流程的最后调用，调用方保证这里出任何问题都不影响审核本身。
 """
 
@@ -37,6 +41,8 @@ DAILY_PER_JUROR = settings.jury_machine_daily_per_juror
 DAILY_MIN = settings.jury_machine_daily_min
 # 真实举报的优先级恒为正数（举报人权重 × 理由权重），所以负数一定排在它们后面。
 MACHINE_PRIORITY = -1.0
+# 二审之后还要交给人看的两种结果
+JUDGED_FOR_JURY = {"downgraded", "flagged"}
 # 色情类不给委员看（委员池里未成年人占多数）。和投票时可选的类别、分案时的敏感判断是同一个口径。
 BLOCKED_CATEGORIES = {"sexual", "minor_sexual", "vulgar", "suggestive"}
 
@@ -48,7 +54,12 @@ def uncertain_text_record(records: list[ContentModerationRecord], *, allow_image
     """
     texts = [record for record in records if record.content_type == "text"]
     others = [record for record in records if record.content_type != "text"]
-    if len(texts) != 1 or texts[0].decision != "review" or is_moderation_error(texts[0]):
+    if len(texts) != 1:
+        return None
+    # 二审过的按二审：值得看的照收（包括一审出错的），认为没问题的不收；没二审过的照旧只收真正的「拿不准」
+    if texts[0].judge_outcome not in JUDGED_FOR_JURY and (
+        texts[0].judge_outcome == "cleared" or texts[0].decision != "review" or is_moderation_error(texts[0])
+    ):
         return None
     if others and (not allow_images or any(record.decision != "allow" for record in others)):
         return None
@@ -82,6 +93,17 @@ def _machine_categories(record: ContentModerationRecord) -> tuple[str, set[str]]
     return next((item for item in sorted(listed) if item in penalty_service.CATEGORIES), "other"), mentioned
 
 
+def machine_priority(record: ContentModerationRecord) -> float:
+    """机器案件的排队优先级，恒为负（排在所有真实举报后面）。
+
+    没有二审的都是 MACHINE_PRIORITY；有二审的按违规概率排，一审 block 被降级的整体排在其余机器案件前面。"""
+    p = record.judge_p
+    if p is None:
+        return MACHINE_PRIORITY
+    score = (1 + p) / 2 if record.judge_outcome == "downgraded" else p / 2
+    return round(MACHINE_PRIORITY + 0.99 * score, 4)
+
+
 async def daily_cap(db: AsyncSession, now: datetime) -> int:
     """今天最多收多少件。"""
     jurors = await db.execute(
@@ -112,11 +134,13 @@ async def _open_case(
     if existing.scalar_one_or_none() is not None:
         return None
     now = datetime.now(UTC)
-    used = await db.execute(
-        select(func.count(ReportCase.id)).where(ReportCase.case_origin == "machine", ReportCase.created_at >= now - timedelta(hours=24))
-    )
-    if int(used.scalar_one() or 0) >= await daily_cap(db, now):
-        return None
+    # 一审 block、二审降级的不占名额：它们本来是要直接处罚的，不能因为名额满了就谁也不看
+    if record.judge_outcome != "downgraded":
+        used = await db.execute(
+            select(func.count(ReportCase.id)).where(ReportCase.case_origin == "machine", ReportCase.created_at >= now - timedelta(hours=24))
+        )
+        if int(used.scalar_one() or 0) >= await daily_cap(db, now):
+            return None
     case = ReportCase(
         target_key=key,
         target_type=target_type,
@@ -131,10 +155,11 @@ async def _open_case(
         report_count=0,
         reporter_weight=0.0,
         primary_reason=f"{case_service.MACHINE_REASON_PREFIX} · {penalty_service.category_label(category)}",
-        priority=MACHINE_PRIORITY,
+        priority=machine_priority(record),
         machine_decision="review",
         machine_category=category,
         machine_confidence=record.confidence,
+        judge_p=record.judge_p,
         case_origin="machine",
         # 和举报时固化的快照同一个结构：被判的内容和前后各 10 条上下文
         snapshot=json.dumps(await snapshot(), ensure_ascii=False, sort_keys=True, separators=(",", ":")),

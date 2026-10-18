@@ -53,6 +53,8 @@ class ReportCase(Base):
     machine_category: Mapped[str | None] = mapped_column(String(40), nullable=True)
     machine_level: Mapped[int | None] = mapped_column(Integer, nullable=True)
     machine_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # 二审给的违规概率（docs/moderation-v2.md 1.10）：只用来调排队先后，不会因此驳回举报。没有二审为空
+    judge_p: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     # auto / jury / admin
     verdict_source: Mapped[str | None] = mapped_column(String(12), nullable=True)

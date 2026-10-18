@@ -355,6 +355,7 @@ class JurySettingsUpdate(BaseModel):
     public_group_content: bool | None = None
     opinions_open_to_jurors: bool | None = None
     exam_required: bool | None = None
+    machine_judge: bool | None = None
 
 
 # ---------------------------------------------------------------- 入门考试

@@ -356,6 +356,10 @@ class ContentModerationRecordRead(BaseModel):
     human_level: int | None = None
     human_by_id: int | None = None
     human_at: datetime | None = None
+    # 二审（docs/moderation-v2.md 1.10）：违规概率、耗时（毫秒，含审核机上的排队）、结果。没送二审为 null
+    judge_p: float | None = None
+    judge_ms: int | None = None
+    judge_outcome: str | None = None
 
     @computed_field
     @property

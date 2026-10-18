@@ -194,8 +194,9 @@ async def create_report(db: AsyncSession, reporter_id: int, payload: ReportCreat
         # 这条举报让案件变成了敏感类别，已经从委员队列撤出来。
         await case_service.notify_jury_queue_changed(db)
     result = await get_report(db, report.id)
-    # 新案件要先过一遍机器预审，由 API 层在事务提交后调度。
+    # 新案件要先过一遍机器预审，由 API 层在事务提交后调度；并进已有案件、而它还没有二审概率的，补一次二审。
     setattr(result, "_new_case_id", case.id if created else None)
+    setattr(result, "_judge_case_id", case.id if not created and case_service.needs_judge(case) else None)
     return result
 
 

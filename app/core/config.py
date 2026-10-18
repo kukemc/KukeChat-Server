@@ -76,6 +76,20 @@ class Settings(BaseSettings):
     # 审核服务对文本「拿不准」（review）时要不要先撤回。默认不撤，只留记录等人工；
     # 图片的 review 无论如何都不撤回。两种情况都不会记违规。
     content_moderation_text_review_recall: bool = False
+    # 二审（docs/moderation-v2.md 1.10）：一审标出来的文本消息（block / review / 出错）和被举报的消息，再交给审核服务的
+    # /judge/text（审核机上的 StartLux 小模型，看上下文）判一次违规概率。默认开，但只在内容审核本身开着时才生效。
+    # 后台「风纪 › 设置」还有一个运行时开关 machine_judge（默认开），两个都开才生效。
+    moderation_judge_enabled: bool = True
+    # 一审 block 时，二审概率 ≥ 这个值才照旧撤回 + 处罚，否则只当「拿不准」处理（不处罚）
+    moderation_judge_block_threshold: float = Field(default=0.9, ge=0, le=1)
+    # 一审 review / 出错时，二审概率 < 这个值直接放行（不建机器案件、不撤回）
+    moderation_judge_allow_threshold: float = Field(default=0.1, ge=0, le=1)
+    # 排队 + 调用一共最多等这么久；等不到就照一审结论办
+    moderation_judge_timeout_seconds: int = Field(default=45, ge=5, le=300)
+    # 每个进程排队等二审的上限，满了的直接照一审结论办。审核机一次 4–6 秒，排太长也等不到
+    moderation_judge_queue_size: int = Field(default=16, ge=1, le=1000)
+    # 带给二审的上文条数（同一会话里待审消息之前的消息）；被举报的消息另外带最多 3 条下文
+    moderation_judge_context_messages: int = Field(default=5, ge=0, le=20)
     # 语音口令识别服务（语音红包，docs/red-packets.md）。不配就不开放语音红包；密钥沿用 content_moderation_token
     voice_asr_url: str | None = None
     voice_asr_timeout_seconds: int = Field(default=15, ge=1, le=60)
@@ -343,6 +357,11 @@ class Settings(BaseSettings):
         if len(secret) < 32:
             raise ValueError("JWT_SECRET_KEY 太短，至少需要 32 个字符。")
         return secret
+
+    @property
+    def moderation_judge_active(self) -> bool:
+        """部署配置上二审是否打开（不含后台开关 machine_judge）。"""
+        return bool(self.moderation_judge_enabled and self.content_moderation_enabled and (self.content_moderation_url or "").strip())
 
     @model_validator(mode="after")
     def validate_moderation(self) -> "Settings":

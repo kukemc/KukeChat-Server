@@ -62,6 +62,8 @@ class CaseRead(BaseModel):
     machine_category: str | None = None
     machine_level: int | None = None
     machine_confidence: float | None = None
+    # 二审给的违规概率（docs/moderation-v2.md 1.10），只影响排队先后；没有二审为 null
+    judge_p: float | None = None
     verdict_source: str | None = None
     verdict_category: str | None = None
     verdict_category_label: str | None = None

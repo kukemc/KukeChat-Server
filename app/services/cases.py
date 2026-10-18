@@ -376,6 +376,9 @@ def _refresh_priority(case: ReportCase) -> None:
         priority *= 0.7
     elif case.machine_decision == "review":
         priority *= 1.3
+    if case.judge_p is not None:
+        # 二审的违规概率：0 → ×0.5，1 → ×1.5。只调先后，不会因此驳回举报
+        priority *= 0.5 + case.judge_p
     case.priority = round(priority, 3)
 
 
@@ -445,6 +448,45 @@ async def _recount(db: AsyncSession, case: ReportCase) -> None:
 # ---------------------------------------------------------------- 机器预审
 
 
+def schedule_case_judge(case_id: int) -> None:
+    """举报并进一个已经在排队、还没有二审概率的消息案件：后台补一次二审（docs/moderation-v2.md 1.10）。"""
+    task = asyncio.create_task(judge_case(case_id))
+
+    def _consume(done: asyncio.Task) -> None:
+        try:
+            done.result()
+        except Exception:
+            logger.exception("Case judge failed", extra={"case_id": case_id})
+
+    task.add_done_callback(_consume)
+
+
+def needs_judge(case: ReportCase) -> bool:
+    """这个案件要不要补二审：还在排队的消息案件、没有概率、也不在等预审（预审里会问）。"""
+    return case.status == "open" and case.queue != "triage" and case.target_type == "message" and case.message_id is not None and case.judge_p is None
+
+
+async def judge_case(case_id: int) -> None:
+    async with AsyncSessionLocal() as db:
+        case = await db.get(ReportCase, case_id)
+        if case is None or not needs_judge(case):
+            return
+        from app.services import moderation as moderation_service
+
+        p = await moderation_service.judge_reported_message(db, case.message_id)
+        if p is None:
+            return
+        # 等二审的时候案件可能已经被处理了
+        await db.refresh(case)
+        if not needs_judge(case):
+            return
+        case.judge_p = p
+        _refresh_priority(case)
+        case.updated_at = datetime.now(UTC)
+        await db.commit()
+        await _broadcast_admin(case, "judged")
+
+
 def schedule_triage(case_id: int) -> None:
     import asyncio
 
@@ -478,11 +520,16 @@ async def triage_case(case_id: int) -> None:
                 )
             ).scalars().all()
             usable = [record for record in records if record.decision in {"allow", "review", "block"}]
+            judged = [record.judge_p for record in usable if record.judge_p is not None]
+            if judged:
+                case.judge_p = max(judged)
             if usable:
-                worst = max(usable, key=lambda item: ({"allow": 0, "review": 1, "block": 2}[item.decision], item.severity))
-                case.machine_decision = worst.decision
+                # 算上二审：一审 block 但二审没把握的按 review（不当场处罚结案），见 moderation._effective_decision
+                rank = {"allow": 0, "review": 1, "block": 2}
+                worst = max(usable, key=lambda item: (rank[moderation_service._effective_decision(item)], item.severity))
+                case.machine_decision = moderation_service._effective_decision(worst)
                 case.machine_confidence = worst.confidence
-                if worst.decision == "block":
+                if case.machine_decision == "block":
                     violation = (
                         await db.execute(
                             select(UserViolation)
@@ -1430,6 +1477,7 @@ async def build_case_reads(db: AsyncSession, cases: list[ReportCase]) -> list[di
                 "machine_category": case.machine_category,
                 "machine_level": case.machine_level,
                 "machine_confidence": case.machine_confidence,
+                "judge_p": case.judge_p,
                 "verdict_source": case.verdict_source,
                 "verdict_category": case.verdict_category,
                 "verdict_category_label": penalty_service.category_label(case.verdict_category) if case.verdict_category else None,
