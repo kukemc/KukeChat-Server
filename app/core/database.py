@@ -344,6 +344,16 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("content_moderation_records", "teamup_profile_id", "teamup_profile_id INTEGER"),
     ("content_moderation_records", "teamup_comment_id", "teamup_comment_id INTEGER"),
     ("teamup_profiles", "background_url", "background_url VARCHAR(500)"),
+    # 群公告 v2（docs/group-announcements.md）
+    ("group_announcements", "images_json", "images_json TEXT"),
+    ("group_announcements", "pinned_at", "pinned_at DATETIME"),
+    ("group_announcements", "popup", "popup BOOLEAN NOT NULL DEFAULT 0"),
+    ("group_announcements", "popup_since", "popup_since DATETIME"),
+    ("group_announcements", "require_confirm", "require_confirm BOOLEAN NOT NULL DEFAULT 0"),
+    ("group_announcements", "send_to_new_members", "send_to_new_members BOOLEAN NOT NULL DEFAULT 0"),
+    ("group_announcements", "new_members_since", "new_members_since DATETIME"),
+    ("group_announcements", "guide_nickname", "guide_nickname BOOLEAN NOT NULL DEFAULT 0"),
+    ("group_announcements", "edited_at", "edited_at DATETIME"),
 )
 
 _ADDED_INDEXES: tuple[tuple[str, str], ...] = (
@@ -440,6 +450,8 @@ _BACKFILLS: tuple[tuple[str, str, dict], ...] = (
         "UPDATE bot_review_replies SET moderation_status = lower(moderation_status) WHERE moderation_status IN ('PENDING', 'APPROVED', 'REJECTED')",
         {},
     ),
+    # 群公告 v2：以前就置顶的那条补上置顶时间（列表按置顶时间排）
+    ("group_announcements", "UPDATE group_announcements SET pinned_at = updated_at WHERE pinned = :yes AND pinned_at IS NULL", {"yes": True}),
 )
 
 # 两个 worker 同时启动时，PG 上用这个 advisory lock 把建表 / 迁移串起来（任意固定的整数，"kuke"）

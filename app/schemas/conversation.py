@@ -67,16 +67,6 @@ class GroupSettingsUpdate(BaseModel):
     level_titles: list[LevelTitle] | None = None
 
 
-class AnnouncementCreate(BaseModel):
-    content: str = Field(min_length=1, max_length=600)
-    pinned: bool = False
-
-
-class AnnouncementUpdate(BaseModel):
-    content: str = Field(min_length=1, max_length=600)
-    pinned: bool = False
-
-
 class MemberRoleUpdate(BaseModel):
     role: Literal[MemberRole.ADMIN, MemberRole.MEMBER]
 
@@ -144,19 +134,6 @@ class ConversationMemberPage(BaseModel):
     limit: int
     offset: int
     has_more: bool
-
-
-class AnnouncementRead(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
-    id: int
-    conversation_id: int
-    author_id: int | None = None
-    author: UserPublic | None = None
-    content: str
-    pinned: bool
-    created_at: datetime
-    updated_at: datetime
 
 
 class ConversationRead(BaseModel):

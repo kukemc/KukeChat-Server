@@ -25,9 +25,6 @@ from app.models.message import Message
 from app.models.user import User
 from app.schemas.common import MessageResponse
 from app.schemas.conversation import (
-    AnnouncementCreate,
-    AnnouncementRead,
-    AnnouncementUpdate,
     ConversationAnnouncementUpdate,
     ConversationMemberPage,
     ConversationMemberRead,
@@ -635,65 +632,6 @@ async def reject_group_join_request(
     await manager.send_to_users(recipients, "group.join_request.rejected", response)
     await send_conversation_updates(db, join_request.conversation_id, reviewers)
     return response
-
-
-@router.get("/{conversation_id}/announcements", response_model=list[AnnouncementRead])
-async def announcements(
-    conversation_id: int,
-    current_user: Annotated[User, Depends(get_current_user)],
-    db: Annotated[AsyncSession, Depends(get_db)],
-) -> list[AnnouncementRead]:
-    items = await conversation_service.list_announcements(db, conversation_id, current_user.id)
-    return [AnnouncementRead.model_validate(item) for item in items]
-
-
-@router.post("/{conversation_id}/announcements", response_model=AnnouncementRead, status_code=status.HTTP_201_CREATED)
-async def create_announcement(
-    conversation_id: int,
-    payload: AnnouncementCreate,
-    current_user: Annotated[User, Depends(get_current_user)],
-    db: Annotated[AsyncSession, Depends(get_db)],
-) -> AnnouncementRead:
-    announcement = await conversation_service.create_announcement(
-        db, conversation_id, current_user, payload.content, payload.pinned
-    )
-    announcement_data = AnnouncementRead.model_validate(announcement)
-    member_ids = await online_conversation_member_ids(db, conversation_id)
-    await manager.send_to_users(member_ids, "group.announcement.created", announcement_data)
-    await send_conversation_updates(db, conversation_id, member_ids)
-    return announcement_data
-
-
-@router.delete("/{conversation_id}/announcements/{announcement_id}", response_model=MessageResponse)
-async def delete_announcement(
-    conversation_id: int,
-    announcement_id: int,
-    current_user: Annotated[User, Depends(get_current_user)],
-    db: Annotated[AsyncSession, Depends(get_db)],
-) -> MessageResponse:
-    await conversation_service.delete_announcement(db, conversation_id, announcement_id, current_user)
-    member_ids = await online_conversation_member_ids(db, conversation_id)
-    await manager.send_to_users(member_ids, "group.announcement.deleted", {"conversation_id": conversation_id, "announcement_id": announcement_id})
-    await send_conversation_updates(db, conversation_id, member_ids)
-    return MessageResponse(detail="Announcement deleted")
-
-
-@router.patch("/{conversation_id}/announcements/{announcement_id}", response_model=AnnouncementRead)
-async def update_group_announcement(
-    conversation_id: int,
-    announcement_id: int,
-    payload: AnnouncementUpdate,
-    current_user: Annotated[User, Depends(get_current_user)],
-    db: Annotated[AsyncSession, Depends(get_db)],
-) -> AnnouncementRead:
-    announcement = await conversation_service.update_announcement(
-        db, conversation_id, announcement_id, current_user, payload.content, payload.pinned
-    )
-    announcement_data = AnnouncementRead.model_validate(announcement)
-    member_ids = await online_conversation_member_ids(db, conversation_id)
-    await manager.send_to_users(member_ids, "group.announcement.updated", announcement_data)
-    await send_conversation_updates(db, conversation_id, member_ids)
-    return announcement_data
 
 
 @router.get("/{conversation_id}/members", response_model=list[ConversationMemberRead] | ConversationMemberPage)

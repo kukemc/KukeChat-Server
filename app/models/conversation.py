@@ -141,11 +141,39 @@ class GroupAnnouncement(Base):
     author_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
     content: Mapped[str] = mapped_column(Text)
     pinned: Mapped[bool] = mapped_column(Boolean, default=False)
+    # 群公告 v2（docs/group-announcements.md）
+    # 图片：JSON 数组，元素是已上传图片的 url
+    images_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 置顶时间：置顶的公告按它从新到旧排（可以有多条置顶）
+    pinned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 使用弹窗展示：popup_since 之前就在群里的成员进群聊时弹出，直到看过 / 确认
+    popup: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    popup_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    require_confirm: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    # 发送给新成员：new_members_since 之后入群的成员会弹出这条。全群最多一条为 true
+    send_to_new_members: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    new_members_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    guide_nickname: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    # 正文 / 图片 / 选项最后一次被修改的时间；没改过为空（updated_at 会被置顶之类的小改动刷新，不能拿来显示「已编辑」）
+    edited_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
 
     conversation: Mapped[Conversation] = relationship(back_populates="announcements")
     author: Mapped["User | None"] = relationship(foreign_keys=[author_id])
+
+
+class GroupAnnouncementReceipt(Base):
+    """成员对一条群公告的回执：看过（关掉弹窗 / 打开详情）、确认收到。"""
+
+    __tablename__ = "group_announcement_receipts"
+    __table_args__ = (UniqueConstraint("announcement_id", "user_id", name="uq_group_announcement_receipt"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    announcement_id: Mapped[int] = mapped_column(ForeignKey("group_announcements.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class GroupJoinRequest(Base):

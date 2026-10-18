@@ -16,7 +16,7 @@ from app.models.case import (
     ReportCase,
 )
 from app.models.bot import Bot, BotInstallation, BotReview, BotReviewLike, BotReviewReply
-from app.models.conversation import Conversation, ConversationMember, GroupAnnouncement, GroupJoinRequest, TemporaryConversationBlock
+from app.models.conversation import Conversation, ConversationMember, GroupAnnouncement, GroupAnnouncementReceipt, GroupJoinRequest, TemporaryConversationBlock
 from app.models.friend import FriendRequest, Friendship
 from app.models.gift import Gift, GiftRecord
 from app.models.group_plus import GroupFile, GroupFileFolder, GroupFileUpload, GroupPlusRecord, GroupTodo
@@ -52,6 +52,7 @@ __all__ = [
     "BotReviewLike",
     "ConversationMember",
     "GroupAnnouncement",
+    "GroupAnnouncementReceipt",
     "GroupJoinRequest",
     "TemporaryConversationBlock",
     "FriendRequest",

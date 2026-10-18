@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 UTC = timezone.utc
 
 from fastapi import HTTPException, status
-from sqlalchemy import and_, case, delete, func, or_, select, update
+from sqlalchemy import and_, case, delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
@@ -14,7 +14,7 @@ from app.core import group_levels
 from app.core.config import settings
 from app.core.database import release_connection
 from app.core.dialect import greatest
-from app.models.conversation import Conversation, ConversationMember, GroupAnnouncement, GroupJoinRequest, TemporaryConversationBlock
+from app.models.conversation import Conversation, ConversationMember, GroupJoinRequest, TemporaryConversationBlock
 from app.models.enums import ConversationType, GroupJoinRequestStatus, MemberRole
 from app.models.friend import Friendship
 from app.models.message import Message, MessageVisibility
@@ -826,104 +826,6 @@ async def update_member_title(
     return await get_member(db, conversation_id, target_user_id)
 
 
-async def list_announcements(db: AsyncSession, conversation_id: int, actor_id: int) -> list[GroupAnnouncement]:
-    await require_membership(db, conversation_id, actor_id)
-    await require_group_conversation(db, conversation_id)
-    result = await db.execute(
-        select(GroupAnnouncement)
-        .options(joinedload(GroupAnnouncement.author))
-        .where(GroupAnnouncement.conversation_id == conversation_id)
-        .order_by(GroupAnnouncement.pinned.desc(), GroupAnnouncement.created_at.desc(), GroupAnnouncement.id.desc())
-    )
-    return list(result.scalars().all())
-
-
-async def create_announcement(
-    db: AsyncSession,
-    conversation_id: int,
-    actor: User,
-    content: str,
-    pinned: bool,
-) -> GroupAnnouncement:
-    member = await require_membership(db, conversation_id, actor.id)
-    conversation = await require_group_conversation(db, conversation_id)
-    if member.role not in STAFF_ROLES:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only group owners or admins can publish announcements")
-
-    if pinned:
-        await db.execute(
-            update(GroupAnnouncement)
-            .where(GroupAnnouncement.conversation_id == conversation_id, GroupAnnouncement.pinned.is_(True))
-            .values(pinned=False, updated_at=datetime.now(UTC))
-        )
-
-    announcement = GroupAnnouncement(
-        conversation_id=conversation_id,
-        author_id=actor.id,
-        content=content,
-        pinned=pinned,
-    )
-    db.add(announcement)
-    conversation.announcement = content
-    conversation.updated_at = datetime.now(UTC)
-    await db.commit()
-    result = await db.execute(
-        select(GroupAnnouncement)
-        .options(joinedload(GroupAnnouncement.author))
-        .where(GroupAnnouncement.id == announcement.id)
-    )
-    return result.scalar_one()
-
-
-async def update_announcement(
-    db: AsyncSession,
-    conversation_id: int,
-    announcement_id: int,
-    actor: User,
-    content: str,
-    pinned: bool,
-) -> GroupAnnouncement:
-    conversation = await require_group_conversation(db, conversation_id)
-    membership = await get_member(db, conversation_id, actor.id)
-    if membership.role not in STAFF_ROLES:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only group owners or admins can update announcements")
-
-    result = await db.execute(
-        select(GroupAnnouncement)
-        .options(joinedload(GroupAnnouncement.author))
-        .where(GroupAnnouncement.id == announcement_id, GroupAnnouncement.conversation_id == conversation_id)
-    )
-    announcement = result.scalar_one_or_none()
-    if announcement is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Announcement not found")
-
-    now = datetime.now(UTC)
-    if pinned:
-        await db.execute(
-            update(GroupAnnouncement)
-            .where(
-                GroupAnnouncement.conversation_id == conversation_id,
-                GroupAnnouncement.id != announcement_id,
-                GroupAnnouncement.pinned.is_(True),
-            )
-            .values(pinned=False, updated_at=now)
-        )
-
-    announcement.content = content
-    announcement.pinned = pinned
-    announcement.updated_at = now
-    conversation.announcement = content
-    conversation.updated_at = now
-    await db.commit()
-
-    result = await db.execute(
-        select(GroupAnnouncement)
-        .options(joinedload(GroupAnnouncement.author))
-        .where(GroupAnnouncement.id == announcement_id)
-    )
-    return result.scalar_one()
-
-
 async def update_member_role(
     db: AsyncSession,
     conversation_id: int,
@@ -1589,31 +1491,3 @@ async def build_conversation_reads(db: AsyncSession, conversations: list[Convers
         )
 
     return reads
-
-
-async def delete_announcement(db: AsyncSession, conversation_id: int, announcement_id: int, actor: User) -> GroupAnnouncement:
-    conversation = await require_group_conversation(db, conversation_id)
-    membership = await get_member(db, conversation_id, actor.id)
-    if membership.role not in STAFF_ROLES:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only group owners or admins can delete announcements")
-    result = await db.execute(
-        select(GroupAnnouncement)
-        .where(GroupAnnouncement.id == announcement_id, GroupAnnouncement.conversation_id == conversation_id)
-    )
-    announcement = result.scalar_one_or_none()
-    if announcement is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Announcement not found")
-
-    deleted_content = announcement.content
-    await db.delete(announcement)
-    if conversation.announcement == deleted_content:
-        latest_result = await db.execute(
-            select(GroupAnnouncement)
-            .where(GroupAnnouncement.conversation_id == conversation_id, GroupAnnouncement.id != announcement_id)
-            .order_by(GroupAnnouncement.pinned.desc(), GroupAnnouncement.created_at.desc(), GroupAnnouncement.id.desc())
-            .limit(1)
-        )
-        latest = latest_result.scalar_one_or_none()
-        conversation.announcement = latest.content if latest else None
-    await db.commit()
-    return announcement

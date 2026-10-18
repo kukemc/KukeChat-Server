@@ -84,3 +84,8 @@ from app.api.v1 import releases  # noqa: E402
 
 api_router.include_router(releases.public_router, prefix="/releases", tags=["releases"])
 api_router.include_router(releases.admin_router, prefix="/admin", tags=["admin"])
+
+# 群公告 v2（docs/group-announcements.md）：/conversations/{id}/announcements/...
+from app.api.v1 import group_announcements  # noqa: E402
+
+api_router.include_router(group_announcements.router, prefix="/conversations", tags=["conversations"])
