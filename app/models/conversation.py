@@ -37,6 +37,8 @@ class Conversation(Base):
     game_mode_enabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
     game_creation_oid: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     tasks_enabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    # 「正在输入」：auto 只在 200 人以下的群显示 / on 大群也显示 / off 不显示（services/typing.py）
+    typing_indicator: Mapped[str] = mapped_column(String(8), default="auto", server_default="auto")
     # 等级头衔：按等级区间显示的称号（1-10 级「萌新」之类），每个群自己决定开不开、怎么分档。
     # level_titles 存 JSON 数组 [{"min_level": 1, "title": "萌新"}, ...]，为空表示用默认分档。
     level_titles_enabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")

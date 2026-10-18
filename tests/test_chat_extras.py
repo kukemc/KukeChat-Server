@@ -24,6 +24,8 @@ from app.services import messages as message_service
 from app.services import moderation as moderation_service
 from app.services import polls as poll_service
 from app.services import typing as typing_service
+from app.services import conversations as conversation_service
+from app.schemas.conversation import GroupSettingsUpdate
 from app.services import users as user_service
 from app.services.storage import StoredObject
 
@@ -233,6 +235,26 @@ class TypingTests(ChatExtrasBase):
     async def test_large_groups_do_not_broadcast_typing(self) -> None:
         with patch.object(typing_service, "MAX_GROUP_MEMBERS", 2):
             self.assertFalse((await self._typing("alice", self.group_id, set(self.ids.values()))).called)
+
+    async def test_group_setting_turns_typing_on_for_large_groups_or_off(self) -> None:
+        online = set(self.ids.values())
+        async with self.sessions() as db:
+            owner = await self._user(db, "owner")
+            with self.assertRaises(HTTPException):
+                await conversation_service.update_group_settings(db, self.group_id, self.ids["alice"], GroupSettingsUpdate(typing_indicator="on"))
+            updated = await conversation_service.update_group_settings(db, self.group_id, owner.id, GroupSettingsUpdate(typing_indicator="on"))
+            self.assertEqual(updated.typing_indicator, "on")
+        with patch.object(typing_service, "MAX_GROUP_MEMBERS", 2):
+            # 大群设成 on：照样转发给在线成员，限速放宽到 4 秒
+            send = await self._typing("alice", self.group_id, online)
+            self.assertEqual(set(send.call_args.args[0]), {self.ids["owner"], self.ids["bob"]})
+            typing_service._last_sent[(self.ids["alice"], self.group_id)] -= 3
+            self.assertFalse((await self._typing("alice", self.group_id, online)).called)
+        async with self.sessions() as db:
+            await conversation_service.update_group_settings(db, self.group_id, self.ids["owner"], GroupSettingsUpdate(typing_indicator="off"))
+        typing_service._last_sent.clear()
+        # 改了设置立刻生效，不等缓存过期；小群设成 off 也不转发
+        self.assertFalse((await self._typing("bob", self.group_id, online)).called)
 
 
 class GroupEmojiTests(ChatExtrasBase):

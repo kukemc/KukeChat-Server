@@ -724,6 +724,10 @@ async def update_group_settings(
         conversation.updated_at = datetime.now(UTC)
         await db.commit()
         await db.refresh(conversation)
+        if "typing_indicator" in updates:
+            from app.services import typing as typing_service
+
+            typing_service.forget(conversation_id)
     return conversation
 
 
@@ -1259,6 +1263,7 @@ async def build_conversation_read(db: AsyncSession, conversation: Conversation, 
         join_question=conversation.join_question,
         tasks_enabled=conversation.tasks_enabled,
         task_creation_permission=conversation.task_creation_permission,
+        typing_indicator=conversation.typing_indicator or "auto",
         level_titles_enabled=conversation.level_titles_enabled,
         level_titles=effective_level_titles(conversation),
         is_temporary=conversation.is_temporary,
@@ -1467,6 +1472,7 @@ async def build_conversation_reads(db: AsyncSession, conversations: list[Convers
                 join_question=conversation.join_question,
                 tasks_enabled=conversation.tasks_enabled,
                 task_creation_permission=conversation.task_creation_permission,
+                typing_indicator=conversation.typing_indicator or "auto",
                 level_titles_enabled=conversation.level_titles_enabled,
                 level_titles=effective_level_titles(conversation),
                 is_temporary=conversation.is_temporary,

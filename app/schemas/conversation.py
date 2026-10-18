@@ -60,6 +60,8 @@ class GroupSettingsUpdate(BaseModel):
     join_question: str | None = Field(default=None, max_length=200)
     tasks_enabled: bool | None = None
     task_creation_permission: Literal["members", "admins"] | None = None
+    # 「正在输入」：auto 只在 200 人以下的群显示 / on 大群也显示 / off 不显示
+    typing_indicator: Literal["auto", "on", "off"] | None = None
     level_titles_enabled: bool | None = None
     # 群文件默认保留多少小时：24 / 168 / 720（docs/group-plus.md 第 2 节；取值在服务层校验，返回 422 invalid_file_ttl）
     file_default_ttl_hours: int | None = None
@@ -153,6 +155,7 @@ class ConversationRead(BaseModel):
     join_question: str | None = None
     tasks_enabled: bool = False
     task_creation_permission: Literal["members", "admins"] = "members"
+    typing_indicator: Literal["auto", "on", "off"] = "auto"
     # 等级头衔。level_titles 始终是生效的分档（没自定义时是默认分档），按 min_level 升序。
     level_titles_enabled: bool = False
     level_titles: list[LevelTitle] = Field(default_factory=list)
