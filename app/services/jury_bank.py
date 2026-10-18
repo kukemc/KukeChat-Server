@@ -415,7 +415,13 @@ async def restore_if_cleared(db: AsyncSession, member: Any) -> bool:
     if low_agreement or low_golden:
         return False
     now = datetime.now(UTC)
+    # 这次暂停本来就不该发生：在任天数和任期接着原来的算，不从现在重新开始
+    serving_since, term_ends_at = member.serving_since, penalty_service.aware(member.term_ends_at)
     jury_service._activate(member, now)
+    if serving_since is not None:
+        member.serving_since = serving_since
+    if term_ends_at is not None and term_ends_at > now:
+        member.term_ends_at = term_ends_at
     member.review_note = "质控题更正后准确率已恢复，系统自动恢复资格"
     member.reviewed_at = now
     member.reviewed_by_id = None

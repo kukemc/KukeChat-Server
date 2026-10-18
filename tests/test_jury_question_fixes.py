@@ -77,6 +77,9 @@ class QuestionFixTests(Phase2TestCase):
             member = await self._member(db, "juror1")
             # 已经答过 4 道、对 2 道，有点积分可扣（投票当天先拿今日首票 +2）
             member.golden_total, member.golden_correct, member.points = 4, 2, 100
+            serving_since = datetime.now(UTC) - timedelta(days=3)
+            term_ends_at = datetime.now(UTC) + timedelta(days=20)
+            member.serving_since, member.term_ends_at = serving_since, term_ends_at
             await db.commit()
             await self._cast(db, "juror1", question.id, "none", quality=True)
             await db.refresh(member)
@@ -86,6 +89,8 @@ class QuestionFixTests(Phase2TestCase):
             await self._update(db, question, verified=False)
             await db.refresh(member)
             self.assertEqual((member.status, member.golden_correct, member.points), ("active", 3, 107))
+            # 在任天数和任期接着原来的算
+            self.assertEqual((bank_service.penalty_service.aware(member.serving_since), bank_service.penalty_service.aware(member.term_ends_at)), (serving_since, term_ends_at))
             self.assertEqual(await self._fixed_logs(db, "juror1", question.id), [10])
             kinds = (await db.execute(select(JuryNotification.kind).where(JuryNotification.user_id == self.ids["juror1"]))).scalars().all()
             self.assertIn("reinstated", kinds)
