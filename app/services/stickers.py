@@ -83,7 +83,8 @@ async def list_favorite_stickers(db: AsyncSession, user_id: int) -> list[Favorit
         select(FavoriteSticker)
         .options(joinedload(FavoriteSticker.asset))
         .where(FavoriteSticker.user_id == user_id)
-        .order_by(FavoriteSticker.created_at.desc(), FavoriteSticker.id.desc())
+        # 没排过序的（新加的）在前，按添加时间倒序；排过序的按 position
+        .order_by(FavoriteSticker.position.is_(None).desc(), FavoriteSticker.position.asc(), FavoriteSticker.created_at.desc(), FavoriteSticker.id.desc())
     )
     return result.scalars().all()
 
@@ -137,20 +138,53 @@ async def add_favorite_sticker(db: AsyncSession, user_id: int, source_url: str) 
         return favorite
 
 
-async def remove_favorite_sticker(db: AsyncSession, user_id: int, asset_id: int) -> None:
-    favorite = await _get_favorite_sticker(db, user_id, asset_id)
-    if favorite is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Favorite sticker not found")
+async def _delete_favorite(db: AsyncSession, favorite: FavoriteSticker, keys_to_delete: list[str]) -> None:
+    """删掉一条收藏；这张图没人收藏了就连图一起删（对象存储里的文件记到 keys_to_delete，提交之后再删）。"""
     asset = favorite.asset
     await db.delete(favorite)
     await db.flush()
-    keys_to_delete: list[str] = []
     if asset is not None:
         remaining_result = await db.execute(select(FavoriteSticker.id).where(FavoriteSticker.asset_id == asset.id).limit(1))
         if remaining_result.scalar_one_or_none() is None:
             await db.delete(asset)
             if asset.storage_path != asset.source_path and asset.storage_path.startswith("stickers/"):
                 keys_to_delete.extend([asset.storage_path, thumbnail_key_for_key(asset.storage_path)])
+
+
+async def remove_favorite_sticker(db: AsyncSession, user_id: int, asset_id: int) -> None:
+    favorite = await _get_favorite_sticker(db, user_id, asset_id)
+    if favorite is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Favorite sticker not found")
+    keys_to_delete: list[str] = []
+    await _delete_favorite(db, favorite, keys_to_delete)
     await db.commit()
     if keys_to_delete:
         await asyncio.to_thread(delete_objects, keys_to_delete)
+
+
+async def remove_favorite_stickers(db: AsyncSession, user_id: int, asset_ids: list[int]) -> int:
+    """批量删除：已经不在收藏里的跳过。返回删掉了几个。"""
+    wanted = set(asset_ids)
+    favorites = [item for item in await list_favorite_stickers(db, user_id) if item.asset_id in wanted]
+    keys_to_delete: list[str] = []
+    for favorite in favorites:
+        await _delete_favorite(db, favorite, keys_to_delete)
+    await db.commit()
+    if keys_to_delete:
+        await asyncio.to_thread(delete_objects, keys_to_delete)
+    return len(favorites)
+
+
+async def reorder_favorite_stickers(db: AsyncSession, user_id: int, asset_ids: list[int]) -> list[FavoriteSticker]:
+    """按给的顺序排。必须正好是当前全部收藏表情（多了、少了、重复都 409，客户端刷新后重试）。"""
+    favorites = await list_favorite_stickers(db, user_id)
+    by_asset = {item.asset_id: item for item in favorites}
+    if len(asset_ids) != len(set(asset_ids)) or set(asset_ids) != set(by_asset):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "sticker_order_mismatch", "message": "表情列表已经变了，刷新后再排"},
+        )
+    for index, asset_id in enumerate(asset_ids):
+        by_asset[asset_id].position = index
+    await db.commit()
+    return await list_favorite_stickers(db, user_id)

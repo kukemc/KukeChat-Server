@@ -12,7 +12,7 @@ from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import HTTPException, Request, status
 from fastapi.responses import FileResponse
-from PIL import Image, ImageOps, UnidentifiedImageError
+from PIL import Image, ImageOps, ImageSequence, UnidentifiedImageError
 from starlette.routing import NoMatchFound
 
 from app.core.config import settings
@@ -46,6 +46,9 @@ MAX_AUDIO_UPLOAD_BYTES = 2 * 1024 * 1024
 # old local files; Pillow's default decompression warning is not a hard limit.
 MAX_IMAGE_PIXELS = 12_000_000
 MAX_LEGACY_IMAGE_BYTES = 12 * 1024 * 1024
+# 动态 WebP / APNG 转成 GIF 时的上限：帧数、所有帧加起来的像素数（超了就和以前一样只留第一帧）
+MAX_ANIMATED_FRAMES = 300
+MAX_ANIMATED_TOTAL_PIXELS = 40_000_000
 
 
 @dataclass(frozen=True)
@@ -591,6 +594,28 @@ def _encode_jpeg(image: Image.Image, max_dimension: int, *, quality: int | None 
     return output.getvalue()
 
 
+def _animated_to_gif(image: Image.Image, max_dimension: int, max_bytes: int) -> bytes | None:
+    """动态 WebP / APNG（常见的是 QQ、微信存下来、扩展名还是 .jpg 的表情）转成 GIF，保住动画。
+
+    所有客户端都只把 .gif 当动图播，所以统一转成 GIF。帧太多、太大或者转完超过上传上限时返回 None，按静态图处理。
+    """
+    frame_count = getattr(image, "n_frames", 1)
+    width, height = image.size
+    if frame_count < 2 or frame_count > MAX_ANIMATED_FRAMES or width * height * frame_count > MAX_ANIMATED_TOTAL_PIXELS:
+        return None
+    frames: list[Image.Image] = []
+    durations: list[int] = []
+    for frame in ImageSequence.Iterator(image):
+        rgba = frame.convert("RGBA")
+        rgba.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
+        frames.append(rgba)
+        durations.append(max(20, int(frame.info.get("duration") or 100)))
+    output = BytesIO()
+    frames[0].save(output, format="GIF", save_all=True, append_images=frames[1:], duration=durations, loop=0, disposal=2)
+    data = output.getvalue()
+    return data if len(data) <= max_bytes else None
+
+
 async def run_image_worker(function, *args):
     """Hold the decode slot until its thread finishes, even on cancellation.
 
@@ -661,15 +686,20 @@ def _process_verified_image(content: bytes, folder: str, object_id: str, limits:
     active = limits if limits is not None else DEFAULT_IMAGE_UPLOAD_LIMITS
     image_format, _detected_content_type = _verified_image(content, active.max_pixels)
     folder = _normalize_key(folder)
-    key = _join_key(folder, f"{object_id}.gif" if image_format == "GIF" else f"{object_id}.jpg")
     max_dimension = active.max_dimension if active.max_dimension is not None else settings.image_max_dimension
     base_quality = active.quality if active.quality is not None else settings.image_quality
     try:
         with Image.open(BytesIO(content)) as image:
             _check_image_pixels(image, active.max_pixels)
+            animated = None
+            if image_format in {"WEBP", "PNG"} and getattr(image, "is_animated", False):
+                animated = _animated_to_gif(image, max_dimension, active.max_bytes)
             # Preserve every GIF frame; only the first frame is decoded for its thumbnail.
             if image_format == "GIF":
                 data = content
+                content_type = "image/gif"
+            elif animated is not None:
+                data = animated
                 content_type = "image/gif"
             else:
                 # 默认（quality=None）走 min(settings.image_quality, 78)，与放宽前一致；
@@ -693,6 +723,7 @@ def _process_verified_image(content: bytes, folder: str, object_id: str, limits:
     except Exception as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Image could not be decoded") from exc
 
+    key = _join_key(folder, f"{object_id}.gif" if content_type == "image/gif" else f"{object_id}.jpg")
     thumbnail_key = thumbnail_key_for_key(key)
     return ProcessedImageUpload(
         key=key,

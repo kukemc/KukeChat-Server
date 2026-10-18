@@ -74,6 +74,24 @@ class UploadResourceTests(unittest.TestCase):
         with Image.open(BytesIO(processed.data)) as gif:
             self.assertEqual(gif.n_frames, 2)
 
+    def test_animated_webp_and_apng_are_kept_as_gif(self) -> None:
+        # QQ / 微信存下来的表情常是动态 WebP，扩展名还是 .jpg：按内容识别，转成 GIF 保住动画
+        frames = [Image.new("RGBA", (40, 40), (index * 60, 0, 0, 255)) for index in range(4)]
+        for format in ("WEBP", "PNG"):
+            with self.subTest(format=format):
+                output = BytesIO()
+                frames[0].save(output, format=format, save_all=True, append_images=frames[1:], duration=80, loop=0)
+                processed = storage.process_image_upload(output.getvalue(), "messages", "anim")
+                self.assertEqual((processed.content_type, processed.key), ("image/gif", "messages/anim.gif"))
+                with Image.open(BytesIO(processed.data)) as gif:
+                    self.assertEqual(gif.n_frames, 4)
+                self.assertTrue(processed.thumbnail_data.startswith(bytes((0xFF, 0xD8))))
+        # 帧数超过上限的按静态图处理
+        with patch.object(storage, "MAX_ANIMATED_FRAMES", 3):
+            output = BytesIO()
+            frames[0].save(output, format="WEBP", save_all=True, append_images=frames[1:], duration=80, loop=0)
+            self.assertEqual(storage.process_image_upload(output.getvalue(), "messages", "flat").content_type, "image/jpeg")
+
     def test_local_sticker_source_is_bounded_before_read_all(self) -> None:
         with TemporaryDirectory() as root, patch.object(storage.settings, "upload_dir", root), patch.object(storage.settings, "storage_backend", "local"):
             path = Path(root) / "messages" / "old.png"

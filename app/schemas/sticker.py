@@ -17,6 +17,12 @@ class FavoriteStickerCreate(BaseModel):
         return normalized
 
 
+class FavoriteStickerIds(BaseModel):
+    """排序（必须正好是当前全部收藏表情）和批量删除共用。"""
+
+    asset_ids: list[int] = Field(max_length=2000)
+
+
 class FavoriteStickerRead(BaseModel):
     asset_id: int
     url: str

@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 
 UTC = timezone.utc
 
-from sqlalchemy import DateTime, ForeignKey, String, UniqueConstraint
+from sqlalchemy import DateTime, ForeignKey, Integer, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -34,6 +34,8 @@ class FavoriteSticker(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     asset_id: Mapped[int] = mapped_column(ForeignKey("sticker_assets.id", ondelete="CASCADE"), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    # 用户手动排过序之后的位置（0 起）；没排过的、排序之后新加的是 NULL，排在最前面（按添加时间倒序）
+    position: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     user: Mapped["User"] = relationship(back_populates="favorite_stickers")
     asset: Mapped[StickerAsset] = relationship(back_populates="favorites")

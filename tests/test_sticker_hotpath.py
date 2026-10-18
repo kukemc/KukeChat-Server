@@ -70,6 +70,27 @@ class StickerHotpathTests(unittest.IsolatedAsyncioTestCase):
         async with self.sessions() as db:
             return await stickers.add_favorite_sticker(db, user_id, f"/uploads/{source}")
 
+    async def test_reorder_and_batch_delete(self) -> None:
+        self.set_source(animated_gif(), "image/gif")
+        ids = [(await self.favorite(1, f"messages/{name}.gif")).asset_id for name in ("a", "b", "c")]
+        async with self.sessions() as db:
+            # 新加的在前
+            self.assertEqual([item.asset_id for item in await stickers.list_favorite_stickers(db, 1)], ids[::-1])
+            ordered = await stickers.reorder_favorite_stickers(db, 1, [ids[1], ids[0], ids[2]])
+            self.assertEqual([item.asset_id for item in ordered], [ids[1], ids[0], ids[2]])
+            for wrong in ([ids[0], ids[1]], [ids[0], ids[0], ids[1], ids[2]], [*ids, 999]):
+                with self.assertRaises(HTTPException) as caught:
+                    await stickers.reorder_favorite_stickers(db, 1, wrong)
+                self.assertEqual(caught.exception.status_code, 409)
+        # 排过序之后新加的排最前
+        newest = (await self.favorite(1, "messages/d.gif")).asset_id
+        async with self.sessions() as db:
+            self.assertEqual([item.asset_id for item in await stickers.list_favorite_stickers(db, 1)], [newest, ids[1], ids[0], ids[2]])
+            self.assertEqual(await stickers.remove_favorite_stickers(db, 1, [ids[0], newest, 12345]), 2)
+            self.assertEqual([item.asset_id for item in await stickers.list_favorite_stickers(db, 1)], [ids[1], ids[2]])
+            # 别人的收藏删不到
+            self.assertEqual(await stickers.remove_favorite_stickers(db, 2, [ids[1]]), 0)
+
     async def test_png_and_jpeg_each_fetch_from_s3_only_once(self) -> None:
         for fmt, suffix, content_type in (("PNG", "png", "image/png"), ("JPEG", "jpg", "image/jpeg")):
             with self.subTest(fmt=fmt):
