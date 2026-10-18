@@ -8,6 +8,9 @@
 按违规概率排先后；一审判 block 但二审没把握、因此没处罚的（downgraded）也进，排在机器案件的最前面，而且不占每天的名额 ——
 它们原本是要直接处罚的。
 
+空闲复查（docs/moderation-v2.md 1.11，moderation_idle.py）：一审放行、但作者有风险信号或一审风险分偏高的群聊文字，二审闲着时再问一次，
+概率够高的也从这里建案（machine_source = idle_scan），只用名额里留给它的那一份（jury_machine_idle_share），不和其余机器案件互相挤占。
+
 由 moderation.py 在审核流程的最后调用，调用方保证这里出任何问题都不影响审核本身。
 """
 
@@ -36,9 +39,17 @@ from app.services import penalties as penalty_service
 logger = logging.getLogger(__name__)
 UTC = timezone.utc
 
-# 每天（最近 24 小时）最多进多少件 = max(下限, 在任委员数 × 系数)。旧管线每天约 170 条「拿不准」，全收远超委员容量。
+# 每天（最近 24 小时）最多进多少件 = max(下限, 在任委员数 × 系数)。旧管线每天约 170 条「拿不准」，二审放行掉 p < 0.1 的之后
+# 还剩一半上下；委员反映活太少，2026-10-19 起名额提到每人每天 6 件（至少 15 件），大约能把二审认为值得看的全收下。
 DAILY_PER_JUROR = settings.jury_machine_daily_per_juror
 DAILY_MIN = settings.jury_machine_daily_min
+# 空闲复查开着时，名额里留给它的比例：复查只能用这一份，其余机器案件只能用剩下的
+IDLE_SHARE = settings.jury_machine_idle_share
+# machine_source 的取值
+SOURCE_REVIEW = "review"
+SOURCE_DOWNGRADED = "downgraded"
+SOURCE_IDLE_SCAN = "idle_scan"
+IDLE_SCAN_REASON = "空闲复查"
 # 真实举报的优先级恒为正数（举报人权重 × 理由权重），所以负数一定排在它们后面。
 MACHINE_PRIORITY = -1.0
 # 二审之后还要交给人看的两种结果
@@ -100,16 +111,47 @@ def machine_priority(record: ContentModerationRecord) -> float:
     p = record.judge_p
     if p is None:
         return MACHINE_PRIORITY
+    # 空闲复查的（judge_outcome = idle_scan）和二审认为值得看的同一个算法：按概率排
     score = (1 + p) / 2 if record.judge_outcome == "downgraded" else p / 2
     return round(MACHINE_PRIORITY + 0.99 * score, 4)
 
 
 async def daily_cap(db: AsyncSession, now: datetime) -> int:
-    """今天最多收多少件。"""
+    """今天最多收多少件（全部机器案件，含留给空闲复查的那一份）。"""
     jurors = await db.execute(
         select(func.count(JuryMember.id)).where(JuryMember.status == "active", or_(JuryMember.term_ends_at.is_(None), JuryMember.term_ends_at > now))
     )
     return max(DAILY_MIN, math.floor(int(jurors.scalar_one() or 0) * DAILY_PER_JUROR))
+
+
+async def idle_scan_on(db: AsyncSession) -> bool:
+    """空闲复查现在开没开（部署配置 + 后台开关）。关着时不给它留名额。"""
+    return settings.moderation_idle_scan_enabled and await jury_settings.is_enabled(db, "machine_idle_scan")
+
+
+async def caps(db: AsyncSession, now: datetime) -> dict[str, int]:
+    """今天的名额怎么分：{total, idle_scan, regular}。复查开着时留 floor(total × IDLE_SHARE) 给它（向下取整：名额很少时
+    先保证拿不准的），其余给拿不准的。"""
+    total = await daily_cap(db, now)
+    idle = min(total, math.floor(total * IDLE_SHARE)) if await idle_scan_on(db) else 0
+    return {"total": total, "idle_scan": idle, "regular": total - idle}
+
+
+async def _used(db: AsyncSession, now: datetime, *, idle_scan: bool) -> int:
+    """最近 24 小时用掉的名额。降级来的（downgraded）不占名额，也不计数。"""
+    clauses = [ReportCase.case_origin == "machine", ReportCase.created_at >= now - timedelta(hours=24)]
+    if idle_scan:
+        clauses.append(ReportCase.machine_source == SOURCE_IDLE_SCAN)
+    else:
+        clauses.append(or_(ReportCase.machine_source.is_(None), ReportCase.machine_source == SOURCE_REVIEW))
+    return int((await db.execute(select(func.count(ReportCase.id)).where(*clauses))).scalar_one() or 0)
+
+
+async def has_room(db: AsyncSession, *, idle_scan: bool, now: datetime | None = None) -> bool:
+    """这一份名额今天还有没有剩。空闲复查在问二审之前先看一眼，满了就不白问。"""
+    now = now or datetime.now(UTC)
+    limit = (await caps(db, now))["idle_scan" if idle_scan else "regular"]
+    return await _used(db, now, idle_scan=idle_scan) < limit
 
 
 async def _open_case(
@@ -123,8 +165,11 @@ async def _open_case(
     message_id: int | None,
     content_publishable: bool,
     snapshot: Any,
+    source: str | None = None,
+    note: str | None = None,
 ) -> ReportCase | None:
-    """建一个机器来源的案件并放进委员队列。snapshot 是一个返回快照的协程函数：前面的条件都过了才去取。"""
+    """建一个机器来源的案件并放进委员队列。snapshot 是一个返回快照的协程函数：前面的条件都过了才去取。
+    source 不传按二审结果算（downgraded / review）；空闲复查传 idle_scan。"""
     category, mentioned = _machine_categories(record)
     if mentioned & (BLOCKED_CATEGORIES | case_service.SENSITIVE_MACHINE_CATEGORIES):
         return None
@@ -134,13 +179,12 @@ async def _open_case(
     if existing.scalar_one_or_none() is not None:
         return None
     now = datetime.now(UTC)
+    if source is None:
+        source = SOURCE_DOWNGRADED if record.judge_outcome == "downgraded" else SOURCE_REVIEW
     # 一审 block、二审降级的不占名额：它们本来是要直接处罚的，不能因为名额满了就谁也不看
-    if record.judge_outcome != "downgraded":
-        used = await db.execute(
-            select(func.count(ReportCase.id)).where(ReportCase.case_origin == "machine", ReportCase.created_at >= now - timedelta(hours=24))
-        )
-        if int(used.scalar_one() or 0) >= await daily_cap(db, now):
-            return None
+    if source != SOURCE_DOWNGRADED and not await has_room(db, idle_scan=source == SOURCE_IDLE_SCAN, now=now):
+        return None
+    idle_scan = source == SOURCE_IDLE_SCAN
     case = ReportCase(
         target_key=key,
         target_type=target_type,
@@ -154,9 +198,16 @@ async def _open_case(
         jury_eligible=True,
         report_count=0,
         reporter_weight=0.0,
-        primary_reason=f"{case_service.MACHINE_REASON_PREFIX} · {penalty_service.category_label(category)}",
+        primary_reason=(
+            f"{case_service.MACHINE_REASON_PREFIX} · {IDLE_SCAN_REASON}"
+            if idle_scan
+            else f"{case_service.MACHINE_REASON_PREFIX} · {penalty_service.category_label(category)}"
+        ),
         priority=machine_priority(record),
-        machine_decision="review",
+        # 空闲复查的内容一审是放行的
+        machine_decision="allow" if idle_scan else "review",
+        machine_source=source,
+        machine_note=(note or "")[:200] or None,
         machine_category=category,
         machine_confidence=record.confidence,
         judge_p=record.judge_p,
@@ -232,4 +283,39 @@ async def offer_post(db: AsyncSession, post: Post, records: list[ContentModerati
         # 公开动态的内容可以公示（和举报建案时一样）
         content_publishable=True,
         snapshot=snapshot,
+    )
+
+
+async def offer_idle_scan(db: AsyncSession, message: Message, record: ContentModerationRecord, reasons: list[str]) -> ReportCase | None:
+    """空闲复查（moderation_idle.py）认为可疑的一条群聊文字建成案件。只建案：不处罚、不撤回。
+
+    record 已经写好了这次复查的 judge_p。reasons 是选中它的理由（「新账号」「一审风险分 4.2」……），只给后台看，委员看不到。
+    """
+    if message.type != MessageType.TEXT or message.recalled_at is not None or record.judge_p is None:
+        return None
+    if not await jury_settings.is_enabled(db, "machine_review"):
+        return None
+    conversation = await db.get(Conversation, message.conversation_id)
+    # 私聊永远不进委员队列（和 offer_message 同一个口径）
+    if conversation is None or conversation.type != ConversationType.GROUP or conversation.is_temporary:
+        return None
+
+    async def snapshot() -> dict[str, Any]:
+        from app.services import reports as report_service
+
+        return await report_service._message_report_snapshot(db, message, conversation, None)
+
+    note = f"{IDLE_SCAN_REASON}：{'、'.join(reasons) or '一审放行'}；二审 {record.judge_p:.2f}"
+    return await _open_case(
+        db,
+        record=record,
+        target_type="message",
+        target_id=message.id,
+        reported_user_id=message.sender_id,
+        conversation_id=message.conversation_id,
+        message_id=message.id,
+        content_publishable=False,
+        snapshot=snapshot,
+        source=SOURCE_IDLE_SCAN,
+        note=note,
     )

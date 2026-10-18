@@ -341,6 +341,10 @@ async def question_reads(db: AsyncSession, cases: list[ReportCase]) -> list[dict
                 "answer_overridden": case.golden_outcome is not None or case.golden_level is not None or case.golden_category is not None,
                 "answered": answered,
                 "correct_rate": round(correct / answered, 3) if answered else None,
+                # 题库体检（jury_bank_audit.py）：没体检过三项都是 null。judge_p 在体检前可能是举报预审时的概率，不算体检结果
+                "judge_p": case.judge_p if case.bank_audit_at is not None else None,
+                "audit_flag": case.bank_audit_flag if case.bank_audit_at is not None else None,
+                "audit_at": penalty_service.aware(case.bank_audit_at),
             }
         )
     return items
@@ -352,10 +356,16 @@ async def list_questions(
     verified: bool | None = None,
     source: str | None = None,
     query: str | None = None,
+    audit: str | None = None,
     limit: int = 50,
     offset: int = 0,
 ) -> tuple[list[dict[str, Any]], int]:
     clauses: list[Any] = [ReportCase.is_golden.is_(True)]
+    # 题库体检的结论：suspect / ok / skipped；none = 还没体检过
+    if audit == "none":
+        clauses.append(ReportCase.bank_audit_at.is_(None))
+    elif audit:
+        clauses.append(ReportCase.bank_audit_flag == audit)
     if verified is not None:
         clauses.append(ReportCase.golden_verified.is_(verified))
     if source == "legacy":

@@ -953,12 +953,13 @@ class MachineCaseTests(Phase3TestCase):
 
     async def test_daily_cap_scales_with_the_number_of_jurors(self) -> None:
         async with self.sessions() as db:
-            await self._switch(db, machine_review=True)
+            # 空闲复查关着：名额全给拿不准的（复查开着时的分法见 test_moderation_idle）
+            await self._switch(db, machine_review=True, machine_idle_scan=False)
             now = datetime.now(UTC)
-            # 9 位在任委员 × 2 = 18；至少 5
-            self.assertEqual(await machine_service.daily_cap(db, now), 18)
+            # 9 位在任委员 × 6 = 54；至少 15
+            self.assertEqual(await machine_service.daily_cap(db, now), 54)
             with patch.object(machine_service, "DAILY_PER_JUROR", 0.2):
-                self.assertEqual(await machine_service.daily_cap(db, now), 5)
+                self.assertEqual(await machine_service.daily_cap(db, now), 15)
         with patch.object(machine_service, "DAILY_MIN", 2), patch.object(machine_service, "DAILY_PER_JUROR", 0):
             for name in ("insult", "insult2", "insult3"):
                 await self._moderate(self.messages[name])
@@ -1360,7 +1361,7 @@ class ConfigTests(Phase3TestCase):
             )
             self.assertEqual(
                 (thresholds["machine_daily_per_juror"], thresholds["machine_daily_min"], thresholds["cleared_block_days"], thresholds["reconsider_window_days"], thresholds["reconsider_text_min"]),
-                (2, 5, 30, 7, 10),
+                (6, 15, 30, 7, 10),
             )
 
 
@@ -1462,7 +1463,7 @@ class EndpointTests(Phase3TestCase):
         self.assertEqual((appeals["total"], appeals["items"][0]["violation_id"], appeals["items"][0]["votes"][0]["juror"]["username"], appeals["items"][0]["votes"][0]["vote"]), (1, violation.id, "juror4", "uphold"))
         self.assertEqual((await client.get("/admin/jury/reviews", params={"kind": "reconsider"})).json()["items"][0]["case_id"], dismissed.id)
         thresholds = (await client.get("/admin/jury/settings")).json()["thresholds"]
-        self.assertEqual((thresholds["panel_timeout_hours"], thresholds["machine_daily_min"]), (48, 5))
+        self.assertEqual((thresholds["panel_timeout_hours"], thresholds["machine_daily_min"]), (48, 15))
         # 管理员直接给合议中的案件下结论
         resolved = (await client.post(f"/admin/cases/{case.id}/resolve", json={"outcome": "dismiss"})).json()
         self.assertEqual((resolved["status"], resolved["queue"], resolved["panel_outcome"]), ("dismissed", "panel", "manual"))

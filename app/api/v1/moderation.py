@@ -19,6 +19,7 @@ from app.schemas.penalty import (
     RuleTier,
     ViolationRead,
 )
+from app.services import moderation as moderation_service
 from app.services import penalties as penalty_service
 from app.websocket.manager import admin_manager
 
@@ -70,6 +71,9 @@ async def appeal_violation(
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> ViolationRead:
     violation = await penalty_service.submit_appeal(db, current_user.id, violation_id, payload.text)
+    if violation.source in moderation_service.APPEAL_JUDGE_SOURCES and violation.target_type == "message":
+        # 申诉预审：后台问一次二审，结果只给管理员排先后（docs/moderation-v2.md 1.3）
+        moderation_service.schedule_appeal_judgement(violation.id)
     await admin_manager.broadcast(
         "admin.violation.changed",
         {"violation_id": violation.id, "user_id": violation.user_id, "action": "appealed"},

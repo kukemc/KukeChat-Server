@@ -362,6 +362,13 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("content_moderation_records", "judge_ms", "judge_ms INTEGER"),
     ("content_moderation_records", "judge_outcome", "judge_outcome VARCHAR(12)"),
     ("report_cases", "judge_p", "judge_p FLOAT"),
+    # 一审风险分、空闲复查、申诉预审、题库体检（docs/moderation-v2.md 1.10–1.11、jury-v2.md 2.1.1）
+    ("content_moderation_records", "risk_score", "risk_score FLOAT"),
+    ("report_cases", "machine_source", "machine_source VARCHAR(12)"),
+    ("report_cases", "machine_note", "machine_note VARCHAR(200)"),
+    ("report_cases", "bank_audit_at", "bank_audit_at DATETIME"),
+    ("report_cases", "bank_audit_flag", "bank_audit_flag VARCHAR(8)"),
+    ("user_violations", "appeal_judge_p", "appeal_judge_p FLOAT"),
 )
 
 _ADDED_INDEXES: tuple[tuple[str, str], ...] = (
@@ -426,6 +433,11 @@ _ADDED_INDEXES: tuple[tuple[str, str], ...] = (
     (
         "content_moderation_records",
         "CREATE INDEX IF NOT EXISTS ix_moderation_records_judge_pending ON content_moderation_records (created_at) WHERE judge_outcome = 'pending'",
+    ),
+    # 空闲复查按「最近几小时、一审风险分够高」找消息（部分索引：只有带风险分的文本记录进索引）
+    (
+        "content_moderation_records",
+        "CREATE INDEX IF NOT EXISTS ix_moderation_records_created_risk ON content_moderation_records (created_at, risk_score) WHERE risk_score IS NOT NULL",
     ),
 )
 

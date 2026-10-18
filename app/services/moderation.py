@@ -437,7 +437,11 @@ async def _second_opinion(db: AsyncSession, message: Message, records: list[Cont
             record.judge_outcome = JUDGE_PENDING
             await db.commit()
             verdict = await moderation_judge.judge(
-                moderation_judge.clean_text(record.content_text, moderation_judge.TEXT_CHARS), context, after, priority=priority
+                moderation_judge.clean_text(record.content_text, moderation_judge.TEXT_CHARS),
+                context,
+                after,
+                priority=priority,
+                risk=record.risk_score,
             )
             # 等的这段时间里发送者可能自己撤回了：后面按最新状态处理
             await db.refresh(message, attribute_names=["recalled_at", "recalled_by_id"])
@@ -466,11 +470,81 @@ async def judge_reported_message(db: AsyncSession, message_id: int) -> float | N
     if not text:
         return None
     context, after = await moderation_judge.message_context(db, message, after=moderation_judge.REPORT_AFTER_MESSAGES)
+    risk = await _latest_risk_score(db, message_id)
     await _release_connection(db)
     verdict = await moderation_judge.judge(
-        moderation_judge.clean_text(text, moderation_judge.TEXT_CHARS), context, after, priority=moderation_judge.PRIORITY_REPORT
+        moderation_judge.clean_text(text, moderation_judge.TEXT_CHARS), context, after, priority=moderation_judge.PRIORITY_REPORT, risk=risk
     )
     return round(verdict.p, 4) if verdict is not None else None
+
+
+async def _latest_risk_score(db: AsyncSession, message_id: int) -> float | None:
+    """这条消息最近一次一审给文本的风险分（二审排队用）；没有为 None。"""
+    row = await db.execute(
+        select(ContentModerationRecord.risk_score)
+        .where(ContentModerationRecord.message_id == message_id, ContentModerationRecord.risk_score.is_not(None))
+        .order_by(ContentModerationRecord.id.desc())
+        .limit(1)
+    )
+    return row.scalar_one_or_none()
+
+
+# ---------------------------------------------------------------- 申诉预审（docs/moderation-v2.md 1.3）
+
+# 机器给文字的处罚来源（图片 auto_image 不送：二审只看文字）
+APPEAL_JUDGE_SOURCES = ("auto_rule", "auto_ai")
+
+
+def schedule_appeal_judgement(violation_id: int) -> None:
+    """申诉交上来之后在后台问一次二审，不让申诉人等。"""
+    if not moderation_judge.is_active():
+        return
+    _schedule_task(judge_appeal(violation_id))
+
+
+async def judge_appeal(violation_id: int, session_factory: Any = None) -> float | None:
+    """机器处罚的一条消息被申诉了：结合上下文（含下文）问一次二审，概率写在 user_violations.appeal_judge_p 上，
+    后台申诉列表按它把可能误判的排在前面。只给管理员参考，不会自动改判、也不影响资深复审。不可用返回 None。"""
+    factory = session_factory or AsyncSessionLocal
+    async with factory() as db:
+        if not await jury_settings.is_enabled(db, "machine_judge"):
+            return None
+        violation = await db.get(UserViolation, violation_id)
+        if (
+            violation is None
+            or violation.appeal_status != "pending"
+            or violation.source not in APPEAL_JUDGE_SOURCES
+            or violation.target_type != "message"
+            or violation.target_id is None
+        ):
+            return None
+        record = await db.get(ContentModerationRecord, violation.moderation_record_id) if violation.moderation_record_id else None
+        message = await db.get(Message, violation.target_id)
+        # 被罚的消息一般已经撤回了，正文以审核记录里留的为准
+        text = (record.content_text if record is not None and record.content_type == "text" else None) or (
+            message.content if message is not None and message.type == MessageType.TEXT else None
+        )
+        if not (text or "").strip():
+            return None
+        context: list[str] = []
+        after: list[str] = []
+        if message is not None:
+            context, after = await moderation_judge.message_context(db, message, after=moderation_judge.REPORT_AFTER_MESSAGES)
+        risk = record.risk_score if record is not None else None
+        await _release_connection(db)
+        verdict = await moderation_judge.judge(
+            moderation_judge.clean_text(text, moderation_judge.TEXT_CHARS), context, after, priority=moderation_judge.PRIORITY_REPORT, risk=risk
+        )
+        if verdict is None:
+            return None
+        p = round(verdict.p, 4)
+        await db.execute(update(UserViolation).where(UserViolation.id == violation_id).values(appeal_judge_p=p))
+        await db.commit()
+    try:
+        await admin_manager.broadcast("admin.violation.changed", {"violation_id": violation_id, "action": "appeal_judged"})
+    except Exception:
+        logger.exception("Failed to broadcast appeal judgement", extra={"violation_id": violation_id})
+    return p
 
 
 async def recover_stale_judgements() -> int:
@@ -1156,6 +1230,7 @@ def _build_record(
         severity=normalized["severity"],
         categories=_canonical_json(normalized.get("categories") or []),
         confidence=float(normalized.get("confidence")) if isinstance(normalized.get("confidence"), Real) else None,
+        risk_score=normalized.get("risk_score"),
         reason=normalized.get("reason"),
         raw_response=_canonical_json(result),
         evidence_snapshot=evidence_json,
@@ -1186,6 +1261,7 @@ def _build_post_record(
         severity=normalized["severity"],
         categories=_canonical_json(normalized.get("categories") or []),
         confidence=float(normalized.get("confidence")) if isinstance(normalized.get("confidence"), Real) else None,
+        risk_score=normalized.get("risk_score"),
         reason=normalized.get("reason"),
         raw_response=_canonical_json(result),
         evidence_snapshot=evidence_json,
@@ -1210,6 +1286,7 @@ def _build_post_comment_record(comment: PostComment, content_text: str, result: 
         severity=normalized["severity"],
         categories=_canonical_json(normalized.get("categories") or []),
         confidence=float(normalized.get("confidence")) if isinstance(normalized.get("confidence"), Real) else None,
+        risk_score=normalized.get("risk_score"),
         reason=normalized.get("reason"),
         raw_response=_canonical_json(result),
         evidence_snapshot=evidence_json,
@@ -1233,6 +1310,7 @@ def _build_post_topic_record(topic: PostTopic, content_text: str, result: dict[s
         severity=normalized["severity"],
         categories=_canonical_json(normalized.get("categories") or []),
         confidence=float(normalized.get("confidence")) if isinstance(normalized.get("confidence"), Real) else None,
+        risk_score=normalized.get("risk_score"),
         reason=normalized.get("reason"),
         raw_response=_canonical_json(result),
         evidence_snapshot=evidence_json,
@@ -1256,6 +1334,7 @@ def _build_profile_cover_record(user: User, content_url: str, result: dict[str, 
         severity=normalized["severity"],
         categories=_canonical_json(normalized.get("categories") or []),
         confidence=float(normalized.get("confidence")) if isinstance(normalized.get("confidence"), Real) else None,
+        risk_score=normalized.get("risk_score"),
         reason=normalized.get("reason"),
         raw_response=_canonical_json(result),
         evidence_snapshot=evidence_json,
@@ -1286,6 +1365,7 @@ def _build_teamup_profile_record(
         severity=normalized["severity"],
         categories=_canonical_json(normalized.get("categories") or []),
         confidence=float(normalized.get("confidence")) if isinstance(normalized.get("confidence"), Real) else None,
+        risk_score=normalized.get("risk_score"),
         reason=normalized.get("reason"),
         raw_response=_canonical_json(result),
         evidence_snapshot=evidence_json,
@@ -1310,6 +1390,7 @@ def _build_teamup_comment_record(comment: TeamupComment, content_text: str, resu
         severity=normalized["severity"],
         categories=_canonical_json(normalized.get("categories") or []),
         confidence=float(normalized.get("confidence")) if isinstance(normalized.get("confidence"), Real) else None,
+        risk_score=normalized.get("risk_score"),
         reason=normalized.get("reason"),
         raw_response=_canonical_json(result),
         evidence_snapshot=evidence_json,
@@ -1333,7 +1414,16 @@ def _normalize_result(result: dict[str, Any], fallback_type: str) -> dict[str, A
         "confidence": selected.get("confidence"),
         "reason": selected.get("reason") or result.get("reason"),
         "scores": selected.get("scores"),
+        "risk_score": _risk_score(selected.get("risk_score", result.get("risk_score"))) if (selected.get("type") or fallback_type) == "text" else None,
     }
+
+
+def _risk_score(value: Any) -> float | None:
+    """一审的文本风险分（0–10）。老版本审核服务没有这个字段；不是数、超出范围的一律当没有。"""
+    if isinstance(value, bool) or not isinstance(value, Real):
+        return None
+    score = float(value)
+    return round(score, 3) if 0.0 <= score <= 10.0 else None
 
 
 async def _apply_moderation_action(db: AsyncSession, message: Message, record: ContentModerationRecord) -> ModerationAction:

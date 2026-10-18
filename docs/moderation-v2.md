@@ -77,6 +77,12 @@
 
 - 每条处罚只能申诉一次，重复提交返回 409。
 - 申诉通过后该记录 `status=revoked`，记分清零，由它触发的禁言 / 封禁同步解除。
+- **申诉预审**（后台用，客户端无变化）：机器给文字的处罚（`source` 为 `auto_rule` / `auto_ai`、内容是消息）被申诉时，后台任务
+  结合上下文（前 5 条、后 3 条，同 1.10 的匿名规则）问一次二审，违规概率写在 `AdminViolationRead.appeal_judge_p`；
+  低于 `MODERATION_APPEAL_LOW_P`（默认 0.3）的 `appeal_possible_error=true`，后台显示「二审：违规概率 0.08，可能误判」。
+  `GET /admin/violations?appeal_status=pending` 按概率从低到高排（没有预审结果的排最后）。**只排先后，不会自动通过或驳回**，
+  也不影响资深复审。二审不可用、后台开关 `machine_judge` 关着时没有这个概率，申诉照常。预审出结果时后台通道发
+  `admin.violation.changed`（`action=appeal_judged`）。
 
 ### 1.4 被封禁时怎么申诉
 
@@ -139,7 +145,7 @@
 
 后台读规则用 `GET /admin/moderation/rules`（与 `/moderation/rules` 内容相同；后者在客户端证明头校验之后，后台调不通）。
 
-`penalty` 结构：`{ kind, hours?, permanent? }`。`AdminViolationRead` 在 `ViolationRead` 基础上多出：`user_id`、`user`、`raw_source`、`confidence`、`reason`、`moderation_record_id`、`report_id`、`case_id`、`actor`、`review_status`、`recommended_penalty`、`reviewed_at`、`appeal_text`、`appealed_at`、`appeal_note`、`appeal_reviewed_at`、`revoked_at`、`revoke_reason`。
+`penalty` 结构：`{ kind, hours?, permanent? }`。`AdminViolationRead` 在 `ViolationRead` 基础上多出：`user_id`、`user`、`raw_source`、`confidence`、`reason`、`moderation_record_id`、`report_id`、`case_id`、`actor`、`review_status`、`recommended_penalty`、`reviewed_at`、`appeal_text`、`appealed_at`、`appeal_note`、`appeal_reviewed_at`、`appeal_judge_p`、`appeal_possible_error`（申诉预审，见 1.3）、`revoked_at`、`revoke_reason`。
 
 `GET /admin/stats` 新增 `appeals_pending`、`penalty_reviews_pending`。`POST /admin/reports/{id}/review` 新增可选的 `violation_category`、`violation_level`：给了就按阶梯处罚；同时带 `disable_user` 时以管理员指定的封禁时长为准。原有的手动封禁 / 解封接口不变，但现在都会落到台账里。
 
@@ -182,7 +188,8 @@
   都算不可用，照一审结论办。连不上 / 审核机关了二审时 60 秒内不再去问。等二审期间进程退出（发版重启）留下的 `pending` 记录，
   由审核重试循环（每 `CONTENT_MODERATION_RETRY_INTERVAL_SECONDS`）按一审结论补做，不会丢。
 - **排队**：每个后端进程一个有界优先队列（`MODERATION_JUDGE_QUEUE_SIZE`，默认 16）、同一时刻最多一个请求在路上；
-  审核机上还有一道全局并发 1。先做一审 `block` 的，再做一审拿不准的，最后是举报。
+  审核机上还有一道全局并发 1。先做一审 `block` 的，再做一审拿不准（含出错）的，然后是举报和申诉预审，最后是空闲复查（1.11）和题库体检
+  （jury-v2.md 2.1.1）。同一档里一审风险分 `risk_score` 高的先做（没有按 0）。
 - **上下文**：只给送二审的消息查一次同会话里之前的 `MODERATION_JUDGE_CONTEXT_MESSAGES`（默认 5）条（举报的消息另带后 3 条），
   撤回的和系统消息不带，正文截断。发言人匿名成「被举报人」（待审消息的作者）和 成员A / 成员B …，`@昵称` 换成 `@某人`，
   不带用户名、昵称、ID。上下文只发给我们自己的审核机做自动判断（每条消息本来就会单独送审），不落库，管理员看不到私聊上下文。
@@ -198,10 +205,43 @@
 
 - `ContentModerationRecordRead`（`GET /admin/moderation-records`）新增 `judge_p`（违规概率）、`judge_ms`（审核服务报的耗时，含它那边的排队）、
   `judge_outcome`（`pending` / `confirmed` / `downgraded` / `cleared` / `flagged` / `scored` / `unavailable`；`scored` 是举报预审里只打分的）。
-  没送二审的三个都是 null。记录的 `decision` 始终是一审原样。
+  没送二审的三个都是 null。记录的 `decision` 始终是一审原样。`judge_outcome` 还有一种 `idle_scan`：一审放行、被空闲复查送过二审的（1.11）。
+- `ContentModerationRecordRead` 新增 `risk_score`：一审给文本的风险分（0–10，越大越可疑）。审核服务 `/moderate/text` 的结果、`/moderate` 的
+  文本结果顶层带 `risk_score`；老版本审核服务没有这个字段、不是 0–10 的数、图片记录都是 null。所有文本记录（消息、动态、评论、话题、组队）都存。
 - `CaseRead` 新增 `judge_p`。不给委员看（`JuryCaseView` 里没有），免得影响他们的判断。
 - 审核服务新增 `POST /judge/text`（和 `/moderate*` 同一个 `X-Moderation-Token`）：body `{ text, context: [str], after?: [str] }`，
   返回 `{ p_violation, latency_ms, model }`；不可用时 503，`detail.code` ∈ `judge_disabled` / `judge_busy` / `judge_timeout` / `judge_unavailable` / `judge_bad_response`。
+
+### 1.11 空闲复查（已实现）
+
+二审一小时能做 600–1400 次，实时的活每小时只有二十来次。空闲的时候，后端把最近一审**放行**过、但看起来可疑的群聊文字再交给二审看一遍，
+概率够高的建成没有举报人的机器案件交给委员（docs/jury-v2.md 3.3）。**从不处罚、从不撤回。**
+
+- **挑哪些消息**：最近 `MODERATION_IDLE_SCAN_LOOKBACK_HOURS`（默认 6）小时、发出满 3 分钟（下文出来了）的**群聊纯文本**消息，一审 `allow`、
+  没被处理过、没送过二审、没撤回、不在任何案件里，且满足下面任意一条：
+  - 作者注册不满 7 天；
+  - 作者和被封的设备、或最近 180 天被封且还封着的账号有强 / 中关联（同一设备令牌、机器码、浏览器指纹；只靠 IP 的不算，见 device-bans.md）；
+  - 作者近 30 天有处罚（没撤销的违规记录）；
+  - 作者近 7 天被举报过（不论结果）；
+  - 消息所在的群近 7 天被举报 ≥ 3 次；
+  - 一审风险分 `risk_score` ≥ `MODERATION_IDLE_SCAN_MIN_RISK`（默认 3），不看作者。
+  候选先按一审风险分从高到低、再按作者身上的风险信号多少排，每轮最多 `MODERATION_IDLE_SCAN_BATCH`（默认 50）条。查询只走带索引的列
+  （`content_moderation_records.created_at`、新加的部分索引 `(created_at, risk_score) WHERE risk_score IS NOT NULL`、
+  `user_violations.created_at`、`user_reports.created_at`、`users.banned_at`、设备表的 `(kind, value_hash)`），风险名单每 10 分钟算一次。
+- **私聊永远不送**：私聊不是案源，复查连二审都不问。
+- **怎么问**：和举报一样带前 5 条、后 3 条匿名上下文，放进二审队列的最低一档；只在本进程队列里没有实时的活、库里也没有别的进程
+  正在等二审的记录（`judge_outcome=pending`）时才放，一次一条。限速每小时最多 `MODERATION_IDLE_SCAN_HOURLY_CAP`（默认 600）次
+  （两次之间至少 6 秒）。二审排不上 / 超时 / 不可用时整体暂停 5 分钟。
+- **不重复**：问之前把审核记录的 `judge_outcome` 从空改成 `idle_scan`（认领），概率写回 `judge_p`；没问成的退回空值下次再来。
+  之后有人举报这条消息时直接复用这个概率。
+- **只有一个进程在扫**：几个 worker 抢 `system_settings` 里的一行租约（`moderation.idle_scan.lease`，3 分钟没续就过期），每问一条续一次。
+- **建案**：概率 ≥ `MODERATION_IDLE_SCAN_THRESHOLD`（默认 0.6）且后台开关 `machine_review` 开着时，建一个机器案件：`case_origin=machine`、
+  `machine_source=idle_scan`、`machine_decision=allow`、理由「机器筛查 · 空闲复查」，`machine_note` 记着为什么选中它（例如
+  「空闲复查：新账号、近 7 天被举报；二审 0.83」，只给后台看）。和其他机器案件一起按概率排、全部排在真实举报后面，只用每日名额里留给复查的那一份。
+- **开关**：部署配置 `MODERATION_IDLE_SCAN_ENABLED`（默认 true）；后台「风纪 › 设置」的 `machine_idle_scan`（默认开）。另外 `machine_judge`、
+  `machine_review` 也都要开着才跑（`machine_review` 关着时建不了案件，问了也白问）。
+- **负载估算**：一天约 1.7 万条消息，6 小时窗口里被选中的通常几十到几百条；即使每小时都打满 600 次，审核机也还有一半空闲，
+  实时的活最多多等一条（约 5 秒）。
 
 ## 2. 举报案件（已实现）
 

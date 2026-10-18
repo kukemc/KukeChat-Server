@@ -14,9 +14,10 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import HTTPException, status
-from sqlalchemy import func, select, update
+from sqlalchemy import case as sql_case, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.models.enums import PlatformRole, UserStatus
 from app.models.penalty import UserViolation
 from app.models.report import AdminAuditLog
@@ -876,10 +877,14 @@ async def list_violations(
     if source:
         clauses.append(UserViolation.source.like("auto_%") if source == "auto" else UserViolation.source == source)
     total = int((await db.execute(select(func.count(UserViolation.id)).where(*clauses))).scalar_one() or 0)
+    order: list[Any] = [UserViolation.id.desc()]
+    if appeal_status == "pending":
+        # 待处理的申诉：申诉预审（二审）认为违规概率低的、可能是误判的排在最前；没有预审结果的排在后面
+        order = [sql_case((UserViolation.appeal_judge_p.is_(None), 1), else_=0), UserViolation.appeal_judge_p.asc(), UserViolation.id.desc()]
     result = await db.execute(
         select(UserViolation)
         .where(*clauses)
-        .order_by(UserViolation.id.desc())
+        .order_by(*order)
         .offset(offset)
         .limit(limit)
     )
@@ -914,6 +919,9 @@ async def build_admin_reads(db: AsyncSession, violations: list[UserViolation]) -
                 "appealed_at": aware(violation.appealed_at),
                 "appeal_note": violation.appeal_note,
                 "appeal_reviewed_at": aware(violation.appeal_reviewed_at),
+                # 申诉预审：二审的违规概率，低于 moderation_appeal_low_p 时标「可能误判」
+                "appeal_judge_p": violation.appeal_judge_p,
+                "appeal_possible_error": violation.appeal_judge_p is not None and violation.appeal_judge_p < settings.moderation_appeal_low_p,
                 "revoked_at": aware(violation.revoked_at),
                 "revoke_reason": violation.revoke_reason,
             }

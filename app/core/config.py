@@ -90,6 +90,26 @@ class Settings(BaseSettings):
     moderation_judge_queue_size: int = Field(default=16, ge=1, le=1000)
     # 带给二审的上文条数（同一会话里待审消息之前的消息）；被举报的消息另外带最多 3 条下文
     moderation_judge_context_messages: int = Field(default=5, ge=0, le=20)
+    # 空闲复查（docs/moderation-v2.md 1.11）：二审闲着的时候，把最近一审放行、但作者有风险或一审风险分偏高的群聊文字
+    # 交给二审再看一遍，概率够高的建成机器案件给委员看（从不处罚、从不撤回）。还要后台开关 machine_idle_scan、
+    # machine_judge、machine_review 都开着才跑。
+    moderation_idle_scan_enabled: bool = True
+    # 二审概率 ≥ 这个值才建案件
+    moderation_idle_scan_threshold: float = Field(default=0.6, ge=0, le=1)
+    # 每一轮最多复查多少条、往回看多久
+    moderation_idle_scan_batch: int = Field(default=50, ge=1, le=500)
+    moderation_idle_scan_lookback_hours: int = Field(default=6, ge=1, le=72)
+    # 复查每小时最多问二审多少次（两次之间至少隔 3600 / 这个值 秒）
+    moderation_idle_scan_hourly_cap: int = Field(default=600, ge=1, le=3600)
+    # 一审放行、作者没有风险信号的消息，一审风险分（risk_score，0–10）≥ 这个值也复查
+    moderation_idle_scan_min_risk: float = Field(default=3, ge=0, le=10)
+    # 消息发出后至少等这么久再复查（让下文先出来，二审能看到后面几条）
+    moderation_idle_scan_min_age_seconds: int = Field(default=180, ge=0, le=3600)
+    # 没有要复查的消息时、或者二审忙 / 不可用之后，多久再来看
+    moderation_idle_scan_interval_seconds: int = Field(default=120, ge=5, le=3600)
+    moderation_idle_scan_backoff_seconds: int = Field(default=300, ge=10, le=24 * 3600)
+    # 申诉预审（docs/moderation-v2.md 1.3）：机器处罚的申诉，二审概率低于这个值时后台标「可能误判」、排在申诉列表最前
+    moderation_appeal_low_p: float = Field(default=0.3, ge=0, le=1)
     # 语音口令识别服务（语音红包，docs/red-packets.md）。不配就不开放语音红包；密钥沿用 content_moderation_token
     voice_asr_url: str | None = None
     voice_asr_timeout_seconds: int = Field(default=15, ge=1, le=60)
@@ -236,9 +256,11 @@ class Settings(BaseSettings):
     jury_points_panel_agreed: int = Field(default=15, ge=-1000, le=1000)
     jury_points_panel_disagreed: int = Field(default=5, ge=-1000, le=1000)
     jury_points_review_vote: int = Field(default=8, ge=-1000, le=1000)
-    # 机器拿不准的内容每天（最近 24 小时）最多进多少件 = max(下限, 在任委员数 × 系数)
-    jury_machine_daily_per_juror: float = Field(default=2, ge=0, le=1000)
-    jury_machine_daily_min: int = Field(default=5, ge=0, le=100000)
+    # 机器案件每天（最近 24 小时）最多进多少件 = max(下限, 在任委员数 × 系数)。委员反映活太少，2026-10-19 从 2 / 5 提到 6 / 15
+    jury_machine_daily_per_juror: float = Field(default=6, ge=0, le=1000)
+    jury_machine_daily_min: int = Field(default=15, ge=0, le=100000)
+    # 上面的名额里留给空闲复查的比例（复查开着时）：复查只能用这一份，其余机器案件用剩下的，两边互不挤占
+    jury_machine_idle_share: float = Field(default=0.3, ge=0, le=1)
     # 一条消息 / 动态被认定不违规后多少天内不能再举报
     jury_cleared_block_days: int = Field(default=30, ge=0, le=3650)
     # 举报人复议：定案后多少天内可以申请、理由至少多少个字

@@ -375,7 +375,7 @@
 | 接口 | 说明 |
 | --- | --- |
 | `GET /admin/jury/settings` | 三个开关的当前值、全部阈值的当前值（只读展示） |
-| `PUT /admin/jury/settings` | `{ auto_appoint?, appeals?, machine_review?, public_group_content?, opinions_open_to_jurors?, exam_required?, machine_judge? }`（`exam_required` 二期起；`machine_judge` 是机器二审，见 moderation-v2.md 1.10，**默认开**，其余默认关），写审计日志，几秒内对所有进程生效 |
+| `PUT /admin/jury/settings` | `{ auto_appoint?, appeals?, machine_review?, public_group_content?, opinions_open_to_jurors?, exam_required?, machine_judge?, machine_idle_scan? }`（`exam_required` 二期起；`machine_judge` 是机器二审，见 moderation-v2.md 1.10，**默认开**；`machine_idle_scan` 是空闲复查，见 1.11，**默认开**，只建案不处罚；其余默认关），写审计日志，几秒内对所有进程生效 |
 | `POST /admin/jury/members/{user_id}/review` | 原有。`approve` / `reinstate` 新增可选的 `tier`（创始任命：直接任命为任意层级）；新增 `action: "set_tier"` |
 | `GET /admin/jury/opinions?state=&reported=&case_id=&limit&offset` | 观点列表，带真实作者和举报记录 |
 | `POST /admin/jury/opinions/{id}/moderate` | `{ action: "delete" \| "restore" \| "dismiss_reports", note? }` |
@@ -450,6 +450,22 @@
 - 计过分的题被改回未核对、或移出题库时，之前答错的一律改判为答对（同上）。
 - 改判之后，被系统按准确率自动暂停的委员如果准确率回到暂停线以上，自动恢复资格（审计 `jury.member.auto_reinstate`，通知 `reinstated`）。
 - 某道质控题在上次核对之后答错的 ≥ 2 人且占 ≥ 40%，自动改回未核对、移出考试和质控（审计 `jury.question.auto_pulled`），等管理员复核：改答案、移出题库或重新核对。只移出、不自动改判。
+
+### 2.1.1 题库体检（后台）
+
+让二审（moderation-v2.md 1.10）把题库里的每道题看一遍，找出标准答案可能有误的题。**从不自动改答案。**
+
+- `POST /admin/jury/questions/audit` → `AdminQuestionAuditStatus`：开始一轮（题库里全部的题，含未核对的）。已经在跑返回 409 `audit_running`；
+  二审没开（部署配置或后台开关 `machine_judge`）返回 409 `judge_unavailable`。
+- `GET /admin/jury/questions/audit` → `{ status, total, done, flagged, skipped, suspect_total, started_at, finished_at, message }`。
+  `status` ∈ `idle`（没跑过）/ `running` / `done` / `failed`（二审连续不可用，停了）/ `interrupted`（跑的进程退出了，10 分钟没动静）。
+  `flagged` / `skipped` 是这一轮的，`suspect_total` 是题库里现在标着疑似有误的总数。
+- 证据就是委员看到的那份：案件快照里的匿名消息，被举报那条之前 5 条、之后 3 条，被举报人 = 那条消息的作者；动态只看正文。
+  被举报的不是文字（图片、语音）或者内容没了的记为 `skipped`。
+- 判定：标准答案「不违规」但 `p ≥ 0.8`，或标准答案「违规」但 `p ≤ 0.1`，标为 `suspect`（疑似答案有误）；其余 `ok`。
+- 在后台慢慢跑：二审队列最低一档，只在没有实时的活时才问，一道一道来；进度存在 `system_settings`，哪个进程都看得到。
+- `AdminQuestionRead` 新增 `judge_p`、`audit_flag`（`ok` / `suspect` / `skipped`）、`audit_at`，没体检过都是 null；
+  `GET /admin/jury/questions` 新增筛选 `audit=suspect|ok|skipped|none`（`none` = 没体检过）。
 
 ### 2.2 资格与申请
 
@@ -804,13 +820,18 @@
 
 开关 `machine_review`，默认关。打开后，机器判为「拿不准」的内容里，**群聊里的纯文本消息和公开动态的文字**会作为没有举报人的案件进委员队列。图片、私聊、色情类不进。
 
-- 限量：每天进队列的上限 = 在任委员数 × 2（至少 5），到上限后当天不再收。
+- 限量：每天（最近 24 小时）进队列的上限 = 在任委员数 × 6（至少 15），到上限后当天不再收（2026-10-19 从 × 2、至少 5 提上来：委员反映活太少）。
+  空闲复查（moderation-v2.md 1.11）开着时，其中 30%（向下取整）只给复查建的案件用，其余给拿不准的，两份互不挤占；复查关着时全给拿不准的。
+  一审 `block`、二审降级的不占名额。
 - 排在所有真实举报的案件后面。
 - 这类案件超时或无共识时不转管理员：有资深委员就进合议，否则直接以「未作处理」结案，不记任何处罚。
 - 委员看到的 `JuryCaseView`（以及 `PanelCaseView`、`JuryCaseDetail`、公示栏的条目和详情）新增 `case_origin`：`report` / `machine`。机器来源的案件 `report_count` 为 0，`reasons` 是一项 `{ "reason": "机器筛查 · 辱骂骚扰", "count": 1 }`。
 - 认定违规后和举报案件一样：撤回内容、按阶梯处罚、进公示栏（群聊消息不带内容）。
 - 二审（moderation-v2.md 1.10）之后：二审认为没问题的不进；一审出错、二审认为值得看的也进；一审判 `block` 但二审没把握、因此没处罚的也进，
   而且不占每日名额。机器案件之间按二审概率排（降级的那种整体在前），仍然全部排在真实举报后面。
+  二审概率在放行线（0.1）和处罚线（0.9）之间的拿不准内容（`flagged`）、以及降级的，只要类别不是色情类、内容还在，就一定进（受名额限制）。
+- 空闲复查：一审放行、但作者有风险信号或一审风险分偏高的群聊文字，二审闲着时再看一遍，概率 ≥ 0.6 的也作为机器案件进来
+  （理由「机器筛查 · 空闲复查」），见 moderation-v2.md 1.11。委员看到的和其他机器案件一样，不知道它为什么被选中。
 
 ### 3.4 判例
 
@@ -974,7 +995,7 @@
 
 | 接口 | 说明 |
 | --- | --- |
-| `GET /admin/cases?queue=panel` | 合议中的案件；`CaseRead.queue` 多一个取值 `panel`，新增 `case_origin`（`report` / `machine`）、`panel_outcome`、`reconsider_status` |
+| `GET /admin/cases?queue=panel` | 合议中的案件；`CaseRead.queue` 多一个取值 `panel`，新增 `case_origin`（`report` / `machine`）、`panel_outcome`、`reconsider_status`；机器案件另有 `machine_source`（`review` / `downgraded` / `idle_scan`，旧案件为 null）和 `machine_note`（建案原因，只给后台） |
 | `POST /admin/cases/{id}/resolve` | 对合议中的案件同样可用（管理员直接接手） |
 | `GET /admin/jury/reviews?kind=appeal\|reconsider&status=open\|closed&limit&offset` | 资深复审的监控：处罚 / 案件、申诉内容、每位复审委员的票（实名）、结果 |
 | `POST /admin/violations/{id}/appeal` | 原有。复审进行中或已出结果时也可以调，管理员的结论覆盖复审结果（复审已经撤销了处罚的，不能再驳回：409 `appeal_already_revoked`） |

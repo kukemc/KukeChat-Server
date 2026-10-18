@@ -109,6 +109,9 @@ class AdminViolationRead(ViolationRead):
     appealed_at: datetime | None = None
     appeal_note: str | None = None
     appeal_reviewed_at: datetime | None = None
+    # 申诉预审（docs/moderation-v2.md 1.3）：二审给被罚消息的违规概率；没有预审为 null。possible_error = 概率低于 moderation_appeal_low_p
+    appeal_judge_p: float | None = None
+    appeal_possible_error: bool = False
     revoked_at: datetime | None = None
     revoke_reason: str | None = None
 

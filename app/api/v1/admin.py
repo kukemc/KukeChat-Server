@@ -73,6 +73,7 @@ from app.schemas.jury import (
     AdminExamPage,
     AdminExamRead,
     AdminQuestionDetail,
+    AdminQuestionAuditStatus,
     AdminQuestionPage,
     AdminQuestionRead,
     AdminQuestionUpdate,
@@ -83,6 +84,7 @@ from app.services import cases as case_service
 from app.services import jury as jury_service
 from app.services import jury_reviews as review_service
 from app.services import jury_bank as bank_service
+from app.services import jury_bank_audit as bank_audit_service
 from app.services import jury_points as points_service
 from app.services import jury_opinions as opinion_service
 from app.services import jury_settings
@@ -1029,13 +1031,39 @@ async def admin_list_jury_questions(
     verified: Literal["true", "false", ""] | None = None,
     source: Literal["admin", "consensus", "legacy", "precedent", ""] | None = None,
     q: str | None = Query(default=None, max_length=80),
+    # 题库体检的结论：suspect 疑似答案有误 / ok / skipped / none 没体检过
+    audit: Literal["suspect", "ok", "skipped", "none", ""] | None = None,
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
 ) -> AdminQuestionPage:
     items, total = await bank_service.list_questions(
-        db, verified={"true": True, "false": False}.get(verified or ""), source=source or None, query=q, limit=limit, offset=offset
+        db,
+        verified={"true": True, "false": False}.get(verified or ""),
+        source=source or None,
+        query=q,
+        audit=audit or None,
+        limit=limit,
+        offset=offset,
     )
     return AdminQuestionPage(items=[AdminQuestionRead(**item) for item in items], total=total)
+
+
+# 题库体检（docs/jury-v2.md 2.1.1）。要写在 /jury/questions/{case_id} 前面，否则 audit 会被当成题号
+@router.get("/jury/questions/audit", response_model=AdminQuestionAuditStatus)
+async def admin_jury_question_audit_status(
+    _admin: Annotated[User, Depends(get_current_admin)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> AdminQuestionAuditStatus:
+    return AdminQuestionAuditStatus(**await bank_audit_service.audit_status(db))
+
+
+@router.post("/jury/questions/audit", response_model=AdminQuestionAuditStatus)
+async def admin_start_jury_question_audit(
+    admin: Annotated[User, Depends(get_current_admin)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> AdminQuestionAuditStatus:
+    """让二审把题库里的题全看一遍，标出可能答案有误的题。后台慢慢跑，进度用 GET 查；不会改任何答案。"""
+    return AdminQuestionAuditStatus(**await bank_audit_service.start_audit(db, admin.id))
 
 
 @router.get("/jury/questions/{case_id}", response_model=AdminQuestionDetail)

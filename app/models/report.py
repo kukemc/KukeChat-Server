@@ -107,7 +107,11 @@ class ContentModerationRecord(Base):
     # unavailable 二审不可用，照一审结论办。没送二审为空
     judge_p: Mapped[float | None] = mapped_column(Float, nullable=True)
     judge_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # 再加一种 idle_scan：一审放行的消息被空闲复查送过二审（1.11），概率在 judge_p，没问成的退回空值下次再来
     judge_outcome: Mapped[str | None] = mapped_column(String(12), nullable=True)
+    # 一审给文本的风险分（0–10，越大越可疑；审核服务 AIHub 那一档给的）。老版本审核服务、非文本为空。
+    # 二审排队和空闲复查选消息时用（索引 ix_moderation_records_created_risk 见 database._ADDED_INDEXES）
+    risk_score: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     message: Mapped["Message | None"] = relationship(foreign_keys=[message_id])
     post: Mapped["Post | None"] = relationship(foreign_keys=[post_id])

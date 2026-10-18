@@ -100,6 +100,14 @@ class ReportCase(Base):
     panel_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # 合议的去向：consensus（合议定案）/ timeout（超时转管理员）/ unavailable（凑不齐人，没进或中途转管理员）/ manual（管理员接手）
     panel_outcome: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # 机器案件是哪条路进来的：review（一审拿不准、二审认为值得看；旧案件为空也按它算）/ downgraded（一审 block、二审没把握）/
+    # idle_scan（一审放行、空闲复查时二审认为可疑，docs/moderation-v2.md 1.11）。举报案件为空。只给后台看
+    machine_source: Mapped[str | None] = mapped_column(String(12), nullable=True)
+    # 给后台看的建案原因，例如「空闲复查：新账号、近 7 天被举报；二审 0.83」
+    machine_note: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    # 题库体检（docs/jury-v2.md 2.1.1）：最近一次体检的时间和结论（ok / suspect 疑似答案有误 / skipped 没法判）。概率写在 judge_p
+    bank_audit_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    bank_audit_flag: Mapped[str | None] = mapped_column(String(8), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)

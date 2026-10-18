@@ -88,6 +88,8 @@ class UserViolation(Base):
     appeal_result: Mapped[str | None] = mapped_column(String(8), nullable=True)
     # 结果是谁给的：senior / admin
     appeal_decided_by: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    # 申诉预审：机器处罚被申诉时，二审结合上下文给被罚的那条消息再打的违规概率（只给管理员排先后，不会自动改判）
+    appeal_judge_p: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     user: Mapped["User"] = relationship(foreign_keys=[user_id])
     actor: Mapped["User | None"] = relationship(foreign_keys=[actor_id])

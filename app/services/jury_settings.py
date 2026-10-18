@@ -21,12 +21,15 @@ from app.models.system import SystemSetting
 # exam_required：申请是否必须先通过入门考试。默认关 —— 已发布的旧客户端没有考试入口。
 # machine_judge：机器二审（docs/moderation-v2.md 1.10）。不归风纪管，但它决定一审 block 的内容罚不罚、拿不准的进不进委员队列，
 # 放在这里和 machine_review 一起开关。
+# machine_idle_scan：空闲复查（docs/moderation-v2.md 1.11），二审闲着时复查一审放行的可疑群聊文字，可疑的建成机器案件。
+# 只建案、不处罚，而且 machine_review 关着时什么也不做，所以默认开。
 SWITCHES: tuple[str, ...] = (
     "auto_appoint", "appeals", "machine_review", "public_group_content", "opinions_open_to_jurors", "exam_required", "machine_judge",
+    "machine_idle_scan",
 )
 PUBLIC_SWITCHES: tuple[str, ...] = ("auto_appoint", "appeals", "machine_review")
 # 没设置过时默认开的开关；其余没设置过的一律是关
-DEFAULT_ON: frozenset[str] = frozenset({"machine_judge"})
+DEFAULT_ON: frozenset[str] = frozenset({"machine_judge", "machine_idle_scan"})
 _KEY_PREFIX = "jury.switch."
 # 服务跑两个 worker 进程，另一个进程改了开关后最多这么久才能看到。
 CACHE_SECONDS = 5.0
@@ -167,6 +170,14 @@ def thresholds() -> dict[str, int | float]:
         "points_review_vote": settings.jury_points_review_vote,
         "machine_daily_per_juror": settings.jury_machine_daily_per_juror,
         "machine_daily_min": settings.jury_machine_daily_min,
+        "machine_idle_share": settings.jury_machine_idle_share,
+        # 空闲复查（docs/moderation-v2.md 1.11）
+        "idle_scan_threshold": settings.moderation_idle_scan_threshold,
+        "idle_scan_min_risk": settings.moderation_idle_scan_min_risk,
+        "idle_scan_batch": settings.moderation_idle_scan_batch,
+        "idle_scan_lookback_hours": settings.moderation_idle_scan_lookback_hours,
+        "idle_scan_hourly_cap": settings.moderation_idle_scan_hourly_cap,
+        "appeal_low_p": settings.moderation_appeal_low_p,
         "cleared_block_days": settings.jury_cleared_block_days,
         "reconsider_window_days": settings.jury_reconsider_window_days,
         "reconsider_text_min": settings.jury_reconsider_text_min,

@@ -41,8 +41,8 @@ class FakeJudge:
         self.results = list(results)
         self.calls: list[dict] = []
 
-    async def __call__(self, text, context=None, after=None, *, priority):
-        self.calls.append({"text": text, "context": list(context or []), "after": list(after or []), "priority": priority})
+    async def __call__(self, text, context=None, after=None, *, priority, risk=None):
+        self.calls.append({"text": text, "context": list(context or []), "after": list(after or []), "priority": priority, "risk": risk})
         p = self.results.pop(0) if self.results else None
         return None if p is None else moderation_judge.JudgeVerdict(p=p, latency_ms=4800, model="startlux-test")
 

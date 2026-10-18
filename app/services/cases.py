@@ -1497,6 +1497,8 @@ async def build_case_reads(db: AsyncSession, cases: list[ReportCase]) -> list[di
                 "overturn_note": case.overturn_note,
                 # —— 三期 ——
                 "case_origin": case.case_origin or "report",
+                "machine_source": case.machine_source,
+                "machine_note": case.machine_note,
                 "panel_at": penalty_service.aware(case.panel_at),
                 "panel_outcome": case.panel_outcome,
                 "reconsider_status": reconsiders.get(case.id, "none"),

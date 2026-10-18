@@ -1368,8 +1368,8 @@ class OverviewAndSettingsTests(JuryV2TestCase):
 
     async def test_switches_config_and_tiers(self) -> None:
         async with self.sessions() as db:
-            # 没设置过的都是关，只有机器二审（machine_judge）默认开
-            self.assertEqual(await jury_settings.get_switches(db), {name: name == "machine_judge" for name in jury_settings.SWITCHES})
+            # 没设置过的都是关，只有机器二审（machine_judge）和空闲复查（machine_idle_scan）默认开
+            self.assertEqual(await jury_settings.get_switches(db), {name: name in {"machine_judge", "machine_idle_scan"} for name in jury_settings.SWITCHES})
             config = JuryConfig(**await overview_service.config(db))
             self.assertEqual((config.version, config.switches), (2, {"auto_appoint": False, "appeals": False, "machine_review": False}))
             # 一期的能力和投票选项原样在前面，二期的追加在后面
@@ -1395,7 +1395,7 @@ class OverviewAndSettingsTests(JuryV2TestCase):
 
             # 改开关：立即生效，写审计日志，没变化的不记
             changed = await jury_settings.update_switches(db, self.ids["admin"], {"appeals": True, "auto_appoint": False, "public_group_content": True})
-            self.assertEqual(changed, {"auto_appoint": False, "appeals": True, "machine_review": False, "public_group_content": True, "opinions_open_to_jurors": False, "exam_required": False, "machine_judge": True})
+            self.assertEqual(changed, {"auto_appoint": False, "appeals": True, "machine_review": False, "public_group_content": True, "opinions_open_to_jurors": False, "exam_required": False, "machine_judge": True, "machine_idle_scan": True})
             self.assertTrue(await jury_settings.is_enabled(db, "public_group_content"))
             self.assertEqual((await overview_service.config(db))["switches"], {"auto_appoint": False, "appeals": True, "machine_review": False})
             log = (await db.execute(select(AdminAuditLog).where(AdminAuditLog.action == "jury.settings.update"))).scalar_one()

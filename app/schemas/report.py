@@ -360,6 +360,8 @@ class ContentModerationRecordRead(BaseModel):
     judge_p: float | None = None
     judge_ms: int | None = None
     judge_outcome: str | None = None
+    # 一审给文本的风险分（0–10）；老版本审核服务、非文本为 null
+    risk_score: float | None = None
 
     @computed_field
     @property

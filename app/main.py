@@ -33,6 +33,7 @@ from app.core import loop_watch
 from app.services.cases import start_jury_sweep_worker, stop_jury_sweep_worker
 from app.services.ccw import start_ccw_binding_worker, stop_ccw_binding_worker
 from app.services.moderation import start_moderation_retry_worker, stop_moderation_retry_worker
+from app.services.moderation_idle import start_idle_scan_worker, stop_idle_scan_worker
 from app.services.group_files import start_group_file_worker, stop_group_file_worker
 from app.services.red_packets import start_red_packet_worker, stop_red_packet_worker
 from app.services.gifts import ensure_default_gifts
@@ -110,6 +111,8 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
     await shared_realtime_subscriber.start()
     start_ccw_binding_worker()
     start_moderation_retry_worker()
+    # 空闲复查：二审闲着时复查一审放行的可疑群聊文字（docs/moderation-v2.md 1.11），几个进程里只有拿到租约的那个在扫
+    start_idle_scan_worker()
     start_task_reminder_worker()
     start_jury_sweep_worker()
     # 账号等级：记在线时长、结算活跃天；老用户的折算也在这个循环启动时做一次
@@ -145,6 +148,7 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
         await stop_jury_sweep_worker()
         await stop_task_reminder_worker()
         await stop_ccw_binding_worker()
+        await stop_idle_scan_worker()
         await stop_moderation_retry_worker()
         await shared_realtime_subscriber.stop()
         await game_manager.stop()

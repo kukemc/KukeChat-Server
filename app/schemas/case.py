@@ -86,6 +86,9 @@ class CaseRead(BaseModel):
     # —— 三期 ——
     # report 有人举报 / machine 机器拿不准的内容（没有举报人；之后有人举报同一条内容时并进来，仍是 machine）
     case_origin: Literal["report", "machine"] = "report"
+    # 机器案件是怎么进来的：review / downgraded / idle_scan（空闲复查）；举报案件和旧的机器案件为 null。machine_note 是建案原因
+    machine_source: str | None = None
+    machine_note: str | None = None
     # 进入资深合议的时间；没进过为 null
     panel_at: datetime | None = None
     # 合议的去向：consensus 合议定案 / timeout 超时转管理员 / unavailable 凑不齐人 / manual 管理员接手；合议中或没进过为 null

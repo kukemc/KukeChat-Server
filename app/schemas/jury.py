@@ -356,6 +356,7 @@ class JurySettingsUpdate(BaseModel):
     opinions_open_to_jurors: bool | None = None
     exam_required: bool | None = None
     machine_judge: bool | None = None
+    machine_idle_scan: bool | None = None
 
 
 # ---------------------------------------------------------------- 入门考试
@@ -577,6 +578,27 @@ class AdminQuestionRead(BaseModel):
     # 被答次数和正确率（评审中的质控作答 + 练习场）
     answered: int = 0
     correct_rate: float | None = None
+    # 题库体检（docs/jury-v2.md 2.1.1）：二审的违规概率、结论（ok / suspect 疑似答案有误 / skipped 没法判）、体检时间。没体检过为 null
+    judge_p: float | None = None
+    audit_flag: Literal["ok", "suspect", "skipped"] | None = None
+    audit_at: datetime | None = None
+
+
+class AdminQuestionAuditStatus(BaseModel):
+    """题库体检的进度（docs/jury-v2.md 2.1.1）。"""
+
+    # idle 没跑过 / running / done / failed / interrupted（跑的进程退出了）
+    status: Literal["idle", "running", "done", "failed", "interrupted"]
+    total: int = 0
+    done: int = 0
+    # 这一轮标出来的「疑似答案有误」/ 没法判的
+    flagged: int = 0
+    skipped: int = 0
+    # 题库里现在标着「疑似答案有误」的总数（含以前几轮）
+    suspect_total: int = 0
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    message: str | None = None
 
 
 class AdminQuestionPage(BaseModel):
