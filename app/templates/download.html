@@ -173,6 +173,9 @@
     .dl.is-disabled.is-primary { background: transparent; color: var(--fg); border-color: var(--line-strong); }
     .dl.is-disabled.is-primary small { color: var(--muted); }
     .hint { margin: 18px 0 0; font-size: 13px; color: var(--faint); }
+    .alt { margin: 8px 0 0; font-size: 13px; color: var(--faint); }
+    .alt a, .faq p a { color: var(--fg-2); text-decoration: underline; text-decoration-color: var(--line); text-underline-offset: 3px; }
+    .alt a:hover, .faq p a:hover { text-decoration-color: currentColor; }
 
     /* ── 产品截图 ── */
     .shot { margin: 72px auto 0; max-width: 1040px; perspective: 1600px; }
@@ -354,6 +357,7 @@
           </a>
         </div>
         <p class="hint rise d4" id="dl-hint">__HINT__</p>
+        <p class="alt rise d4">用 Linux？试试社区维护的<a href="https://kenins.l2.ink/kukechat/" target="_blank" rel="noreferrer">非官方 Linux 版</a></p>
 
         <figure class="shot rise d5">
           <div class="frame">
@@ -455,6 +459,10 @@
           <details>
             <summary>CCW 社区扩展怎么用？</summary>
             <p>点上面的「CCW 社区扩展」打开链接，在 CCW 里就能直接登录聊天，不用另外装任何东西，适合在作品和社区里随手回消息。</p>
+          </details>
+          <details>
+            <summary>有 Linux 版吗？</summary>
+            <p>官方暂时没有。社区开发者浅酱做了一个<b>非官方的 Linux 版</b>（.deb 安装包，适用于 Debian / Ubuntu 及其衍生版），可以在<a href="https://kenins.l2.ink/kukechat/" target="_blank" rel="noreferrer">这里下载</a>。它不是官方发布的，Linux 版的问题请直接反馈给作者。</p>
           </details>
           <details>
             <summary>几个版本的账号通用吗？</summary>
