@@ -13,6 +13,11 @@
   moderation_idle_scan_backoff_seconds。
 - **不重复**：问之前先在审核记录上认领（judge_outcome 从空改成 idle_scan），概率写回同一行；没问成的退回空值，下一轮再来。
 - **私聊不碰**：私聊永远不是案源（docs/jury-v2.md 3.3），连二审都不送。
+- **巡查口吻**：用 /judge/text 的 patrol 问法（作者叫「发言人」、提示词是没人举报的日常巡查），不用举报那套 ——
+  按举报问，普通作品链接、「@某人？」都会给到 0.7–0.8。
+- **预筛 + 去重**（1.12）：太短的（去掉 @昵称、标点之后 ≤ 3 个字）、只有白名单域名网址的（分享作品、邀请链接）、
+  同一个人 moderation_idle_scan_dedupe_hours 内说过的同一段话（已经问过二审的，或者同一批里排在前面的），
+  都不问二审，记录上标 prefiltered（下一轮不再选它）。
 
 选人的风险信号都只查带索引的列、批量查：新账号（注册不满 7 天）、和被封的设备 / 被封的账号有强 / 中关联（同一设备令牌、
 机器码、浏览器指纹）、近 30 天有处罚、近 7 天被举报过、所在的群近 7 天被举报 ≥ 3 次。另外一审风险分 ≥
@@ -76,6 +81,8 @@ IDLE_WAIT_SECONDS = 60.0
 IDLE_POLL_SECONDS = 2.0
 # 二审忙的时候下一轮多久后再来
 BUSY_RETRY_SECONDS = 15.0
+# 去重时最多翻这么多条这些作者最近问过二审的记录
+DEDUPE_LOOKUP_MAX = 2000
 
 REASON_NEW_ACCOUNT = "新账号"
 REASON_LINKED = "关联被封设备 / 账号"
@@ -321,7 +328,10 @@ async def _judge_candidate(factory: Any, candidate: Candidate) -> str:
         if record is None or message is None or message.recalled_at is not None or not (record.content_text or "").strip():
             await db.commit()
             return "skipped"
-        context, after = await moderation_judge.message_context(db, message, after=moderation_judge.REPORT_AFTER_MESSAGES)
+        # 没人举报：用巡查的问法（作者叫「发言人」），不按举报审核问
+        context, after = await moderation_judge.message_context(
+            db, message, after=moderation_judge.REPORT_AFTER_MESSAGES, author_label=moderation_judge.PATROL_LABEL
+        )
         await release_connection(db)
         verdict = await moderation_judge.judge(
             moderation_judge.clean_text(record.content_text, moderation_judge.TEXT_CHARS),
@@ -329,6 +339,7 @@ async def _judge_candidate(factory: Any, candidate: Candidate) -> str:
             after,
             priority=moderation_judge.PRIORITY_IDLE,
             risk=record.risk_score,
+            mode=moderation_judge.MODE_PATROL,
         )
         if verdict is None:
             # 没问成：退回去，下一轮再来
@@ -465,6 +476,8 @@ def _candidate_query(now: datetime, *extra: Any) -> Any:
             Message.conversation_id,
             ContentModerationRecord.risk_score,
             User.created_at,
+            ContentModerationRecord.content_text,
+            Message.metadata_json,
         )
         .join(Message, Message.id == ContentModerationRecord.message_id)
         .join(Conversation, Conversation.id == Message.conversation_id)
@@ -505,9 +518,14 @@ async def select_candidates(db: AsyncSession, now: datetime) -> list[Candidate]:
         found = await db.execute(select(ReportCase.message_id).where(ReportCase.message_id.in_(message_ids[start : start + 200])))
         in_case.update(found.scalars().all())
     candidates: list[Candidate] = []
-    for record_id, message_id, user_id, conversation_id, risk_score, created_at in rows.values():
+    texts: dict[int, tuple[str | None, str | None]] = {}
+    # 已经在案件里的也标掉：不标的话每一轮都会再选到它们，挤掉别的候选
+    already: list[int] = []
+    for record_id, message_id, user_id, conversation_id, risk_score, created_at, content_text, metadata_json in rows.values():
         if message_id in in_case:
+            already.append(record_id)
             continue
+        texts[record_id] = (content_text, metadata_json)
         reasons: list[str] = []
         created = created_at.replace(tzinfo=UTC) if created_at is not None and created_at.tzinfo is None else created_at
         if created is not None and created >= new_since:
@@ -529,4 +547,57 @@ async def select_candidates(db: AsyncSession, now: datetime) -> list[Candidate]:
             Candidate(record_id=record_id, message_id=message_id, user_id=user_id, risk_score=risk_score, reasons=reasons, author_risk=author_risk)
         )
     candidates.sort(key=lambda item: (-(item.risk_score or 0.0), -item.author_risk, item.record_id))
+    candidates = await _prefilter(db, candidates, texts, now, already=already)
     return candidates[:batch]
+
+
+async def _prefilter(
+    db: AsyncSession,
+    candidates: list[Candidate],
+    texts: dict[int, tuple[str | None, str | None]],
+    now: datetime,
+    *,
+    already: list[int] | None = None,
+) -> list[Candidate]:
+    """预筛 + 去重（docs/moderation-v2.md 1.12）：不值得问二审的从候选里拿掉，记录上标 prefiltered，下一轮不再选。
+    candidates 已经排好序：同一个人同一段话只留排在最前面的那条。调用方提交。"""
+    skipped: list[int] = list(already or [])
+    seen: set[tuple[int, str]] = set()
+    hours = settings.moderation_idle_scan_dedupe_hours
+    if hours > 0 and candidates:
+        # 这些作者最近已经问过二审的文字（实时的、复查的都算）：user_id 有索引，一批作者最多几十个
+        authors = sorted({item.user_id for item in candidates})
+        rows = await db.execute(
+            select(ContentModerationRecord.user_id, ContentModerationRecord.content_text)
+            .where(
+                ContentModerationRecord.user_id.in_(authors[:RISK_LIST_MAX]),
+                ContentModerationRecord.created_at >= now - timedelta(hours=hours),
+                ContentModerationRecord.content_type == "text",
+                ContentModerationRecord.judge_p.is_not(None),
+            )
+            .limit(DEDUPE_LOOKUP_MAX)
+        )
+        seen.update((user_id, moderation_judge.dedupe_key(text)) for user_id, text in rows.all() if user_id is not None)
+    kept: list[Candidate] = []
+    for item in candidates:
+        content_text, metadata_json = texts.get(item.record_id, (None, None))
+        names = moderation_judge.mention_names(metadata_json)
+        if moderation_judge.prefilter_reason(content_text, mention_names=names, short=True) is not None:
+            skipped.append(item.record_id)
+            continue
+        key = (item.user_id, moderation_judge.dedupe_key(content_text))
+        if key[1] and key in seen:
+            skipped.append(item.record_id)
+            continue
+        seen.add(key)
+        kept.append(item)
+    for start in range(0, len(skipped), 200):
+        await db.execute(
+            update(ContentModerationRecord)
+            .where(ContentModerationRecord.id.in_(skipped[start : start + 200]), ContentModerationRecord.judge_outcome.is_(None))
+            .values(judge_outcome=moderation_judge.OUTCOME_PREFILTERED)
+            .execution_options(synchronize_session=False)
+        )
+    if skipped:
+        logger.info("Idle scan prefiltered %d messages", len(skipped))
+    return kept

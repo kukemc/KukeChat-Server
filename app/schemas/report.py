@@ -75,11 +75,21 @@ class AdminBanRead(BaseModel):
     # 距离解封还剩多少秒；永久封禁为 None，已到期为 0
     expires_in_seconds: int | None = None
 
-    ban_source: Literal["auto", "manual", "report", "unknown"] = "unknown"
+    # banned_at 是推出来的（老数据 / 机器人没有封禁时间）：取最近的封禁操作记录、机器人停用 / 删除的时间、账号更新时间
+    banned_at_estimated: bool = False
+
+    # bot_deleted / bot_disabled：机器人账号被创建者删除 / 停用（账号状态也是 disabled，但不是封禁，没有时间和原因）
+    ban_source: Literal["auto", "manual", "report", "unknown", "bot_deleted", "bot_disabled"] = "unknown"
     operator_id: int | None = None
     operator_name: str | None = None
     report_id: int | None = None
     evidence: BanEvidence | None = None
+
+    is_bot: bool = False
+    # 机器人的创建者；bot_owner_banned：创建者现在是不是也封着
+    bot_owner_id: int | None = None
+    bot_owner_name: str | None = None
+    bot_owner_banned: bool = False
 
     # 这个号历史上被自动封过几次，用来一眼看出惯犯
     ban_count: int = 0
@@ -89,6 +99,8 @@ class AdminBanRead(BaseModel):
 class AdminBanPage(BaseModel):
     items: list[AdminBanRead]
     total: int
+    # include_bots=false 时被藏起来的机器人账号数（同样的搜索 / 筛选条件下）；include_bots=true 时为 0
+    hidden_bot_count: int = 0
 
 
 class ReportCreate(BaseModel):

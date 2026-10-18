@@ -417,6 +417,23 @@
 - 刚进群、还没读过任何消息的人，进群之前的 @全体 也算未读（和未读数一致）。
 - 这两列是加在已有的表上的：启动时自动 `ALTER TABLE … ADD COLUMN`（可空整数，不回填、不建索引）。两个进程同时启动、都去加同一列时，后到的那个会把「列已存在」当成成功；稳妥起见上线前仍然先单进程启动一次。
 
+### 7.1 未读提及列表（跳到 @我 的消息）
+
+`GET /conversations/{cid}/mentions/unread` → 200
+
+```jsonc
+{
+  "items": [{ "message_id": 123, "kind": "me", "created_at": "2026-10-19T08:00:00Z" }],  // kind: "me" | "all"
+  "total": 1
+}
+```
+
+- 已读位置（`last_read_message_id` / 清空位置，取大的）之后提到我的消息，**旧的在前**，`items` 最多 50 条；`total` 是一共几条（最多数到 1000）。
+- 口径和 `mention_pending` 一样：点名我 → `"me"`；@全体（只算群聊）→ `"all"`；两者都有 → `"me"`。自己发的、撤回的、对自己隐藏的不算。
+- 不是成员 404。客户端跳到某条后照常 `POST /conversations/{id}/read`，再拉一次就是剩下的。
+- 实现：先拿上面那两个记号挡 —— 都不比已读位置新就直接返回空，**不查消息表**（绝大多数情况）。否则只扫 `(已读位置, 两个记号里大的]` 这一段（走 `(conversation_id, id)` 索引），而且只取 `metadata` 里带 `mention` 字样的行，在内存里按 `metadata.mentions` / `mention_all` 认。
+- 同样只是尽力而为：最近一条提及被撤回时记号被清掉，更早那条未读的提及也就不列了（和角标一致）。
+
 ## 8. 生日
 
 用户可以填自己的生日。公开资料上只显示月日，年份要本人选择公开才给；生日当天别人能看到「今天生日」。「今天」一律按 UTC+8。
@@ -505,3 +522,26 @@
 - 原样回显：这次 POST 的返回 `MessageRead.client_nonce`，以及这条消息的 `message.created` 事件里的 `client_nonce`（发给全会话的同一份数据，不含敏感信息）。
 - 不落库：历史分页、单条消息、别的事件里恒为 `null`。不写进 `metadata`，也不受 `metadata` 的任何规则影响。
 - 客户端：POST 返回和 `message.created` 谁先到都行，按 `client_nonce` 找到本地那条替换，另一份按 `id` 去重。
+
+## 12. 语音转文字
+
+`POST /conversations/{cid}/messages/{mid}/transcribe`（无请求体）→ 200 `{ "text": "今天下午三点开会", "cached": false }`
+
+- 能看到这条消息的会话成员都能转（没清空到它之前、没对自己隐藏）；只认 `type = "voice"` 的消息，语音红包领取时发出的那条语音也是。
+- 第一次交给识别服务（`VOICE_ASR_URL` 的 `/asr/transcribe`，和语音红包同一个 SenseVoice 模型）识别，结果存进 `voice_transcripts`（每条消息一行），之后谁来点都直接读库，`cached = true`。
+- `text` 可能是 `""`：录音里没识别出话。空串也存，不会每点一次识别一次；客户端显示「未识别到文字」。数字是汉字（「三点」不是「3点」），和口令识别同一个设置。
+- 消息对象 `MessageRead` 新增 `voice_transcript`：这条语音已经转过就是那段文字（可能是 `""`），没转过、不是语音、撤回了是 `null`。历史分页 / 上下文 / 搜索等返回消息列表的接口都带（一页一条查询）；`message.created` 里恒为 `null`。转完不推实时事件，别人的设备下次拉到消息时才看得到。
+
+| 状态 | `detail.code` | 什么时候 |
+| --- | --- | --- |
+| 404 | `message_not_found` | 消息不存在、不在这个会话、我看不到（不是成员、清空了、隐藏了）、已撤回 |
+| 422 | `not_voice` | 不是语音消息 |
+| 422 | `voice_too_long` | 超过 60 秒（`metadata.voice.duration_ms` 有就先按它挡，没有由识别服务判） |
+| 429 | `transcribe_rate_limited` | 每人每小时最多真正识别 60 次；命中缓存的、识别失败的不算 |
+| 503 | `transcribe_unavailable` | 没配识别服务、连不上、出错；录音文件取不到；不是我们上传的录音（机器人发的外链音频） |
+
+错误体和红包接口一样是 `{ "detail": { "code", "message" } }`。
+
+- 次数按 `voice_transcripts.requested_by_id`（第一个点、真正花了一次识别的人）+ `created_at` 数，几个进程共用一个口径。
+- 等对象存储和识别服务之前把数据库连接还回去（`release_connection`）。两个人同时点同一条：后存的撞唯一约束，直接用先存的那份。
+- 新表 `voice_transcripts`（`message_id` 唯一、外键 CASCADE —— 消息被修剪时跟着删；索引 `(requested_by_id, created_at)`）由启动时的 `create_all` 建，不用手动迁移。

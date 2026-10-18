@@ -58,6 +58,8 @@ JUDGE_CLEARED = "cleared"
 JUDGE_FLAGGED = "flagged"
 JUDGE_SCORED = "scored"
 JUDGE_UNAVAILABLE = "unavailable"
+# 预筛拦下、没问二审（1.12）：一审拿不准的按放行办
+JUDGE_PREFILTERED = moderation_judge.OUTCOME_PREFILTERED
 # 二审等到一半进程退出留下的 pending，这么久以前的就不再补做了
 JUDGE_RECOVERY_MAX_AGE = timedelta(days=2)
 _moderation_retry_task: asyncio.Task | None = None
@@ -425,6 +427,19 @@ async def _second_opinion(db: AsyncSession, message: Message, records: list[Cont
         if not await jury_settings.is_enabled(db, "machine_judge"):
             return
         reported = source == ModerationSource.REPORT_REVIEW
+        # 预筛（docs/moderation-v2.md 1.12）：一审「拿不准」（含出错）的，去掉 @昵称、标点之后一个字都不剩，或者只有平台域名的链接，
+        # 不问二审直接按放行办。一审 block 的照样问（要不要处罚得有二审确认），举报复审也照样问（概率只用来排队）；
+        # 「太短」在这里只认一个字都不剩 —— 一审标出来的「cnm」这种三个字的不能放过
+        if (
+            not reported
+            and record.decision == "review"
+            and moderation_judge.prefilter_reason(
+                record.content_text, mention_names=moderation_judge.mention_names(message.metadata_json), short=False
+            )
+            is not None
+        ):
+            record.judge_outcome = JUDGE_PREFILTERED
+            return
         verdict = await _previous_judgement(db, message.id, record.id) if reported else None
         if verdict is None:
             context, after = await moderation_judge.message_context(db, message, after=moderation_judge.REPORT_AFTER_MESSAGES if reported else 0)
@@ -1630,7 +1645,7 @@ def _effective_decision(record: ContentModerationRecord) -> str:
     记录上的 decision 始终是一审原样，便于对照和评测。"""
     if record.judge_outcome == JUDGE_DOWNGRADED:
         return "review"
-    if record.judge_outcome == JUDGE_CLEARED:
+    if record.judge_outcome in (JUDGE_CLEARED, JUDGE_PREFILTERED):
         return "allow"
     return record.decision
 
@@ -1639,7 +1654,7 @@ def _needs_action(record: ContentModerationRecord) -> bool:
     decision = _effective_decision(record)
     if decision == "block":
         return True
-    if record.judge_outcome == JUDGE_CLEARED or (decision == "allow" and record.severity <= 0):
+    if record.judge_outcome in (JUDGE_CLEARED, JUDGE_PREFILTERED) or (decision == "allow" and record.severity <= 0):
         return False
     # 剩下的都是模型「拿不准」，不是违规结论，只留记录等人工看。图片在这一档的
     # 误判最多，永远不动；文本是否先撤回由配置决定。无论哪种都不记违规。

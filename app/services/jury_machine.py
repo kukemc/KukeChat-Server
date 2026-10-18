@@ -34,6 +34,7 @@ from app.models.post import Post
 from app.models.report import ContentModerationRecord
 from app.services import cases as case_service
 from app.services import jury_settings
+from app.services import moderation_judge
 from app.services import penalties as penalty_service
 
 logger = logging.getLogger(__name__)
@@ -69,7 +70,7 @@ def uncertain_text_record(records: list[ContentModerationRecord], *, allow_image
         return None
     # 二审过的按二审：值得看的照收（包括一审出错的），认为没问题的不收；没二审过的照旧只收真正的「拿不准」
     if texts[0].judge_outcome not in JUDGED_FOR_JURY and (
-        texts[0].judge_outcome == "cleared" or texts[0].decision != "review" or is_moderation_error(texts[0])
+        texts[0].judge_outcome in ("cleared", moderation_judge.OUTCOME_PREFILTERED) or texts[0].decision != "review" or is_moderation_error(texts[0])
     ):
         return None
     if others and (not allow_images or any(record.decision != "allow" for record in others)):
@@ -178,6 +179,8 @@ async def _open_case(
     existing = await db.execute(select(ReportCase.id).where(ReportCase.target_key == key).limit(1))
     if existing.scalar_one_or_none() is not None:
         return None
+    if target_type == "message" and await _same_text_open(db, reported_user_id, record.content_text):
+        return None
     now = datetime.now(UTC)
     if source is None:
         source = SOURCE_DOWNGRADED if record.judge_outcome == "downgraded" else SOURCE_REVIEW
@@ -224,6 +227,26 @@ async def _open_case(
     await case_service._broadcast_admin(case, "queued")
     await case_service.notify_jury_queue_changed(db)
     return case
+
+
+# 查同一个人未结的消息案件时最多看这么多件
+SAME_TEXT_LOOKUP = 50
+
+
+async def _same_text_open(db: AsyncSession, user_id: int, text: str | None) -> bool:
+    """同一个人已经有一件未结的消息案件、内容是同一段话（moderation_judge.dedupe_key 相同：去掉 @、标点、邀请参数）。
+    同一条链接反复发不该开出好几件案子（docs/moderation-v2.md 1.12）。只看 reported_user_id 索引上的几行。"""
+    key = moderation_judge.dedupe_key(text)
+    if not key:
+        return False
+    rows = await db.execute(
+        select(Message.content)
+        .join(ReportCase, ReportCase.message_id == Message.id)
+        .where(ReportCase.reported_user_id == user_id, ReportCase.status == "open", ReportCase.target_type == "message")
+        .order_by(ReportCase.id.desc())
+        .limit(SAME_TEXT_LOOKUP)
+    )
+    return any(moderation_judge.dedupe_key(content) == key for content in rows.scalars().all())
 
 
 async def offer_message(

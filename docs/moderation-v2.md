@@ -204,13 +204,16 @@
 接口变化：
 
 - `ContentModerationRecordRead`（`GET /admin/moderation-records`）新增 `judge_p`（违规概率）、`judge_ms`（审核服务报的耗时，含它那边的排队）、
-  `judge_outcome`（`pending` / `confirmed` / `downgraded` / `cleared` / `flagged` / `scored` / `unavailable`；`scored` 是举报预审里只打分的）。
+  `judge_outcome`（`pending` / `confirmed` / `downgraded` / `cleared` / `flagged` / `scored` / `unavailable` / `prefiltered`；`scored` 是举报预审里只打分的，
+  `prefiltered` 是预筛拦下、没问二审的，见 1.12）。
   没送二审的三个都是 null。记录的 `decision` 始终是一审原样。`judge_outcome` 还有一种 `idle_scan`：一审放行、被空闲复查送过二审的（1.11）。
 - `ContentModerationRecordRead` 新增 `risk_score`：一审给文本的风险分（0–10，越大越可疑）。审核服务 `/moderate/text` 的结果、`/moderate` 的
   文本结果顶层带 `risk_score`；老版本审核服务没有这个字段、不是 0–10 的数、图片记录都是 null。所有文本记录（消息、动态、评论、话题、组队）都存。
 - `CaseRead` 新增 `judge_p`。不给委员看（`JuryCaseView` 里没有），免得影响他们的判断。
-- 审核服务新增 `POST /judge/text`（和 `/moderate*` 同一个 `X-Moderation-Token`）：body `{ text, context: [str], after?: [str] }`，
-  返回 `{ p_violation, latency_ms, model }`；不可用时 503，`detail.code` ∈ `judge_disabled` / `judge_busy` / `judge_timeout` / `judge_unavailable` / `judge_bad_response`。
+- 审核服务新增 `POST /judge/text`（和 `/moderate*` 同一个 `X-Moderation-Token`）：body `{ text, context: [str], after?: [str], mode?: "report" | "patrol" }`，
+  返回 `{ p_violation, latency_ms, model, mode }`。`mode` 默认 `report`（举报审核的问法，作者叫「被举报人」；实时二审、举报、申诉都用它，
+  上面的阈值是按它评的）；`patrol` 是没人举报的日常巡查（空闲复查用，1.11）：作者叫「发言人」，提示词里写明正常分享链接、@别人、简短提问不算违规。
+  老版本审核服务不认 `mode`，照 `report` 问；不可用时 503，`detail.code` ∈ `judge_disabled` / `judge_busy` / `judge_timeout` / `judge_unavailable` / `judge_bad_response`。
 
 ### 1.11 空闲复查（已实现）
 
@@ -229,19 +232,48 @@
   （`content_moderation_records.created_at`、新加的部分索引 `(created_at, risk_score) WHERE risk_score IS NOT NULL`、
   `user_violations.created_at`、`user_reports.created_at`、`users.banned_at`、设备表的 `(kind, value_hash)`），风险名单每 10 分钟算一次。
 - **私聊永远不送**：私聊不是案源，复查连二审都不问。
-- **怎么问**：和举报一样带前 5 条、后 3 条匿名上下文，放进二审队列的最低一档；只在本进程队列里没有实时的活、库里也没有别的进程
+- **预筛 + 去重**：选出来的候选先过一遍 1.12 的预筛，太短的、只有平台链接的、同一个人 24 小时内说过的同一段话都不问，记录标 `prefiltered`。
+- **怎么问**：和举报一样带前 5 条、后 3 条匿名上下文，但用 `mode=patrol` 的巡查问法（作者匿名成「发言人」，不是「被举报人」），放进二审队列的最低一档；只在本进程队列里没有实时的活、库里也没有别的进程
   正在等二审的记录（`judge_outcome=pending`）时才放，一次一条。限速每小时最多 `MODERATION_IDLE_SCAN_HOURLY_CAP`（默认 600）次
   （两次之间至少 6 秒）。二审排不上 / 超时 / 不可用时整体暂停 5 分钟。
 - **不重复**：问之前把审核记录的 `judge_outcome` 从空改成 `idle_scan`（认领），概率写回 `judge_p`；没问成的退回空值下次再来。
   之后有人举报这条消息时直接复用这个概率。
 - **只有一个进程在扫**：几个 worker 抢 `system_settings` 里的一行租约（`moderation.idle_scan.lease`，3 分钟没续就过期），每问一条续一次。
-- **建案**：概率 ≥ `MODERATION_IDLE_SCAN_THRESHOLD`（默认 0.6）且后台开关 `machine_review` 开着时，建一个机器案件：`case_origin=machine`、
+- **建案**：概率 ≥ `MODERATION_IDLE_SCAN_THRESHOLD`（默认 0.9；2026-10-19 前是 0.6，见 1.12）且后台开关 `machine_review` 开着时，建一个机器案件：`case_origin=machine`、
   `machine_source=idle_scan`、`machine_decision=allow`、理由「机器筛查 · 空闲复查」，`machine_note` 记着为什么选中它（例如
   「空闲复查：新账号、近 7 天被举报；二审 0.83」，只给后台看）。和其他机器案件一起按概率排、全部排在真实举报后面，只用每日名额里留给复查的那一份。
 - **开关**：部署配置 `MODERATION_IDLE_SCAN_ENABLED`（默认 true）；后台「风纪 › 设置」的 `machine_idle_scan`（默认开）。另外 `machine_judge`、
   `machine_review` 也都要开着才跑（`machine_review` 关着时建不了案件，问了也白问）。
 - **负载估算**：一天约 1.7 万条消息，6 小时窗口里被选中的通常几十到几百条；即使每小时都打满 600 次，审核机也还有一半空闲，
   实时的活最多多等一条（约 5 秒）。
+- **误建的案件**：后台可以作废机器案件（单件或按 `machine_source=idle_scan` 一次全部），见 2.4。
+
+### 1.12 预筛与去重（已实现）
+
+2026-10-19 空闲复查上线当天建出一批误报案件：普通的 CCW 作品链接（`https://ccw.site/detail/…?invite=…`、
+`https://www.ccw.site/gandi/project/…?inviteToken=…`，p 0.71–0.80）、「@某人？」（0.71），同一个人反复发的同一条链接还建了好几件。
+原因是按「举报审核」的口吻问一条没人举报的消息，模型会先入为主往违规上靠。改成三道防线：巡查问法（1.10 的 `mode=patrol`）、
+阈值 0.6 → 0.9、以及下面的预筛 —— 不值得问的根本不送。
+
+预筛只看文字本身（`moderation_judge.prefilter_reason`），不查库：
+
+| 规则 | 判定 | 空闲复查 | 实时二审（一审 `review` / 出错） |
+| --- | --- | --- | --- |
+| 太短 | 去掉 `@昵称`（消息 metadata 里点名的那几个）、空白、标点、表情之后不超过 `MODERATION_PREFILTER_SHORT_CHARS`（默认 3）个字 | 不问 | 只有「一个字都不剩」才不问 —— 一审标出来的「cnm」三个字不能因为短放过 |
+| 平台链接 | 除了网址什么都没有，而且每个网址都在 `MODERATION_TRUSTED_LINK_DOMAINS`（默认 `ccw.site,kuke.ink`，含子域名）上 | 不问 | 不问 |
+
+- 空闲复查拦下的记录 `judge_outcome = prefiltered`，下一轮不再选；实时二审拦下的同样标 `prefiltered`，**按放行办**（和 `cleared` 一样：不撤回、不建机器案件）。
+- 一审 `block` 的从不预筛：要不要处罚得有二审确认。举报复审也从不预筛（概率只用来排队）。后台开关 `machine_judge` 关着时预筛也不做，完全照一审。
+- 「@昵称」只按 metadata 里的点名去掉：「@张三傻逼」里只有「@张三」是点名，「傻逼」留着；没有点名信息的「@某人？」在实时二审里照常问。
+- 网址里夹着别的字（「加我领福利 https://ccw.site/…」）、或者有任何一个不在白名单上的网址，都照常问。`https://ccw.site@evil.com/`、
+  `https://ccw.site.evil.com/` 不算白名单。
+
+去重（只在空闲复查里）：
+
+- 同一个人 `MODERATION_IDLE_SCAN_DEDUPE_HOURS`（默认 24）小时内已经问过二审（`judge_p` 不为空，实时的、复查的都算）的同一段话，不再问；
+  同一批候选里同一个人的同一段话只问排在最前面的那条。「同一段话」= `moderation_judge.dedupe_key` 相同：去掉 `@…`、空白、标点、大小写，
+  网址只留域名 + 路径（`?invite=` 之类的参数每次不一样）。
+- 建机器案件时（`jury_machine._open_case`，所有来源）：同一个人已经有一件未结的消息案件、内容是同一段话（举报的也算），不再开第二件。
 
 ## 2. 举报案件（已实现）
 
@@ -306,8 +338,10 @@
 | `POST /admin/cases/{id}/resolve` | `{ outcome: "violation" \| "dismiss", category?, level?, delete_content?, penalty?, note?, malicious_reporter_ids? }` |
 | `POST /admin/cases/{id}/queue` | `{ queue: "jury" \| "admin" }`，手动改派；涉及私聊的案件不能派给风纪委员 |
 | `POST /admin/cases/archive` | 一键归档历史遗留案件，body `{ before: datetime, queue?: "admin" \| "triage" \| "jury" \| "panel", dry_run?: bool }` → `{ count, by_queue: { admin, jury, … }, dry_run }`。见下文 |
+| `POST /admin/cases/{id}/void` | 作废一件机器案件（机器误报），body `{ note?: str }` → `CaseDetail`。不是机器案件 422 `not_machine_case`；已结 409 `case_closed`；有人举报并进来了 409 `case_has_reports`。见下文 |
+| `POST /admin/cases/void` | 批量作废未结的机器案件，body `{ machine_source?: "idle_scan" \| "review" \| "downgraded", case_ids?: int[]（≤200）, note?, dry_run?: bool }`（`machine_source` 和 `case_ids` 至少给一个，否则 422 `void_scope_required`）→ `{ count, by_queue, skipped, case_ids, dry_run }`。`skipped` 是符合条件但有人举报并进来的（不动） |
 
-`CaseRead` 字段：`id`、`target_type`、`target_id`、`conversation_id`、`message_id`、`reported_user_id`、`reported_user`、`status`、`queue`、`jury_eligible`、`report_count`、`primary_reason`、`priority`、`summary`、`machine_decision`（`allow` / `review` / `block`，已算上二审）、`machine_category`、`machine_level`、`machine_confidence`、`judge_p`（二审违规概率，见 1.10）、`verdict_source`（`auto` / `jury` / `panel` / `admin` / `archive`）、`verdict_category`、`verdict_category_label`、`verdict_level`、`verdict_note`、`violation_id`、`first_report_id`、`created_at`、`closed_at`。
+`CaseRead` 字段：`id`、`target_type`、`target_id`、`conversation_id`、`message_id`、`reported_user_id`、`reported_user`、`status`、`queue`、`jury_eligible`、`report_count`、`primary_reason`、`priority`、`summary`、`machine_decision`（`allow` / `review` / `block`，已算上二审）、`machine_category`、`machine_level`、`machine_confidence`、`judge_p`（二审违规概率，见 1.10）、`verdict_source`（`auto` / `jury` / `panel` / `admin` / `archive` / `void`）、`verdict_category`、`verdict_category_label`、`verdict_level`、`verdict_note`、`violation_id`、`first_report_id`、`created_at`、`closed_at`。
 
 - `outcome=violation`：`category` 缺省按举报理由映射，`level` 缺省取类别默认等级，`penalty` 缺省走阶梯；`delete_content` 默认 true（撤回消息 / 删除动态）。
 - `outcome=dismiss`：可用 `malicious_reporter_ids` 标出恶意举报人，会降低他们的举报额度。
@@ -321,6 +355,13 @@
 - 举报人信誉（`/reports/quota`）不计 `action = "archived"` 的举报。
 - 风纪委员和资深合议只取 `status = "open"` 的案件，归档后不会再分到；委员已投过票的，票不计一致率，「我的评审」里这类案件 `stage = closed`、`outcome = null`、`verdict = null`。
 - `dry_run = true` 只返回数量，不写库。真正归档时写审计日志 `case.archive`（`details` 里有 `before`、`queue`、`count`、`by_queue`、`case_ids`），并在后台通道广播 `admin.report.changed`：`{ action: "archived", count }`。
+
+**作废机器案件**（`POST /admin/cases/{id}/void`、`POST /admin/cases/void`）：机器误报（例如 1.12 之前空闲复查建出来的作品链接案件）直接收掉。
+和归档同一个口径，**不是结论**：`status = "archived"`、`verdict_source = "void"`、`verdict_note` = 给的 note 或「机器误报，作废」、`closed_at = 作废时间`；
+不处罚、不进题库、不能成为判例；从委员队列和资深合议里消失；委员已经投的票不结算（`agreed` 留空：不计一致率、不给结算的风纪值），
+「我的评审」里 `outcome = null`。只动 `case_origin = machine` 且 `report_count = 0` 的未结案件 —— 后来有人举报并进来的要按举报正常审。
+写审计日志 `case.void`（`details` 里有 `machine_source`、`count`、`by_queue`、`case_ids`、`note`），后台通道广播 `admin.report.changed`：`{ action: "voided", … }`。
+作废的案件仍占当天的机器案件名额（防止作废之后马上又建满一批）。
 
 `GET /admin/stats` 新增 `cases_admin_pending`、`cases_jury_pending`、`jury_applications_pending`。后台通道新增事件 `admin.case.changed`：`{ case_id, queue, status, action }`。
 

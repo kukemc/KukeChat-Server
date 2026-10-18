@@ -25,7 +25,7 @@ from app.models.group_activity import GroupCheckin, GroupMemberDailyActivity, Gr
 from app.models.intimacy import FriendBadge, FriendBond, FriendBondDay
 from app.models.invite import InviteLink
 from app.models.jury_hall import JuryHallComment, JuryHallPost, JuryHallReport, JuryHallVote, JuryPrecedent
-from app.models.message import FeaturedMessage, MentionAllUsage, Message, MessageBookmark, MessageReaction, MessageVisibility
+from app.models.message import FeaturedMessage, MentionAllUsage, Message, MessageBookmark, MessageReaction, MessageVisibility, VoiceTranscript
 from app.models.penalty import UserViolation
 from app.models.poll import GroupEmoji, Poll, PollVote
 from app.models.post import Post, PostComment, PostCommentLike, PostLike, PostMention, PostNotification, PostTopic, PostTopicLink
@@ -76,6 +76,7 @@ __all__ = [
     "GroupPlusRecord",
     "GroupTodo",
     "MentionAllUsage",
+    "VoiceTranscript",
     "MessageBookmark",
     "MessageReaction",
     "MessageVisibility",

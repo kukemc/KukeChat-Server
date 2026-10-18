@@ -72,6 +72,9 @@ ARCHIVED = "archived"
 ARCHIVE_SOURCE = "archive"
 ARCHIVE_ACTION = "archived"
 ARCHIVE_NOTE = "历史遗留，未经审理直接归档"
+# 作废机器误报的案件（docs/jury-v2.md 3.3.2）：和归档同一个 status（archived，没有结论），verdict_source = void 以示区别
+VOID_SOURCE = "void"
+VOID_NOTE = "机器误报，作废"
 # 真正下过结论的案件状态；open 和 archived 都不算
 VERDICT_STATUSES = ("resolved", "dismissed")
 
@@ -1358,6 +1361,86 @@ async def list_cases(
     counts_rows = await db.execute(select(ReportCase.queue, func.count()).where(ReportCase.status == "open").group_by(ReportCase.queue))
     counts = {queue_name: int(count) for queue_name, count in counts_rows.all()}
     return list(result.scalars().all()), total, counts
+
+
+async def void_machine_cases(
+    db: AsyncSession,
+    *,
+    case_ids: list[int] | None = None,
+    machine_source: str | None = None,
+    note: str | None = None,
+    dry_run: bool = False,
+    actor_id: int | None,
+) -> dict[str, Any]:
+    """作废机器来源（没有举报人）的未结案件：机器误报，案件不成立。返回 {"count", "by_queue", "skipped", "case_ids", "dry_run"}。
+
+    和一键归档同一个口径（status = archived、verdict_source = void）：不是结论 —— 不处罚、不进题库、不能成为判例；
+    委员已经投的票不结算（不计一致率、不给结算的风纪值），案件从委员 / 合议队列里消失。
+    case_ids 给了只看这几件，machine_source 给了只看这一路来的（idle_scan / review / downgraded）。
+    后来有人举报、举报并进来的（report_count > 0）不动，算在 skipped 里：那要按举报正常审。
+    """
+    clauses = [ReportCase.status == "open", ReportCase.case_origin == "machine"]
+    if case_ids is not None:
+        if not case_ids:
+            return {"count": 0, "by_queue": {}, "skipped": 0, "case_ids": [], "dry_run": dry_run}
+        clauses.append(ReportCase.id.in_(case_ids[:LOOKUP_BATCH]))
+    if machine_source:
+        clauses.append(ReportCase.machine_source == machine_source)
+    rows = (await db.execute(select(ReportCase.id, ReportCase.queue, ReportCase.report_count).where(*clauses))).all()
+    eligible = [(case_id, queue_name) for case_id, queue_name, reports in rows if not reports]
+    skipped = len(rows) - len(eligible)
+    by_queue = dict(Counter(queue_name for _case_id, queue_name in eligible))
+    ids = [case_id for case_id, _queue in eligible]
+    if dry_run or not ids:
+        return {"count": len(ids), "by_queue": by_queue, "skipped": skipped, "case_ids": ids, "dry_run": dry_run}
+    now = datetime.now(UTC)
+    text = (note or "").strip()[:500] or VOID_NOTE
+    for start in range(0, len(ids), LOOKUP_BATCH):
+        cases = (await db.execute(select(ReportCase).where(ReportCase.id.in_(ids[start : start + LOOKUP_BATCH])))).scalars().all()
+        for case in cases:
+            case.status = ARCHIVED
+            case.verdict_source = VOID_SOURCE
+            case.verdict_note = text
+            case.verdict_by_id = actor_id
+            case.closed_at = now
+            case.updated_at = now
+    db.add(
+        AdminAuditLog(
+            actor_id=actor_id,
+            action="case.void",
+            target_type="report_case",
+            target_id=ids[0] if len(ids) == 1 else None,
+            details=json.dumps(
+                {"machine_source": machine_source, "count": len(ids), "by_queue": by_queue, "case_ids": ids, "note": text},
+                ensure_ascii=False,
+            ),
+        )
+    )
+    await db.commit()
+    if by_queue.get("jury") or by_queue.get("panel"):
+        await notify_jury_queue_changed(db)
+    return {"count": len(ids), "by_queue": by_queue, "skipped": skipped, "case_ids": ids, "dry_run": False}
+
+
+async def void_case(db: AsyncSession, case_id: int, *, note: str | None, actor_id: int | None) -> ReportCase:
+    """作废一件机器案件（见 void_machine_cases）。不是机器案件、已经结了、有人举报并进来的都拒绝。"""
+    case = await db.get(ReportCase, case_id)
+    if case is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Case not found")
+    if case.status != "open":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail={"code": "case_closed", "message": "案件已经结了"})
+    if case.case_origin != "machine":
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail={"code": "not_machine_case", "message": "只有机器来源的案件可以作废"}
+        )
+    if case.report_count:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail={"code": "case_has_reports", "message": "已经有人举报并进了这个案件，要按举报正常审"}
+        )
+    await void_machine_cases(db, case_ids=[case.id], note=note, actor_id=actor_id)
+    await db.refresh(case)
+    await _broadcast_admin(case, "voided")
+    return case
 
 
 async def archive_cases(

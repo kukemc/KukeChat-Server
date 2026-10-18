@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
 from app.core.security import hash_password
+from app.models.bot import Bot
 from app.models.conversation import Conversation, ConversationMember, GroupJoinRequest
 from app.models.enums import ConversationType, GroupJoinRequestStatus, MemberRole, MessageType, ModerationAction, PasswordResetStatus, PlatformRole, ReportStatus, ReportTargetType, UserStatus
 from app.models.message import Message, MessageVisibility
@@ -1086,12 +1087,21 @@ async def list_admin_bans(
     sort: str = "banned_at",
     order: str = "desc",
     scope: str = "all",
+    include_bots: bool = False,
 ) -> AdminBanPage:
     """封禁名单。
 
     相比原来的实现，这里多做三件事：可排序、可筛选、把封禁的来龙去脉一并带上
     （谁封的、因为哪条消息、命中了什么类别），省得为了看一次原因还要去翻审核
     记录。
+
+    机器人账号默认不列（include_bots）：创建者停用 / 删除机器人时，机器人的账号状态也被置成 disabled（让它登不上、
+    收不到事件），但那不是封禁 —— 没有封禁时间、原因、操作记录，名单里一度九成是这种「来源不明」的机器人。
+    列出来时来源标成 bot_deleted / bot_disabled，带上创建者。
+
+    排序按「封禁于」：banned_at 为空（老数据、机器人）时用机器人停用 / 删除的时间、再不行用账号更新时间
+    （返回里推出来的 banned_at 还会先看封禁审核记录 / 人工操作，见 _effective_banned_at，排序上只用库里的列，不连那两张表）；
+    空值一律排最后 —— PG 降序默认把空值排最前，机器人曾因此全挤在第一页。
     """
     await _release_expired_bans(db)
     now = datetime.now(UTC)
@@ -1101,13 +1111,28 @@ async def list_admin_bans(
     if search is not None:
         conditions.append(search)
 
-    total = int((await db.execute(select(func.count(User.id)).where(*conditions))).scalar_one() or 0)
+    # 一条查询同时拿到真人和机器人各有多少
+    counts = {bool(is_bot): int(count or 0) for is_bot, count in (await db.execute(select(User.is_bot, func.count(User.id)).where(*conditions).group_by(User.is_bot))).all()}
+    if include_bots:
+        total, hidden_bots = counts.get(False, 0) + counts.get(True, 0), 0
+    else:
+        total, hidden_bots = counts.get(False, 0), counts.get(True, 0)
+        conditions.append(User.is_bot.is_(False))
 
-    column = BAN_SORT_COLUMNS.get(sort, User.banned_at)
-    direction = column.asc() if order == "asc" else column.desc()
-    # banned_at 是后加的字段，老数据为空；用 id 兜底保证顺序稳定、翻页不跳行
+    # 只有机器人账号在 bots 里有行（user_id 唯一），外连接不会让行数变多
+    effective_banned_at = func.coalesce(User.banned_at, Bot.updated_at, User.updated_at)
+    if sort == "banned_at":
+        direction = (effective_banned_at.asc() if order == "asc" else effective_banned_at.desc()).nulls_last()
+    elif sort == "expires":
+        # banned_until 为空是永久：当成「最晚到期」，升序排最后、降序排最前（SQLite 和 PG 对空值的默认顺序相反，写死）
+        direction = User.banned_until.asc().nulls_last() if order == "asc" else User.banned_until.desc().nulls_first()
+    else:
+        column = BAN_SORT_COLUMNS.get(sort, User.banned_at)
+        direction = column.asc() if order == "asc" else column.desc()
+    # 用 id 兜底保证顺序稳定、翻页不跳行
     stmt = (
         select(User)
+        .outerjoin(Bot, Bot.user_id == User.id)
         .where(*conditions)
         .order_by(direction, User.id.desc())
         .offset(offset)
@@ -1115,11 +1140,12 @@ async def list_admin_bans(
     )
     users = list((await db.execute(stmt)).scalars().all())
     if not users:
-        return AdminBanPage(items=[], total=total)
+        return AdminBanPage(items=[], total=total, hidden_bot_count=hidden_bots)
 
     user_ids = [user.id for user in users]
     evidence_map = await _latest_ban_evidence(db, user_ids)
     audit_map = await _latest_ban_audit(db, user_ids)
+    bot_map = await _bot_ban_context(db, [user.id for user in users if user.is_bot])
     ban_counts = await _count_by_user(
         db,
         select(ContentModerationRecord.user_id, func.count())
@@ -1138,7 +1164,12 @@ async def list_admin_bans(
     for user in users:
         evidence = evidence_map.get(user.id)
         audit = audit_map.get(user.id)
+        bot = bot_map.get(user.id)
         source, operator_id, operator_name, report_id = _resolve_ban_source(evidence, audit)
+        # 机器人没有任何封禁痕迹、对应的机器人又是停用 / 删除状态：就是创建者关掉的，不是封禁
+        if source == "unknown" and bot is not None and bot["status"] in ("deleted", "disabled"):
+            source = "bot_deleted" if bot["status"] == "deleted" else "bot_disabled"
+        banned_at, estimated = _effective_banned_at(user, evidence, audit, bot)
         banned_until = _aware_utc(user.banned_until) if user.banned_until else None
         items.append(
             AdminBanRead(
@@ -1149,7 +1180,8 @@ async def list_admin_bans(
                 email=user.email,
                 created_at=user.created_at,
                 status=user.status,
-                banned_at=user.banned_at,
+                banned_at=banned_at,
+                banned_at_estimated=estimated,
                 banned_until=user.banned_until,
                 ban_reason=user.ban_reason,
                 permanent=user.banned_until is None,
@@ -1161,9 +1193,47 @@ async def list_admin_bans(
                 evidence=evidence,
                 ban_count=ban_counts.get(user.id, 0),
                 message_count=message_counts.get(user.id, 0),
+                is_bot=bool(user.is_bot),
+                bot_owner_id=bot["owner_id"] if bot else user.bot_owner_id,
+                bot_owner_name=bot["owner_name"] if bot else None,
+                bot_owner_banned=bool(bot and bot["owner_banned"]),
             )
         )
-    return AdminBanPage(items=items, total=total)
+    return AdminBanPage(items=items, total=total, hidden_bot_count=hidden_bots)
+
+
+def _effective_banned_at(user: User, evidence: BanEvidence | None, audit: AdminAuditLog | None, bot: dict | None) -> tuple[datetime | None, bool]:
+    """「封禁于」：有 banned_at 用它；老数据 / 机器人没有时，依次取最近的封禁审核记录或人工操作、机器人停用 / 删除的时间、
+    账号更新时间，并标成推测的。"""
+    if user.banned_at is not None:
+        return user.banned_at, False
+    traces = [value for value in (evidence.created_at if evidence else None, audit.created_at if audit else None) if value is not None]
+    if traces:
+        return max(_aware_utc(value) for value in traces), True
+    if bot is not None and bot["updated_at"] is not None:
+        return bot["updated_at"], True
+    return user.updated_at, user.updated_at is not None
+
+
+async def _bot_ban_context(db: AsyncSession, user_ids: list[int]) -> dict[int, dict]:
+    """这一页里机器人账号对应的机器人：状态、停用 / 删除的时间（bots.updated_at）、创建者。只查这一页的几行。"""
+    if not user_ids:
+        return {}
+    rows = await db.execute(
+        select(Bot.user_id, Bot.status, Bot.updated_at, Bot.owner_id, User.nickname, User.username, User.status)
+        .join(User, User.id == Bot.owner_id)
+        .where(Bot.user_id.in_(user_ids))
+    )
+    return {
+        user_id: {
+            "status": bot_status,
+            "updated_at": updated_at,
+            "owner_id": owner_id,
+            "owner_name": nickname or username,
+            "owner_banned": owner_status == UserStatus.DISABLED,
+        }
+        for user_id, bot_status, updated_at, owner_id, nickname, username, owner_status in rows.all()
+    }
 
 
 def _resolve_ban_source(evidence: BanEvidence | None, audit: AdminAuditLog | None):

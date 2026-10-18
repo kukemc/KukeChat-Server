@@ -41,8 +41,8 @@ class FakeJudge:
         self.results = list(results)
         self.calls: list[dict] = []
 
-    async def __call__(self, text, context=None, after=None, *, priority, risk=None):
-        self.calls.append({"text": text, "context": list(context or []), "after": list(after or []), "priority": priority, "risk": risk})
+    async def __call__(self, text, context=None, after=None, *, priority, risk=None, mode=moderation_judge.MODE_REPORT):
+        self.calls.append({"text": text, "context": list(context or []), "after": list(after or []), "priority": priority, "risk": risk, "mode": mode})
         p = self.results.pop(0) if self.results else None
         return None if p is None else moderation_judge.JudgeVerdict(p=p, latency_ms=4800, model="startlux-test")
 
@@ -264,7 +264,7 @@ class QueueTests(JudgeTestCase):
         with self._service(post):
             verdict = await moderation_judge.judge("你真菜", ["成员A：打一把"], priority=moderation_judge.PRIORITY_FLAGGED)
         self.assertEqual(verdict.p, 0.42)
-        self.assertEqual(seen[0][0], {"text": "你真菜", "context": ["成员A：打一把"], "after": []})
+        self.assertEqual(seen[0][0], {"text": "你真菜", "context": ["成员A：打一把"], "after": [], "mode": "report"})
         self.assertLessEqual(seen[0][1], settings.moderation_judge_timeout_seconds)
 
     async def test_inactive_errors_and_timeouts_return_none(self) -> None:

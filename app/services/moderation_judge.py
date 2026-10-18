@@ -20,6 +20,7 @@ import json
 import logging
 import re
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -44,6 +45,12 @@ PRIORITY_AUDIT = 4
 
 # 待审消息作者的称呼，其他人是 成员A / 成员B …。审核服务的提示词里写的就是【被举报人】，改了要两边一起改
 AUTHOR_LABEL = "被举报人"
+# 问法（/judge/text 的 mode）：report 是举报 / 一审标出来的（实时二审、举报、申诉，阈值按它评的）；
+# patrol 是没人举报的日常巡查（空闲复查），作者叫「发言人」、提示词是中性的巡查口吻 —— 按「举报审核」问没人举报的消息，
+# 模型会先入为主往违规上靠（普通的作品链接、「@某人？」都给到 0.7–0.8）。老版本审核服务不认 mode，照 report 问
+MODE_REPORT = "report"
+MODE_PATROL = "patrol"
+PATROL_LABEL = "发言人"
 # 被举报的消息额外带的下文条数（实时审核的消息刚发出去，没有下文）
 REPORT_AFTER_MESSAGES = 3
 # 每条上下文、待审消息最多带多少字（审核服务那边还会把总字数压到 1200 以内）
@@ -134,9 +141,16 @@ def _running_loop() -> asyncio.AbstractEventLoop | None:
 
 
 async def judge(
-    text: str, context: list[str] | None = None, after: list[str] | None = None, *, priority: int, risk: float | None = None
+    text: str,
+    context: list[str] | None = None,
+    after: list[str] | None = None,
+    *,
+    priority: int,
+    risk: float | None = None,
+    mode: str = MODE_REPORT,
 ) -> JudgeVerdict | None:
-    """问一次二审，返回违规概率；不可用（没开、排不上、超时、出错）返回 None。risk 是一审风险分，同一档里高的先做。"""
+    """问一次二审，返回违规概率；不可用（没开、排不上、超时、出错）返回 None。risk 是一审风险分，同一档里高的先做。
+    mode 见 MODE_REPORT / MODE_PATROL；patrol 时上下文里作者的标签要用 PATROL_LABEL（message_context 的 author_label）。"""
     if not is_active() or time.monotonic() < _unavailable_until:
         return None
     timeout = float(settings.moderation_judge_timeout_seconds)
@@ -145,7 +159,7 @@ async def judge(
         priority=priority,
         rank=-float(risk or 0.0),
         seq=next(_seq),
-        payload={"text": text, "context": list(context or []), "after": list(after or [])},
+        payload={"text": text, "context": list(context or []), "after": list(after or []), "mode": mode},
         deadline=time.monotonic() + timeout,
         future=loop.create_future(),
     )
@@ -263,10 +277,13 @@ def view_context(items: list[dict[str, Any]], *, after: int = REPORT_AFTER_MESSA
     return text, [value for value in map(line, earlier) if value], [value for value in map(line, later) if value]
 
 
-async def message_context(db: AsyncSession, message: Message, *, after: int = 0) -> tuple[list[str], list[str]]:
+async def message_context(
+    db: AsyncSession, message: Message, *, after: int = 0, author_label: str = AUTHOR_LABEL
+) -> tuple[list[str], list[str]]:
     """待审消息前 moderation_judge_context_messages 条、后 after 条同会话消息，打好匿名标签（「成员A：……」）。
 
     只查 (conversation_id, id) 索引上的几行、正文在库里就截断。不带用户名、昵称、ID；撤回的和系统消息不带。
+    作者自己的行标成 author_label（举报口径「被举报人」，巡查口径 PATROL_LABEL「发言人」）。
     """
     before = settings.moderation_judge_context_messages
     if before <= 0 and after <= 0:
@@ -289,7 +306,7 @@ async def message_context(db: AsyncSession, message: Message, *, after: int = 0)
         rows = await db.execute(scope().where(Message.id > message.id).order_by(Message.id.asc()).limit(after))
         later = list(rows.all())
 
-    labels: dict[int, str] = {message.sender_id: AUTHOR_LABEL}
+    labels: dict[int, str] = {message.sender_id: author_label}
 
     def label(sender_id: int) -> str:
         if sender_id not in labels:
@@ -303,3 +320,89 @@ async def message_context(db: AsyncSession, message: Message, *, after: int = 0)
         return f"{label(sender_id)}：{text}" if text else None
 
     return [item for item in map(line, earlier) if item], [item for item in map(line, later) if item]
+
+
+# ---------------------------------------------------------------- 预筛：不值得问二审的文字（docs/moderation-v2.md 1.12）
+
+# 网址：带协议的，或者 www. 开头的。到第一个空白 / 中文标点为止
+_URL = re.compile(r"(?:https?://|www\.)[^\s<>\"'，。！？、；：（）【】《》]+", re.IGNORECASE)
+_HOST = re.compile(r"^(?:https?://)?([^/?#:\s]+)", re.IGNORECASE)
+
+PREFILTER_SHORT = "short"
+PREFILTER_PLATFORM_LINK = "platform_link"
+PREFILTER_DUPLICATE = "duplicate"
+# 预筛拦下、没问二审的记录的 judge_outcome（实时二审里一审「拿不准」的按放行办；空闲复查里是「看过了，不用问」）
+OUTCOME_PREFILTERED = "prefiltered"
+
+
+def _strip_noise(text: str, mention_names: Any = None) -> str:
+    """去掉 @昵称、空白、标点和符号（含表情），剩下真正的「字」。
+
+    mention_names 给了（消息 metadata 里点名的昵称）就只去掉这些「@昵称」和落单的 @：「@张三傻逼」只有「@张三」是点名，
+    「傻逼」要留着。没给（None）按 _MENTION 去掉所有「@…」—— 只用于同一个人前后两段话的比较（dedupe_key）。"""
+    value = text or ""
+    if mention_names is None:
+        value = _MENTION.sub("", value)
+    else:
+        for name in sorted({str(item) for item in mention_names if item}, key=len, reverse=True):
+            value = value.replace(f"@{name}", " ")
+    return "".join(char for char in value if unicodedata.category(char)[0] not in "PSZC")
+
+
+def mention_names(metadata: Any) -> list[str]:
+    """消息 metadata 里点名的昵称（{ mentions: [{ user_id, name }] }，@全体是 name「全体成员」之类），预筛用。
+    metadata 可以是库里的 JSON 字符串（messages.metadata），解析不了按没有点名。"""
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except ValueError:
+            metadata = None
+    mentions = metadata.get("mentions") if isinstance(metadata, dict) else None
+    names: list[str] = []
+    for item in mentions if isinstance(mentions, list) else []:
+        name = (item.get("name") or item.get("nickname") or item.get("display_name")) if isinstance(item, dict) else None
+        if isinstance(name, str) and name.strip():
+            names.append(name.strip()[:64])
+    if isinstance(metadata, dict) and (metadata.get("mention_all") is True or metadata.get("mentionAll") is True):
+        names.extend(["全体成员", "所有人", "all"])
+    return names[:60]
+
+
+def _trusted_host(host: str) -> bool:
+    host = host.lower().rstrip(".")
+    return any(host == domain or host.endswith("." + domain) for domain in settings.moderation_trusted_link_domains_normalized)
+
+
+def link_hosts(text: str) -> list[str]:
+    return [match.group(1).lower() for match in (_HOST.match(url) for url in _URL.findall(text or "")) if match]
+
+
+def prefilter_reason(text: str | None, *, mention_names: Any = (), short: bool = True) -> str | None:
+    """这段文字是不是根本不值得问二审，是的话返回原因：
+
+    - short：去掉 @昵称（mention_names，消息 metadata 里点名的那几个）、空白、标点、表情之后不超过
+      moderation_prefilter_short_chars（默认 3）个字（「@某人？」「好的」「666」）。
+      short=False 时只认「去掉之后一个字都不剩」（只有 @ 和标点）—— 实时二审用：一审已经标出来的「cnm」这种三个字的不能放过；
+    - platform_link：除了网址什么都没有，而且每个网址都在白名单域名上（moderation_trusted_link_domains：ccw.site、kuke.ink
+      及其子域名）—— 分享作品、邀请链接。
+
+    都不是返回 None。只看文字本身，不查库。
+    """
+    value = (text or "").strip()
+    if not value:
+        return PREFILTER_SHORT
+    urls = _URL.findall(value)
+    rest = _strip_noise(_URL.sub(" ", value), mention_names or ())
+    if urls:
+        if not rest and all(_trusted_host(host) for host in link_hosts(value)) and len(link_hosts(value)) == len(urls):
+            return PREFILTER_PLATFORM_LINK
+        return None
+    limit = settings.moderation_prefilter_short_chars if short else 0
+    return PREFILTER_SHORT if len(rest) <= limit else None
+
+
+def dedupe_key(text: str | None) -> str:
+    """同一个人「同一段话」的比较键：去掉 @昵称、空白、标点、表情、大小写，网址只留域名 + 路径（邀请参数每次不一样）。"""
+    value = text or ""
+    value = _URL.sub(lambda match: " " + re.sub(r"^(?:https?://)?(?:www\.)?", "", match.group(0).split("?", 1)[0].split("#", 1)[0], flags=re.IGNORECASE) + " ", value)
+    return _strip_noise(value).lower()[:200]

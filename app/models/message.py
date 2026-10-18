@@ -4,7 +4,7 @@ from datetime import date, datetime, timezone
 
 UTC = timezone.utc
 
-from sqlalchemy import Date, DateTime, Enum as SAEnum, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Date, DateTime, Enum as SAEnum, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -108,3 +108,24 @@ class MentionAllUsage(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
 
     user: Mapped["User"] = relationship()
+
+
+class VoiceTranscript(Base):
+    """语音消息转文字的结果（docs/chat-features.md「语音转文字」）。一条语音只识别一次，之后谁来点都直接读这里。
+
+    text 可以是空串：录音里没识别出话（静音、太短），也照样记下来，免得每次点都再识别一遍。
+    requested_by_id 是第一个点「转文字」、真正花了一次识别的人，按它算每人每小时的次数（命中缓存的不算）。
+    消息被修剪删掉时跟着删（外键 CASCADE）。
+    """
+
+    __tablename__ = "voice_transcripts"
+    __table_args__ = (
+        UniqueConstraint("message_id", name="uq_voice_transcript_message"),
+        Index("ix_voice_transcripts_requester_created", "requested_by_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    message_id: Mapped[int] = mapped_column(ForeignKey("messages.id", ondelete="CASCADE"))
+    text: Mapped[str] = mapped_column(Text, default="")
+    requested_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)

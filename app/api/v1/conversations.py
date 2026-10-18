@@ -59,6 +59,8 @@ from app.schemas.message import (
     PokeRequest,
     ReadConversationRequest,
     ReadReceipt,
+    UnreadMentionsRead,
+    VoiceTranscriptRead,
 )
 from app.services import bots as bot_service
 from app.services import conversations as conversation_service
@@ -69,6 +71,7 @@ from app.services import messages as message_service
 from app.services import moderation as moderation_service
 from app.services import pokes as poke_service
 from app.services import response_cache
+from app.services import voice_transcripts as voice_transcript_service
 from app.websocket.manager import admin_manager, bot_manager, game_manager, manager
 
 
@@ -1306,6 +1309,28 @@ async def toggle_message_bookmark(
 ) -> MessageBookmarkToggleRead:
     bookmarked = await message_service.toggle_message_bookmark(db, conversation_id, current_user.id, message_id)
     return MessageBookmarkToggleRead(bookmarked=bookmarked)
+
+
+@router.post("/{conversation_id}/messages/{message_id}/transcribe", response_model=VoiceTranscriptRead)
+async def transcribe_voice_message(
+    conversation_id: int,
+    message_id: int,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> VoiceTranscriptRead:
+    """语音消息转文字（docs/chat-features.md「语音转文字」）：第一次识别后存库，之后直接读。"""
+    result = await voice_transcript_service.transcribe_message(db, conversation_id, current_user.id, message_id)
+    return VoiceTranscriptRead(**result)
+
+
+@router.get("/{conversation_id}/mentions/unread", response_model=UnreadMentionsRead)
+async def unread_mentions(
+    conversation_id: int,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> UnreadMentionsRead:
+    """已读位置之后提到我的消息（点名 me / @全体 all），旧的在前，最多 50 条（docs/chat-features.md 第 7 节）。"""
+    return UnreadMentionsRead(**await message_service.list_unread_mentions(db, conversation_id, current_user.id))
 
 
 @router.get("/{conversation_id}/bookmarks", response_model=list[MessageRead])

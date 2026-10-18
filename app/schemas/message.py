@@ -146,6 +146,29 @@ class MessageRead(BaseModel):
     conversation: object | None = None
     # 只出现在刚发出的这条消息的 POST 返回和 message.created 里：发送者请求时带的 client_nonce，原样回显
     client_nonce: str | None = None
+    # 语音消息已经转过的文字（POST .../transcribe 存下的；"" 表示没识别出话）。没转过、不是语音、撤回了都是 null
+    voice_transcript: str | None = None
+
+
+class VoiceTranscriptRead(BaseModel):
+    """POST /conversations/{cid}/messages/{mid}/transcribe 的返回。cached：之前转过，这次直接读的库。"""
+
+    text: str
+    cached: bool
+
+
+class UnreadMentionItem(BaseModel):
+    message_id: int
+    # me：点名了我；all：@全体成员（两者都有算 me）
+    kind: Literal["me", "all"]
+    created_at: datetime
+
+
+class UnreadMentionsRead(BaseModel):
+    """GET /conversations/{cid}/mentions/unread：已读位置之后提到我的消息，旧的在前，最多 50 条；total 是总数（最多数到 1000）。"""
+
+    items: list[UnreadMentionItem]
+    total: int
 
 
 class MessageSearchResult(BaseModel):

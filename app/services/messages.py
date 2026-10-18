@@ -239,6 +239,61 @@ async def clear_mentions_of(db: AsyncSession, message: Message) -> None:
     )
 
 
+# GET /mentions/unread：最多列这么多条、最多数到这么多条
+UNREAD_MENTIONS_LIMIT = 50
+UNREAD_MENTIONS_COUNT_CAP = 1000
+
+
+async def list_unread_mentions(db: AsyncSession, conversation_id: int, user_id: int) -> dict[str, Any]:
+    """已读位置之后提到我的消息（点名我 = me，@全体成员 = all，都有算 me），旧的在前（docs/chat-features.md 第 7 节）。
+
+    先拿 mention_pending 用的那三个数挡掉绝大多数情况：成员行上的 last_mention_message_id 和会话上的
+    last_mention_all_message_id 都不比已读位置新，就一条消息都不扫，直接返回空。否则只扫 (已读位置, 两者里大的那个]
+    这一段，走 (conversation_id, id) 索引，并且只取 metadata 里带 mention 字样的行，在 Python 里按 _mentioned_user_ids /
+    _metadata_mentions_all 认。撤回的、自己发的、对自己隐藏的不算；私聊里的 @全体 不算（发的时候也不记）。
+
+    和 mention_pending 一样是尽力而为：最近一条提及被撤回时记号会被清掉（clear_mentions_of），更早的那条也就不再列出来。
+    total 最多数到 UNREAD_MENTIONS_COUNT_CAP。
+    """
+    membership = await require_membership(db, conversation_id, user_id, clear_expired_mute=False)
+    conversation = await db.get(Conversation, conversation_id)
+    floor = max(membership.last_read_message_id or 0, membership.cleared_before_message_id or 0)
+    mine = membership.last_mention_message_id or 0
+    everyone = (conversation.last_mention_all_message_id or 0) if conversation is not None and conversation.type == ConversationType.GROUP else 0
+    ceiling = max(mine, everyone)
+    if ceiling <= floor:
+        return {"items": [], "total": 0}
+    hidden_message_ids = select(MessageVisibility.message_id).where(MessageVisibility.user_id == user_id)
+    rows = await db.execute(
+        select(Message.id, Message.created_at, Message.metadata_json)
+        .where(
+            Message.conversation_id == conversation_id,
+            Message.id > floor,
+            Message.id <= ceiling,
+            Message.sender_id != user_id,
+            Message.recalled_at.is_(None),
+            Message.metadata_json.is_not(None),
+            Message.metadata_json.like("%ention%"),
+            Message.id.not_in(hidden_message_ids),
+        )
+        .order_by(Message.id.asc())
+        .limit(UNREAD_MENTIONS_COUNT_CAP * 2)
+    )
+    items: list[dict[str, Any]] = []
+    for message_id, created_at, metadata_json in rows.all():
+        metadata = _metadata_from_json(metadata_json)
+        if message_id <= mine and user_id in _mentioned_user_ids(metadata):
+            kind = "me"
+        elif message_id <= everyone and _metadata_mentions_all(metadata):
+            kind = "all"
+        else:
+            continue
+        items.append({"message_id": message_id, "kind": kind, "created_at": created_at})
+        if len(items) >= UNREAD_MENTIONS_COUNT_CAP:
+            break
+    return {"items": items[:UNREAD_MENTIONS_LIMIT], "total": len(items)}
+
+
 async def _enforce_mention_all_limit(
     db: AsyncSession,
     conversation: Conversation,
@@ -477,6 +532,15 @@ async def build_message_reads(db: AsyncSession, messages: list[Message], current
         from app.services import polls as poll_service
 
         await poll_service.attach_states(db, reads, current_user_id)
+    voice_ids = [message.id for message in messages if message.type == MessageType.VOICE and message.recalled_at is None]
+    if voice_ids:
+        # 语音转文字（docs/chat-features.md「语音转文字」）：只带已经转过的，一页一条查询
+        from app.services import voice_transcripts
+
+        transcripts = await voice_transcripts.transcripts_for(db, voice_ids)
+        for read in reads:
+            if read.id in transcripts:
+                read.voice_transcript = transcripts[read.id]
     return reads
 
 

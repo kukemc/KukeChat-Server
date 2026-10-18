@@ -63,6 +63,9 @@ from app.schemas.case import (
     CasePage,
     CaseRead,
     CaseResolve,
+    CaseVoid,
+    CaseVoidBulk,
+    CaseVoidResult,
     JuryMemberPage,
     JuryMemberRead,
     JuryMemberReview,
@@ -150,13 +153,16 @@ async def admin_banned_users(
     sort: Annotated[Literal["banned_at", "expires", "username", "id", "created_at"], Query()] = "banned_at",
     order: Annotated[Literal["asc", "desc"], Query()] = "desc",
     scope: Annotated[Literal["all", "permanent", "temporary", "expiring"], Query()] = "all",
+    include_bots: Annotated[bool, Query()] = False,
 ) -> AdminBanPage:
     """封禁名单。
 
     `q` 同时按用户名 / 昵称 / 邮箱模糊匹配和账号 ID 精确匹配（支持 `#123` 写法）。
     每行会带上这次封禁的来源、操作者和触发它的那条消息。
+    机器人账号（创建者停用 / 删除后账号也是 disabled）默认不列，`include_bots=true` 才列；
+    不列时 `hidden_bot_count` 是藏起来的个数。
     """
-    return await report_service.list_admin_bans(db, limit, offset, q, sort, order, scope)
+    return await report_service.list_admin_bans(db, limit, offset, q, sort, order, scope, include_bots)
 
 
 @router.get("/platform-admins", response_model=list[AdminUserRead])
@@ -862,6 +868,26 @@ async def admin_archive_cases(
     return CaseArchiveResult(**result)
 
 
+@router.post("/cases/void", response_model=CaseVoidResult)
+async def admin_void_cases(
+    payload: CaseVoidBulk,
+    admin: Annotated[User, Depends(get_current_admin)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> CaseVoidResult:
+    """批量作废未结的机器案件（例如空闲复查建的全部：machine_source = idle_scan）。不处罚、委员的票不结算，见 cases.void_machine_cases。"""
+    if payload.machine_source is None and payload.case_ids is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "void_scope_required", "message": "要给出 machine_source 或 case_ids"},
+        )
+    result = await case_service.void_machine_cases(
+        db, case_ids=payload.case_ids, machine_source=payload.machine_source, note=payload.note, dry_run=payload.dry_run, actor_id=admin.id
+    )
+    if not result["dry_run"] and result["count"]:
+        await admin_manager.broadcast("admin.report.changed", {"action": "voided", "count": result["count"]})
+    return CaseVoidResult(**result)
+
+
 @router.get("/cases/{case_id}", response_model=CaseDetail)
 async def admin_case_detail(
     case_id: int,
@@ -924,6 +950,19 @@ async def admin_overturn_case(
     )
     await admin_manager.broadcast("admin.report.changed", {"case_id": case_id, "action": "overturned"})
     return await _case_detail(db, result["case"], admin.id, content_restored=result["content_restored"])
+
+
+@router.post("/cases/{case_id}/void", response_model=CaseDetail)
+async def admin_void_case(
+    case_id: int,
+    payload: CaseVoid,
+    admin: Annotated[User, Depends(get_current_admin)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> CaseDetail:
+    """作废一件机器案件：机器误报，没有结论、不处罚，从委员队列里拿掉，委员已经投的票不结算。"""
+    case = await case_service.void_case(db, case_id, note=payload.note, actor_id=admin.id)
+    await admin_manager.broadcast("admin.report.changed", {"case_id": case.id, "action": "voided"})
+    return await _case_detail(db, case, admin.id)
 
 
 @router.post("/cases/{case_id}/queue", response_model=CaseRead)

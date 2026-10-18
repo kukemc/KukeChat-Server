@@ -227,6 +227,30 @@ class CaseArchiveResult(BaseModel):
     dry_run: bool
 
 
+class CaseVoid(BaseModel):
+    """作废一件机器案件：机器误报，不是结论。note 不填记成「机器误报，作废」。"""
+
+    note: str | None = Field(default=None, max_length=500)
+
+
+class CaseVoidBulk(BaseModel):
+    """批量作废未结的机器案件。machine_source（例如 idle_scan：空闲复查建的全部）和 case_ids 至少给一个；dry_run 只数不改。"""
+
+    machine_source: Literal["idle_scan", "review", "downgraded"] | None = None
+    case_ids: list[int] | None = Field(default=None, max_length=200)
+    note: str | None = Field(default=None, max_length=500)
+    dry_run: bool = False
+
+
+class CaseVoidResult(BaseModel):
+    count: int
+    by_queue: dict[str, int] = Field(default_factory=dict)
+    # 符合条件、但后来有人举报并进来的（不作废，要按举报正常审）
+    skipped: int = 0
+    case_ids: list[int] = Field(default_factory=list)
+    dry_run: bool
+
+
 # ---------------------------------------------------------------- 风纪委员
 
 

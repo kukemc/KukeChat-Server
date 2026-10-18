@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import unittest
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Annotated
@@ -14,7 +15,7 @@ from unittest.mock import patch
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException
-from sqlalchemy import update
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1 import admin as admin_api
@@ -52,6 +53,10 @@ class IdleTestCase(JudgeTestCase):
         await super().asyncSetUp()
         idle_service.reset_state()
         self.addCleanup(idle_service.reset_state)
+        # 夹具里的「大家好」「有人吗」只有三个字，会被预筛的「太短」拦掉：选消息的测试先关掉这一条，预筛单独测（PrefilterRoundTests）
+        short = patch.object(settings, "moderation_prefilter_short_chars", 0)
+        short.start()
+        self.addCleanup(short.stop)
         # 夹具里的账号都是刚注册的：先变成老账号，「新账号」这条信号单独测
         async with self.sessions() as db:
             await db.execute(update(User).values(created_at=datetime.now(UTC) - timedelta(days=60)))
@@ -282,21 +287,23 @@ class RoundTests(IdleTestCase):
         async with self.sessions() as db:
             await self._allowed(db, "insult", risk=5)
             await self._allowed(db, "insult2", risk=4)
-        with self._scan(0.83, 0.3) as fake:
+        with self._scan(0.93, 0.3) as fake:
             result = await idle_service.run_round(self.sessions)
         self.assertEqual((result.status, result.judged, result.cases), ("done", 2, 1))
         self.assertEqual(fake.calls[0]["priority"], moderation_judge.PRIORITY_IDLE)
         self.assertEqual(fake.calls[0]["risk"], 5)
         self.assertEqual(fake.calls[0]["context"], ["成员A：大家好"])
-        self.assertEqual(fake.calls[0]["after"], ["成员B：别这样说话", "被举报人：再说一遍，废物", "被举报人：加我领福利"])
+        # 没人举报：巡查问法，作者叫「发言人」
+        self.assertEqual(fake.calls[0]["mode"], moderation_judge.MODE_PATROL)
+        self.assertEqual(fake.calls[0]["after"], ["成员B：别这样说话", "发言人：再说一遍，废物", "发言人：加我领福利"])
         async with self.sessions() as db:
             record = await self._record(db, "insult")
-            self.assertEqual((record.decision, record.judge_outcome, record.judge_p), ("allow", "idle_scan", 0.83))
+            self.assertEqual((record.decision, record.judge_outcome, record.judge_p), ("allow", "idle_scan", 0.93))
             self.assertEqual(((await self._record(db, "insult2")).judge_outcome, (await self._record(db, "insult2")).judge_p), ("idle_scan", 0.3))
             (case,) = await self._machine_cases(db)
-            self.assertEqual((case.message_id, case.machine_source, case.machine_decision, case.queue, case.judge_p), (self.messages["insult"], "idle_scan", "allow", "jury", 0.83))
+            self.assertEqual((case.message_id, case.machine_source, case.machine_decision, case.queue, case.judge_p), (self.messages["insult"], "idle_scan", "allow", "jury", 0.93))
             self.assertEqual(case.primary_reason, "机器筛查 · 空闲复查")
-            self.assertEqual(case.machine_note, "空闲复查：一审风险分 5.0；二审 0.83")
+            self.assertEqual(case.machine_note, "空闲复查：一审风险分 5.0；二审 0.93")
             self.assertLess(case.priority, 0)
             self.assertFalse(await self._recalled(db, "insult"))
             self.assertEqual(await self._violations(db, "insult"), [])
@@ -588,4 +595,250 @@ class AdminRouteTests(IdleTestCase):
             self.assertEqual(cases[0]["machine_source"], "review")
             settings_read = (await client.get("/admin/jury/settings")).json()
             self.assertTrue(settings_read["switches"]["machine_idle_scan"])
-            self.assertEqual(settings_read["thresholds"]["idle_scan_threshold"], 0.6)
+            self.assertEqual(settings_read["thresholds"]["idle_scan_threshold"], 0.9)
+
+
+# ---------------------------------------------------------------- 预筛、去重、巡查问法、作废（docs/moderation-v2.md 1.12）
+
+# 线上被空闲复查误建成案件的原样（p 0.71–0.80）
+LINK_WORK = "https://ccw.site/detail/66d52d0c8f1b2a3e4d5c6b7a?invite=Qx81Kd"
+LINK_WORK_AGAIN = "https://ccw.site/detail/66d52d0c8f1b2a3e4d5c6b7a?invite=Zp03Lm"
+LINK_GANDI = "https://www.ccw.site/gandi/project/66d52d0c8f1b2a3e4d5c6b7a?inviteToken=a1b2c3"
+BARE_MENTION = "@某人？"
+
+
+class PrefilterTextTests(unittest.TestCase):
+    def test_production_samples_are_not_worth_judging(self) -> None:
+        for text in (LINK_WORK, LINK_WORK_AGAIN, LINK_GANDI, f" {LINK_WORK}\n{LINK_GANDI} ", "https://chat-api.kuke.ink/download"):
+            self.assertEqual(moderation_judge.prefilter_reason(text), moderation_judge.PREFILTER_PLATFORM_LINK, text)
+        for text in (BARE_MENTION, "好的", "666", "？？", "  ", "", "👍👍"):
+            self.assertEqual(moderation_judge.prefilter_reason(text), moderation_judge.PREFILTER_SHORT, text)
+        names = moderation_judge.mention_names({"mentions": [{"user_id": 5, "name": "酷可mc同学"}]})
+        self.assertEqual(moderation_judge.prefilter_reason("@酷可mc同学 ？", mention_names=names), moderation_judge.PREFILTER_SHORT)
+
+    def test_real_content_and_foreign_links_are_still_judged(self) -> None:
+        for text in (
+            "你们都是废物",
+            f"加我领福利 {LINK_WORK}",
+            "https://evil.example.com/x",
+            "https://ccw.site.evil.com/a",
+            "https://ccw.site@evil.com/a",
+            f"{LINK_WORK} https://evil.example.com/x",
+        ):
+            self.assertIsNone(moderation_judge.prefilter_reason(text), text)
+        # 只去掉 metadata 里点名的那个昵称：后面的话留着
+        names = moderation_judge.mention_names({"mentions": [{"user_id": 5, "name": "张三"}]})
+        self.assertIsNone(moderation_judge.prefilter_reason("@张三 你就是个废物", mention_names=names))
+
+    def test_live_mode_only_skips_when_nothing_is_left(self) -> None:
+        # 实时二审（short=False）：一审标出来的「cnm」不能因为短就放过；「@某人？」没有点名信息，「某人」两个字还在
+        self.assertEqual(moderation_judge.prefilter_reason("cnm"), moderation_judge.PREFILTER_SHORT)
+        self.assertIsNone(moderation_judge.prefilter_reason("cnm", short=False))
+        self.assertIsNone(moderation_judge.prefilter_reason(BARE_MENTION, short=False))
+        names = moderation_judge.mention_names(json.dumps({"mentions": [{"user_id": 5, "name": "张三"}]}))
+        self.assertEqual(moderation_judge.prefilter_reason("@张三？", mention_names=names, short=False), moderation_judge.PREFILTER_SHORT)
+        self.assertEqual(moderation_judge.prefilter_reason(LINK_GANDI, short=False), moderation_judge.PREFILTER_PLATFORM_LINK)
+
+    def test_mention_names_tolerates_odd_metadata(self) -> None:
+        self.assertEqual(moderation_judge.mention_names({"mentions": [5, "x", {"name": " 李四 "}, {"user_id": 3}]}), ["李四"])
+        self.assertEqual(moderation_judge.mention_names("not json"), [])
+        self.assertEqual(moderation_judge.mention_names(None), [])
+        self.assertIn("全体成员", moderation_judge.mention_names({"mention_all": True}))
+
+    def test_dedupe_key_ignores_invite_params_mentions_and_punctuation(self) -> None:
+        key = moderation_judge.dedupe_key
+        self.assertEqual(key(LINK_WORK), key(LINK_WORK_AGAIN))
+        self.assertEqual(key(LINK_WORK), key(LINK_WORK.replace("https://", "https://www.")))
+        self.assertNotEqual(key(LINK_WORK), key(LINK_GANDI))
+        self.assertEqual(key("@张三 你好！"), key("你好"))
+        self.assertEqual(key("你们都是废物！！"), key("你们都是 废物"))
+        self.assertEqual(key(""), "")
+
+    def test_trusted_domains_setting_is_normalized(self) -> None:
+        with patch.object(settings, "moderation_trusted_link_domains", " *.CCW.site, .kuke.ink ,,example.org."):
+            self.assertEqual(settings.moderation_trusted_link_domains_normalized, ("ccw.site", "kuke.ink", "example.org"))
+            self.assertEqual(moderation_judge.prefilter_reason("https://example.org/a"), moderation_judge.PREFILTER_PLATFORM_LINK)
+        self.assertEqual(settings.moderation_idle_scan_threshold, 0.9)
+
+
+class PrefilterRoundTests(IdleTestCase):
+    async def asyncSetUp(self) -> None:
+        await super().asyncSetUp()
+        # 这里测的就是预筛：恢复默认的 3 个字
+        short = patch.object(settings, "moderation_prefilter_short_chars", 3)
+        short.start()
+        self.addCleanup(short.stop)
+
+    async def _say(self, db, text: str, *, sender: str = "offender", metadata: dict | None = None) -> int:
+        message = Message(
+            conversation_id=self.small_id, sender_id=self.ids[sender], content=text, metadata_json=json.dumps(metadata, ensure_ascii=False) if metadata else None
+        )
+        db.add(message)
+        await db.commit()
+        return message.id
+
+    async def _judge_state(self, db, message_id: int) -> tuple[str | None, float | None]:
+        record = (
+            await db.execute(select(ContentModerationRecord).where(ContentModerationRecord.message_id == message_id).order_by(ContentModerationRecord.id.desc()))
+        ).scalars().first()
+        return record.judge_outcome, record.judge_p
+
+    async def test_links_mentions_and_repeats_are_never_judged(self) -> None:
+        repeat = "来我群里玩 https://evil.example.com/g?ref={}"
+        async with self.sessions() as db:
+            await self._allowed(db, "insult", risk=5)
+            first = await self._say(db, repeat.format(1))
+            await self._allowed(db, first, risk=5)
+            second = await self._say(db, repeat.format(2))
+            await self._allowed(db, second, risk=5)
+            skipped = [await self._say(db, text) for text in (LINK_WORK, LINK_WORK_AGAIN, LINK_GANDI, BARE_MENTION)]
+            skipped.append(await self._say(db, "@张三？", metadata={"mentions": [{"user_id": self.ids["bob"], "name": "张三"}]}))
+            for message_id in skipped:
+                await self._allowed(db, message_id, risk=5)
+        with self._scan(0.2, 0.95) as fake:
+            result = await idle_service.run_round(self.sessions)
+        # 只问了两条：真正的辱骂、重复的那句话的第一条
+        self.assertEqual([call["text"] for call in fake.calls], ["你们都是废物", repeat.format(1)])
+        self.assertEqual({call["mode"] for call in fake.calls}, {moderation_judge.MODE_PATROL})
+        self.assertEqual((result.judged, result.cases), (2, 1))
+        async with self.sessions() as db:
+            for message_id in [second, *skipped]:
+                self.assertEqual(await self._judge_state(db, message_id), (moderation_judge.OUTCOME_PREFILTERED, None))
+            self.assertEqual(await self._judge_state(db, first), ("idle_scan", 0.95))
+            self.assertEqual([case.message_id for case in await self._machine_cases(db)], [first])
+            # 一天之内同一个人又发一遍：已经问过二审了，不再问
+            third = await self._say(db, repeat.format(3))
+            await self._allowed(db, third, risk=5)
+        with self._scan(0.99) as fake:
+            self.assertEqual((await idle_service.run_round(self.sessions)).status, "empty")
+        self.assertEqual(fake.calls, [])
+        async with self.sessions() as db:
+            self.assertEqual(await self._judge_state(db, third), (moderation_judge.OUTCOME_PREFILTERED, None))
+            self.assertEqual(len(await self._machine_cases(db)), 1)
+
+    async def test_below_the_new_default_threshold_no_case(self) -> None:
+        async with self.sessions() as db:
+            await self._allowed(db, "insult", risk=5)
+        with self._scan(0.85):
+            result = await idle_service.run_round(self.sessions)
+        self.assertEqual((result.judged, result.cases), (1, 0))
+
+    async def test_no_second_open_case_for_the_same_text_by_the_same_author(self) -> None:
+        async with self.sessions() as db:
+            db.add(
+                ReportCase(
+                    target_key=f"message:{self.messages['insult']}", target_type="message", target_id=self.messages["insult"],
+                    message_id=self.messages["insult"], reported_user_id=self.ids["offender"], status="open",
+                )
+            )
+            await db.commit()
+            again = await self._say(db, "你们都是废物！！")
+            await self._allowed(db, again, risk=5)
+        with self._scan(0.97) as fake:
+            result = await idle_service.run_round(self.sessions)
+        self.assertEqual((len(fake.calls), result.cases), (1, 0))
+        async with self.sessions() as db:
+            self.assertEqual(await self._machine_cases(db), [])
+
+    async def test_live_review_of_a_bare_link_or_mention_is_allowed_without_judging(self) -> None:
+        async with self.sessions() as db:
+            link = await self._say(db, LINK_GANDI)
+            mention = await self._say(db, "@张三？", metadata={"mentions": [{"user_id": self.ids["bob"], "name": "张三"}]})
+            bare = await self._say(db, BARE_MENTION)
+            blocked_link = await self._say(db, LINK_WORK)
+        from test_moderation_judge import BLOCK
+
+        with self._judge(0.5, 0.95) as fake:
+            await self._moderate(link, UNCERTAIN)
+            await self._moderate(mention, UNCERTAIN)
+            # 没有点名信息的「@某人？」：「某人」还在，照常问；一审 block 的链接也照常问
+            await self._moderate(bare, UNCERTAIN)
+            await self._moderate(blocked_link, BLOCK)
+        self.assertEqual([call["text"] for call in fake.calls], ["@某人", LINK_WORK])
+        self.assertEqual({call["mode"] for call in fake.calls}, {moderation_judge.MODE_REPORT})
+        async with self.sessions() as db:
+            self.assertEqual(await self._judge_state(db, link), (moderation_judge.OUTCOME_PREFILTERED, None))
+            self.assertEqual(await self._judge_state(db, mention), (moderation_judge.OUTCOME_PREFILTERED, None))
+            # 预筛放行的不建机器案件
+            self.assertEqual([case.message_id for case in await self._machine_cases(db)], [bare])
+
+
+class VoidCaseTests(IdleTestCase):
+    def _client(self) -> httpx.AsyncClient:
+        api = FastAPI()
+        api.include_router(admin_api.router, prefix="/admin")
+
+        async def isolated_db():
+            async with self.sessions() as session:
+                yield session
+
+        async def acting_user(db: Annotated[AsyncSession, Depends(get_db)]) -> User:
+            return await db.get(User, self.ids["admin"])
+
+        api.dependency_overrides[get_db] = isolated_db
+        api.dependency_overrides[get_current_user] = acting_user
+        return httpx.AsyncClient(transport=httpx.ASGITransport(app=api), base_url="http://testserver")
+
+    async def test_void_one_machine_case_drops_it_from_juror_queues_without_scoring_votes(self) -> None:
+        from app.models.case import JuryVote
+        from app.services import jury as jury_service
+
+        async with self.sessions() as db:
+            await self._allowed(db, "insult", risk=5)
+        with self._scan(0.95):
+            await idle_service.run_round(self.sessions)
+        async with self.sessions() as db:
+            (case,) = await self._machine_cases(db)
+            await self._vote(db, "juror1", "l2", case_id=case.id)
+        async with self._client() as client:
+            response = await client.post(f"/admin/cases/{case.id}/void", json={})
+            self.assertEqual(response.status_code, 200, response.text)
+            body = response.json()
+            self.assertEqual((body["status"], body["verdict_source"]), ("archived", "void"))
+            again = await client.post(f"/admin/cases/{case.id}/void", json={})
+            self.assertEqual((again.status_code, again.json()["detail"]["code"]), (409, "case_closed"))
+            listed = (await client.get("/admin/cases", params={"status": "archived"})).json()["items"]
+            self.assertIn(case.id, [item["id"] for item in listed])
+        async with self.sessions() as db:
+            row = await db.get(ReportCase, case.id)
+            self.assertEqual((row.status, row.verdict_source, row.verdict_note, row.violation_id), ("archived", "void", "机器误报，作废", None))
+            votes = (await db.execute(select(JuryVote).where(JuryVote.case_id == case.id, JuryVote.voted_at.is_not(None)))).scalars().all()
+            self.assertEqual([vote.agreed for vote in votes], [None])
+            self.assertFalse(jury_service.has_verdict(row))
+            # 别的委员拿不到它了
+            view = await jury_service.next_case(db, await self._user(db, "juror2"))
+            self.assertTrue(view is None or await self._real(db, view["case_id"]) != case.id)
+            self.assertEqual(await self._violations(db, "insult"), [])
+
+    async def test_only_machine_cases_without_reports_can_be_voided(self) -> None:
+        async with self.sessions() as db:
+            reported = await self._jury_case(db, "greeting")
+        async with self._client() as client:
+            response = await client.post(f"/admin/cases/{reported}/void", json={})
+            self.assertEqual((response.status_code, response.json()["detail"]["code"]), (422, "not_machine_case"))
+            self.assertEqual((await client.post("/admin/cases/999999/void", json={})).status_code, 404)
+
+    async def test_void_all_open_idle_scan_cases_at_once(self) -> None:
+        async with self.sessions() as db:
+            for name, risk in (("insult", 6), ("insult2", 5), ("insult3", 4)):
+                await self._allowed(db, name, risk=risk)
+        with self._scan(0.95, 0.95, 0.95):
+            await idle_service.run_round(self.sessions)
+        await self._run("spam", UNCERTAIN, 0.5)
+        async with self.sessions() as db:
+            cases = await self._machine_cases(db)
+            self.assertEqual([case.machine_source for case in cases], ["idle_scan", "idle_scan", "idle_scan", "review"])
+            # 后来有人举报并进来的不动
+            cases[2].report_count = 1
+            await db.commit()
+        async with self._client() as client:
+            self.assertEqual((await client.post("/admin/cases/void", json={})).status_code, 422)
+            preview = (await client.post("/admin/cases/void", json={"machine_source": "idle_scan", "dry_run": True})).json()
+            self.assertEqual((preview["count"], preview["skipped"], preview["dry_run"]), (2, 1, True))
+            result = (await client.post("/admin/cases/void", json={"machine_source": "idle_scan", "note": "空闲复查误报，统一作废"})).json()
+            self.assertEqual((result["count"], result["skipped"], result["by_queue"]), (2, 1, {"jury": 2}))
+        async with self.sessions() as db:
+            rows = {case.id: case for case in await self._machine_cases(db)}
+            states = [(rows[case.id].status, rows[case.id].verdict_source) for case in cases]
+            self.assertEqual(states, [("archived", "void"), ("archived", "void"), ("open", None), ("open", None)])
+            self.assertEqual(rows[cases[0].id].verdict_note, "空闲复查误报，统一作废")

@@ -94,8 +94,15 @@ class Settings(BaseSettings):
     # 交给二审再看一遍，概率够高的建成机器案件给委员看（从不处罚、从不撤回）。还要后台开关 machine_idle_scan、
     # machine_judge、machine_review 都开着才跑。
     moderation_idle_scan_enabled: bool = True
-    # 二审概率 ≥ 这个值才建案件
-    moderation_idle_scan_threshold: float = Field(default=0.6, ge=0, le=1)
+    # 二审概率 ≥ 这个值才建案件。0.6 时普通作品链接、「@某人？」也能建成案件（2026-10-19 起改用 patrol 问法，阈值提到 0.9）
+    moderation_idle_scan_threshold: float = Field(default=0.9, ge=0, le=1)
+    # 同一个人 24 小时内发的同一段话（去掉 @、标点、邀请参数之后相同）只复查一次（docs/moderation-v2.md 1.12）
+    moderation_idle_scan_dedupe_hours: int = Field(default=24, ge=0, le=24 * 7)
+    # 预筛（docs/moderation-v2.md 1.12）：去掉 @昵称、空白、标点、表情之后不超过这么多字的不问二审（「@某人？」「好的」）。
+    # 只用于空闲复查；实时二审只跳过「一个字都不剩」的
+    moderation_prefilter_short_chars: int = Field(default=3, ge=0, le=20)
+    # 只有网址、而且都在这些域名（及其子域名）上的消息不问二审：分享作品、邀请链接。逗号分隔
+    moderation_trusted_link_domains: str = "ccw.site,kuke.ink"
     # 每一轮最多复查多少条、往回看多久
     moderation_idle_scan_batch: int = Field(default=50, ge=1, le=500)
     moderation_idle_scan_lookback_hours: int = Field(default=6, ge=1, le=72)
@@ -110,7 +117,8 @@ class Settings(BaseSettings):
     moderation_idle_scan_backoff_seconds: int = Field(default=300, ge=10, le=24 * 3600)
     # 申诉预审（docs/moderation-v2.md 1.3）：机器处罚的申诉，二审概率低于这个值时后台标「可能误判」、排在申诉列表最前
     moderation_appeal_low_p: float = Field(default=0.3, ge=0, le=1)
-    # 语音口令识别服务（语音红包，docs/red-packets.md）。不配就不开放语音红包；密钥沿用 content_moderation_token
+    # 语音识别服务（语音红包 docs/red-packets.md；语音消息转文字 docs/chat-features.md 第 12 节）。不配就不开放语音红包、转文字返回 503；
+    # 密钥沿用 content_moderation_token
     voice_asr_url: str | None = None
     voice_asr_timeout_seconds: int = Field(default=15, ge=1, le=60)
     moderation_alert_email: str | None = None
@@ -379,6 +387,12 @@ class Settings(BaseSettings):
         if len(secret) < 32:
             raise ValueError("JWT_SECRET_KEY 太短，至少需要 32 个字符。")
         return secret
+
+    @property
+    def moderation_trusted_link_domains_normalized(self) -> tuple[str, ...]:
+        """moderation_trusted_link_domains 拆开、小写、去掉开头的 *. 和 .。"""
+        items = (item.strip().lower().lstrip("*").lstrip(".").rstrip(".") for item in (self.moderation_trusted_link_domains or "").split(","))
+        return tuple(dict.fromkeys(item for item in items if item))
 
     @property
     def moderation_judge_active(self) -> bool:

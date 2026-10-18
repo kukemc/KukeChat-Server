@@ -1,4 +1,5 @@
 """语音口令识别：把一段录音和口令交给识别服务（settings.voice_asr_url，私有部署，见 docs/red-packets.md），判断说得对不对。
+另外语音消息转文字（transcribe，docs/chat-features.md「语音转文字」）也走同一个识别服务的 /asr/transcribe。
 
 识别服务返回识别出的文字，以及两边转成拼音音节之后的编辑距离 distance 和口令的音节数 length；
 能不能算「说对了」在这里按 allowed_errors 判断：口令越长允许错的音节越多，同音字、平翘舌、前后鼻音不算错（服务端已经归一）。
@@ -61,6 +62,16 @@ def _multipart(fields: dict[str, str], filename: str, data: bytes, content_type:
     return b"".join(parts), boundary
 
 
+class VoiceTooLong(ValueError):
+    """录音超过识别服务转文字的上限（60 秒）。"""
+
+
+@dataclass(frozen=True)
+class VoiceTranscription:
+    text: str
+    duration: float
+
+
 def _post(audio: bytes, filename: str, content_type: str, expected: str) -> dict:
     if not settings.voice_asr_url:
         raise VoiceAsrUnavailable("voice_asr_url is not configured")
@@ -91,5 +102,39 @@ async def match(audio: bytes, filename: str, content_type: str, expected: str) -
             length=int(result.get("length")),
             duration=float(result.get("duration") or 0),
         )
+    except (TypeError, ValueError) as exc:
+        raise VoiceAsrUnavailable(f"bad response: {result!r}"[:200]) from exc
+
+
+def _post_transcribe(audio: bytes, filename: str, content_type: str, language: str | None) -> dict:
+    if not settings.voice_asr_url:
+        raise VoiceAsrUnavailable("voice_asr_url is not configured")
+    body, boundary = _multipart({"language": language} if language else {}, filename, audio, content_type)
+    headers = {"Content-Type": f"multipart/form-data; boundary={boundary}"}
+    if settings.content_moderation_token:
+        headers["X-Moderation-Token"] = settings.content_moderation_token
+    request = Request(f"{settings.voice_asr_url.rstrip('/')}/asr/transcribe", data=body, headers=headers, method="POST")
+    try:
+        # 60 秒的录音识别要比口令（最长 15 秒）多花几倍时间，超时给宽一点
+        with urlopen(request, timeout=settings.voice_asr_timeout_seconds * 2) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:200]
+        if exc.code in (413, 422) and ("audio_too_long" in detail or "audio_too_large" in detail):
+            raise VoiceTooLong(detail) from exc
+        # 别的 422（读不出来的录音、不支持的语言）和服务故障一样：这次转不了
+        raise VoiceAsrUnavailable(f"HTTP {exc.code}: {detail}") from exc
+    except (URLError, TimeoutError, OSError, ValueError) as exc:
+        raise VoiceAsrUnavailable(str(exc)) from exc
+
+
+async def transcribe(audio: bytes, filename: str, content_type: str, language: str | None = None) -> VoiceTranscription:
+    """语音消息转文字：返回识别出的文字（可能是空串：没听到话）和录音时长（秒）。
+    录音太长抛 VoiceTooLong；没配、连不上、出错抛 VoiceAsrUnavailable。在线程里等，调用方先 release_connection。"""
+    result = await asyncio.to_thread(_post_transcribe, audio, filename, content_type, language)
+    if not isinstance(result, dict):
+        raise VoiceAsrUnavailable(f"bad response: {result!r}"[:200])
+    try:
+        return VoiceTranscription(text=str(result.get("text") or "").strip(), duration=float(result.get("duration") or 0))
     except (TypeError, ValueError) as exc:
         raise VoiceAsrUnavailable(f"bad response: {result!r}"[:200]) from exc
