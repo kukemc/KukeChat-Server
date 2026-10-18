@@ -1325,6 +1325,9 @@ async def cast_vote(db: AsyncSession, user: User, review_id: int, vote: str, not
             member.golden_correct += 1 if agreed else 0
             rewards.append(await points_service.award(db, member, "quality_correct" if agreed else "quality_wrong", case_id=case_id, announce=False))
             await _after_settled(db, member)
+            if not agreed:
+                # 答错的人多了，题本身可能有问题：先移出计分，等管理员复核
+                await bank_service.maybe_pull_question(db, case)
         else:
             await _apply_abstain_cooldown(db, member, now)
             await points_service.check_achievements(db, user.id, member)

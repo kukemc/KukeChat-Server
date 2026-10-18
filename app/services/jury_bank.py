@@ -19,7 +19,7 @@ from sqlalchemy import and_, exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.models.case import JuryExamAttempt, JuryPracticeAnswer, JuryVote, ReportCase
+from app.models.case import JuryExamAttempt, JuryPointLog, JuryPracticeAnswer, JuryVote, ReportCase
 from app.models.jury_hall import JuryPrecedent
 from app.models.penalty import UserViolation
 from app.models.report import AdminAuditLog
@@ -48,6 +48,15 @@ BLOCK_MESSAGES = {
     "sensitive": "色情低俗 / 涉未成年 / 隐私类的案件不能进题库",
     "public_content": "这个案件的内容会出现在公示栏里，不能进题库（否则可以去公示栏查答案）",
 }
+# 能进题库、但不能标成「已核对」（不能用于考试和质控计分）的原因，见 verify_block_reason
+VERIFY_BLOCK_MESSAGES = {
+    "hidden_context": "被举报人在上下文里还有看不到的消息（已撤回 / 已删除）或语音，标准答案是「不违规」的题委员没法确认，不能当计分题",
+    "voice_target": "被举报的是一条语音，旧版客户端放不了，不能当计分题",
+}
+# 质控题答错的人多到这个程度，自动移出计分（改回未核对），等管理员复核。只看上一次核对之后的作答。
+PULL_MIN_WRONG = 2
+PULL_WRONG_RATE = 0.4
+AUTO_SUSPEND_NOTE = "评审准确率过低，系统自动暂停资格"
 
 
 # ---------------------------------------------------------------- 标准答案
@@ -120,6 +129,35 @@ async def block_reason(db: AsyncSession, case: ReportCase, *, group_content: boo
     return None
 
 
+def verify_block_from_view(view: dict[str, Any], upheld: bool) -> str | None:
+    """看委员能看到的内容判断这道题能不能当计分题；None 表示可以。
+
+    判「不违规」要看清被举报人在上下文里的全部言行：他有撤回 / 删除的消息（委员看到的是空白）或语音时，
+    答案可能恰恰就在看不到的那几条里。判「违规」的题，被举报的那条本身看得见就够了，除非它是语音。
+    """
+    messages = view.get("messages") or []
+    target = next((item for item in messages if item.get("is_target")), None)
+    if target is not None and target.get("type") == "voice":
+        return "voice_target"
+    if upheld:
+        return None
+    for item in messages:
+        if item.get("speaker") != "被举报人" or item.get("type") == "system":
+            continue
+        if item.get("type") == "voice" or (not (item.get("content") or "").strip() and not item.get("images")):
+            return "hidden_context"
+    return None
+
+
+async def verify_block_reason(db: AsyncSession, case: ReportCase) -> str | None:
+    from app.services import jury as jury_service
+
+    if case.target_type != "message":
+        return None
+    view = await jury_service.juror_case_view(db, case)
+    return verify_block_from_view(view, question_upheld(case))
+
+
 async def _has_pending_appeal(db: AsyncSession, case: ReportCase) -> bool:
     clauses = [UserViolation.case_id == case.id]
     if case.violation_id is not None:
@@ -180,7 +218,8 @@ async def auto_include(db: AsyncSession) -> int:
             case.golden_source = "excluded"
             continue
         case.is_golden = True
-        case.golden_verified = True
+        # 全票一致也只说明委员看到的部分没有争议；上下文里有看不到的内容时只进练习
+        case.golden_verified = await verify_block_reason(db, case) is None
         case.golden_source = "consensus"
         included += 1
     await db.commit()
@@ -348,6 +387,7 @@ async def question_detail(db: AsyncSession, case_id: int) -> dict[str, Any]:
     case = await _case(db, case_id)
     view = await jury_service.juror_case_view(db, case)
     reason = await block_reason(db, case)
+    verify_reason = verify_block_from_view(view, question_upheld(case)) if case.target_type == "message" else None
     return {
         **(await question_reads(db, [case]))[0],
         "reasons": view["reasons"],
@@ -357,34 +397,126 @@ async def question_detail(db: AsyncSession, case_id: int) -> dict[str, Any]:
         # 不能当题目的原因；可以时为 null
         "block_reason": reason,
         "block_message": BLOCK_MESSAGES.get(reason) if reason else None,
+        # 能进题库、但不能标成已核对（计分）的原因；可以时为 null
+        "verify_block_reason": verify_reason,
+        "verify_block_message": VERIFY_BLOCK_MESSAGES.get(verify_reason) if verify_reason else None,
     }
 
 
-async def _rescore_quality_votes(db: AsyncSession, case: ReportCase) -> int:
-    """标准答案改了之后，把评审中答过这道质控题的人重新对一遍答案（只改正确数，不追溯风纪值）。"""
-    from app.models.case import JuryMember
+async def restore_if_cleared(db: AsyncSession, member: Any) -> bool:
+    """被系统按准确率自动暂停的人，质控题更正后准确率回到暂停线以上的，自动恢复资格。调用方负责 commit。"""
+    from app.services import jury as jury_service
+    from app.services import jury_points as points_service
+
+    if member.status != "suspended" or member.review_note != AUTO_SUSPEND_NOTE:
+        return False
+    low_agreement = member.votes_settled >= jury_service.MIN_SETTLED_FOR_REVIEW and member.votes_agreed / member.votes_settled < jury_service.MIN_ACCURACY
+    low_golden = member.golden_total >= jury_service.MIN_GOLDEN_FOR_REVIEW and member.golden_correct / member.golden_total < jury_service.MIN_ACCURACY
+    if low_agreement or low_golden:
+        return False
+    now = datetime.now(UTC)
+    jury_service._activate(member, now)
+    member.review_note = "质控题更正后准确率已恢复，系统自动恢复资格"
+    member.reviewed_at = now
+    member.reviewed_by_id = None
+    db.add(AdminAuditLog(actor_id=None, action="jury.member.auto_reinstate", target_type="user", target_id=member.user_id, details="质控题更正后准确率恢复"))
+    await points_service.sync_badge(db, member, now=now)
+    points_service.notify(
+        db, member.user_id, "reinstated", "你的风纪委员资格已恢复", "之前暂停你资格的质控题里有题目标准答案有误，更正后你的准确率已经恢复，资格已自动恢复。"
+    )
+    return True
+
+
+async def _rescore_quality_votes(db: AsyncSession, case: ReportCase, *, void: bool = False) -> int:
+    """标准答案改了、或者题被移出计分之后，把评审中答错这道质控题的人改判为答对。调用方负责 commit。
+
+    void：这道题不再计分（移出题库 / 改回未核对）—— 题有问题，之前答错的一律算对。
+    否则按新的标准答案重新对：原来错、现在对的改判为答对；原来对、现在错的不追溯（不因为题目出错再扣谁的分）。
+    改判为答对的：退回当时扣的风纪值并补上答对的分，正确数 +1，被这道题拖到自动暂停的人恢复资格，并发通知说明。
+    """
+    from app.services import jury as jury_service
+    from app.services import jury_points as points_service
 
     upheld = question_upheld(case)
     votes = (
-        await db.execute(select(JuryVote).where(JuryVote.case_id == case.id, JuryVote.is_quality_check.is_(True), JuryVote.agreed.is_not(None)))
+        await db.execute(select(JuryVote).where(JuryVote.case_id == case.id, JuryVote.is_quality_check.is_(True), JuryVote.agreed.is_(False)))
     ).scalars().all()
     changed = 0
     for vote in votes:
         if vote.vote not in DECIDED_VOTES:
             continue
-        agreed = (vote.vote != "none") == upheld
-        if vote.agreed == agreed:
+        if not void and (vote.vote != "none") != upheld:
             continue
-        vote.agreed = agreed
-        member = (await db.execute(select(JuryMember).where(JuryMember.user_id == vote.juror_id))).scalar_one_or_none()
-        if member is not None:
-            member.golden_correct = max(0, min(member.golden_total, member.golden_correct + (1 if agreed else -1)))
+        vote.agreed = True
+        member = await jury_service.get_member(db, vote.juror_id)
+        if member is None:
+            continue
+        member.golden_correct = min(member.golden_total, member.golden_correct + 1)
+        lost = (
+            await db.execute(
+                select(func.coalesce(func.sum(JuryPointLog.points), 0)).where(
+                    JuryPointLog.user_id == vote.juror_id, JuryPointLog.kind == "quality_wrong", JuryPointLog.case_id == case.id
+                )
+            )
+        ).scalar_one()
+        refund = -int(lost or 0) + points_service.POINTS["quality_correct"]
+        if refund:
+            await points_service.award(db, member, "quality_fixed", points=refund, case_id=case.id, note=f"质控题更正：评审 #{vote.id}")
+        points_service.notify(
+            db,
+            vote.juror_id,
+            "quality_fixed",
+            "一道质控题的答案已更正",
+            f"你在评审 #{vote.id} 答的质控题标准答案有误，已改判为答对：退回扣掉的风纪值并补上答对的分（共 {refund:+d}）。",
+        )
+        await restore_if_cleared(db, member)
         changed += 1
+    if changed:
+        points_service.reset_leaderboard_cache()
     return changed
+
+
+async def maybe_pull_question(db: AsyncSession, case: ReportCase) -> bool:
+    """质控题刚被答错一次时调用：上次核对之后答错的人数和比例都过线，就把题改回未核对（移出考试和质控），等管理员复核。
+
+    只移出、不改判：题到底错没错由管理员看。管理员改答案或移出题库时，之前答错的人会自动改判（_rescore_quality_votes）。
+    调用方负责 commit。
+    """
+    if not case.is_golden or not case.golden_verified:
+        return False
+    since = (
+        await db.execute(
+            select(func.max(AdminAuditLog.created_at)).where(
+                AdminAuditLog.target_type == "report_case", AdminAuditLog.target_id == case.id, AdminAuditLog.action == "jury.question.update"
+            )
+        )
+    ).scalar_one_or_none()
+    clauses = [JuryVote.case_id == case.id, JuryVote.is_quality_check.is_(True), JuryVote.agreed.is_not(None)]
+    if since is not None:
+        clauses.append(JuryVote.voted_at > since)
+    rows = (await db.execute(select(JuryVote.agreed, func.count()).where(*clauses).group_by(JuryVote.agreed))).all()
+    counts = {bool(agreed): int(count) for agreed, count in rows}
+    wrong, total = counts.get(False, 0), sum(counts.values())
+    if wrong < PULL_MIN_WRONG or wrong / total < PULL_WRONG_RATE:
+        return False
+    case.golden_verified = False
+    db.add(
+        AdminAuditLog(
+            actor_id=None,
+            action="jury.question.auto_pulled",
+            target_type="report_case",
+            target_id=case.id,
+            details=json.dumps({"wrong": wrong, "answered": total}, ensure_ascii=False),
+        )
+    )
+    logger.warning("quality question pulled from scoring", extra={"case_id": case.id, "wrong": wrong, "answered": total})
+    return True
 
 
 async def update_question(db: AsyncSession, case_id: int, *, actor_id: int, changes: dict[str, Any]) -> dict[str, Any]:
     """加入 / 移出题库、核对、改标准答案和说明。changes 里只放请求里出现过的字段，值为 None 表示清空。"""
+    from app.services import jury as jury_service
+
     case = await _case(db, case_id)
     before = {
         "in_bank": bool(case.is_golden),
@@ -397,7 +529,9 @@ async def update_question(db: AsyncSession, case_id: int, *, actor_id: int, chan
     }
     requested = changes.get("in_bank")
     if requested is False:
-        # 移出题库：记成 removed，自动入库和管理员结案都不会再把它放回来。
+        # 移出题库：记成 removed，自动入库和管理员结案都不会再把它放回来。计过分的题，之前答错的人改判为答对。
+        if case.is_golden and case.golden_verified:
+            await _rescore_quality_votes(db, case, void=True)
         case.is_golden = False
         case.golden_verified = False
         case.golden_source = "removed"
@@ -412,6 +546,15 @@ async def update_question(db: AsyncSession, case_id: int, *, actor_id: int, chan
             reason = await block_reason(db, case)
             if reason is not None:
                 raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail={"code": "case_not_eligible", "message": BLOCK_MESSAGES[reason]})
+        was_verified = bool(case.is_golden and case.golden_verified)
+        # 改完之后还是 / 变成已核对的，按改完之后的标准答案查能不能计分（比如把答案改成「不违规」，就要看被举报人有没有看不到的消息）
+        verified_after = bool(changes["verified"]) if changes.get("verified") is not None else was_verified
+        if verified_after and case.target_type == "message":
+            outcome_after = changes["outcome"] if "outcome" in changes else case.golden_outcome
+            upheld_after = outcome_after == "violation" if outcome_after in {"violation", "clean"} else case.status == "resolved"
+            reason = verify_block_from_view(await jury_service.juror_case_view(db, case), upheld_after)
+            if reason is not None:
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail={"code": "question_not_verifiable", "message": VERIFY_BLOCK_MESSAGES[reason]})
         if not case.is_golden:
             case.is_golden = True
             case.golden_verified = False
@@ -431,7 +574,9 @@ async def update_question(db: AsyncSession, case_id: int, *, actor_id: int, chan
             # 标准答案是「不违规」时不留等级和类别
             case.golden_level = None
             case.golden_category = None
-        if "outcome" in changes:
+        if was_verified and not case.golden_verified:
+            await _rescore_quality_votes(db, case, void=True)
+        elif "outcome" in changes:
             await _rescore_quality_votes(db, case)
     after = {
         "in_bank": bool(case.is_golden),

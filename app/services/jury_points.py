@@ -52,6 +52,7 @@ POINT_LABELS: dict[str, str] = {
     "exam_passed": "通过入门考试",
     "overturn_adjust": "改判补差",
     "admin_adjust": "管理员调整",
+    "quality_fixed": "质控题更正",
     "panel_agreed": "合议与结论一致",
     "panel_disagreed": "参与合议",
     "review_vote": "参与复审",
