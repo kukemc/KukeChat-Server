@@ -67,6 +67,8 @@
 - POST：除 `content` 外都可以省略，省略按 false / []。
 - PATCH：**每个字段都可以省略，省略表示不改**（老客户端只传 `content` + `pinned`，不会把图片和选项冲掉）。
 - `send_to_new_members: true` 会把这个群其它公告的这一项自动关掉。
+- 修改时只有置顶变了（或什么都没变）不发卡片、不记 `edited_at`；正文、图片或其它选项变了才发「公告已更新」卡片。
+- 修改不会清掉已有的看过 / 确认记录。
 - 置顶：从未置顶改成置顶时记 `pinned_at = 现在`；已经置顶的再传 true 不刷新时间。
 - 正文和图片发布前同步过内容审核（审核服务不可用时放行）：正文违规 422 `announcement_rejected`，图片违规 422 `announcement_image_rejected`。
 - 图片不是本站上传的图：422 `invalid_announcement_image`；超过 9 张：422 `too_many_images`。
