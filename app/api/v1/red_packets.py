@@ -13,7 +13,7 @@ from app.core.database import get_db
 from app.core.dependencies import get_current_user
 from app.models.user import User
 from app.schemas.message import MessageRead
-from app.schemas.red_packet import RedPacketClaimResult, RedPacketConfig, RedPacketCreate, RedPacketPage, RedPacketPending, RedPacketPendingList, RedPacketRead, RedPacketSendResult
+from app.schemas.red_packet import RedPacketClaimRequest, RedPacketClaimResult, RedPacketConfig, RedPacketCreate, RedPacketPage, RedPacketPending, RedPacketPendingList, RedPacketRead, RedPacketSendResult
 from app.services import intimacy as intimacy_service
 from app.services import sparks as spark_service
 from app.services import messages as message_service
@@ -115,14 +115,18 @@ async def claim_red_packet(
     packet_id: int,
     current_user: Annotated[User, Depends(get_current_user)],
     db: Annotated[AsyncSession, Depends(get_db)],
+    payload: RedPacketClaimRequest | None = None,
 ) -> RedPacketClaimResult:
     user_id = current_user.id
-    result, chain_message = await red_packet_service.claim(db, current_user, packet_id)
+    # 语音红包带录音；别的红包不带请求体（带了也忽略）
+    result, chain_message = await red_packet_service.claim(
+        db, current_user, packet_id, payload.voice_url if payload else None, payload.voice_metadata if payload else None
+    )
     # 会话列表里的 red_packet_pending 变了，别让这个人拿到 5 秒前缓存的那份
     response_cache.invalidate_user_conversations({user_id})
     message_data = None
     if chain_message is not None:
-        # 接龙红包：领取时自动发的那句话已经和领取一起提交了，现在照普通消息广播。
+        # 接龙 / 语音红包：领取时自动发的那句话（那段语音）已经和领取一起提交了，现在照普通消息广播。
         # 不再单独送异步审核：口令是发红包的人写的，发之前审过，红包消息的异步审核也会再看一遍（算在发的人头上）
         message_data = await _deliver_created(db, chain_message, user_id)
         intimacy_service.schedule_message(chain_message.conversation_id, user_id, chain_message.type, chain_message.created_at, bind=db.bind)

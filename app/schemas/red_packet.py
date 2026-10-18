@@ -45,6 +45,8 @@ class RedPacketCreate(BaseModel):
     greeting: Any = None
     # 接龙口令（可空）：1–30 字，领取成功时以领取人的身份自动发这句话
     chain_text: Any = None
+    # 语音口令（可空）：1–30 字，和 chain_text 互斥。领的人要说出这句话，说对了这段语音以领取人的身份发进会话
+    voice_text: Any = None
     # 专属红包的目标（可空）：只在群里，必须是群成员、不是自己、不是机器人；kind 只能是 normal、count 只能是 1
     target_user_id: Any = None
 
@@ -69,6 +71,9 @@ class RedPacketRead(BaseModel):
     sender: UserPublic | None = None
     # 接龙口令；不是接龙红包为 null
     chain_text: str | None = None
+    # 语音红包：要说的口令；不是语音红包为 null
+    voice: bool = False
+    voice_text: str | None = None
     # 专属红包给谁；不是专属红包为 null。谁都能看
     target_user_id: int | None = None
     target: UserPublic | None = None
@@ -93,6 +98,14 @@ class RedPacketSendResult(BaseModel):
     red_packet: RedPacketRead
     message: MessageRead
     balance: ShopBalance
+
+
+class RedPacketClaimRequest(BaseModel):
+    """POST /red-packets/{id}/claim 的请求体，只有语音红包用。voice_url 是 POST /uploads/message-voice 返回的地址；
+    voice_metadata 和平时发语音消息时 metadata 里的字段一样（时长等），原样放进那条语音消息。"""
+
+    voice_url: str | None = None
+    voice_metadata: dict[str, Any] | None = None
 
 
 class RedPacketClaimResult(BaseModel):
@@ -123,6 +136,7 @@ class RedPacketPending(BaseModel):
     expires_at: datetime | None = None
     created_at: datetime | None = None
     chain_text: str | None = None
+    voice_text: str | None = None
     target_user_id: int | None = None
     target: UserPublic | None = None
 
@@ -179,6 +193,8 @@ class AdminRedPacketRead(BaseModel):
     chain: bool = False
     # 接龙口令；私聊红包恒为 null（和 greeting 一样不给后台看）
     chain_text: str | None = None
+    voice: bool = False
+    voice_text: str | None = None
     # 专属红包的目标（只在群里）
     target_user_id: int | None = None
     target: AdminShopUser | None = None

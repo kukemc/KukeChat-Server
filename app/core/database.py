@@ -206,6 +206,7 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("conversations", "auto_approve", "auto_approve BOOLEAN NOT NULL DEFAULT 0"),
     ("conversations", "join_question", "join_question VARCHAR(200)"),
     ("conversations", "tasks_enabled", "tasks_enabled BOOLEAN NOT NULL DEFAULT 0"),
+    ("red_packets", "voice_text", "voice_text VARCHAR(60)"),
     ("conversations", "typing_indicator", "typing_indicator VARCHAR(8) NOT NULL DEFAULT 'auto'"),
     ("conversations", "level_titles_enabled", "level_titles_enabled BOOLEAN NOT NULL DEFAULT 0"),
     ("conversations", "level_titles", "level_titles TEXT"),

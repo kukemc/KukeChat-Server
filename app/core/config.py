@@ -76,6 +76,9 @@ class Settings(BaseSettings):
     # 审核服务对文本「拿不准」（review）时要不要先撤回。默认不撤，只留记录等人工；
     # 图片的 review 无论如何都不撤回。两种情况都不会记违规。
     content_moderation_text_review_recall: bool = False
+    # 语音口令识别服务（语音红包，docs/red-packets.md）。不配就不开放语音红包；密钥沿用 content_moderation_token
+    voice_asr_url: str | None = None
+    voice_asr_timeout_seconds: int = Field(default=15, ge=1, le=60)
     moderation_alert_email: str | None = None
     moderation_alert_cooldown_minutes: int = Field(default=30, ge=1, le=1440)
     # CCW 账号绑定：用户在指定作品下留言，服务端轮询评论完成校验。

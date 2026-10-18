@@ -31,6 +31,7 @@ import secrets
 import time
 import unicodedata
 from datetime import datetime, timedelta, timezone
+from pathlib import PurePosixPath
 from typing import Any
 
 from fastapi import HTTPException, status
@@ -45,7 +46,7 @@ from app.integrations import get_coin_ledger
 from app.models.conversation import Conversation, ConversationMember
 from app.models.enums import ConversationType, MemberRole, MessageType
 from app.models.message import Message
-from app.models.red_packet import RedPacket, RedPacketShare
+from app.models.red_packet import RedPacket, RedPacketShare, RedPacketVoiceAttempt
 from app.models.shop import ShopAccount
 from app.models.system import SystemSetting
 from app.models.user import User
@@ -62,8 +63,12 @@ KINDS = ("normal", "lucky")
 STATUSES = ("active", "finished", "expired", "revoked")
 DEFAULT_GREETING = "恭喜发财"
 GREETING_MAX = 30
-# 接龙口令最长几个字
+# 接龙口令最长几个字（语音口令同样）
 CHAIN_TEXT_MAX = 30
+# 语音红包：每人每个红包最多说几次、一次最长几秒、录音最大多少字节
+VOICE_ATTEMPTS_MAX = 5
+VOICE_MAX_SECONDS = 15
+VOICE_MAX_BYTES = 2 * 1024 * 1024
 # GET /red-packets/config 的 features：服务端支持的玩法，客户端据此决定显示不显示对应的选项
 FEATURES = ("chain", "exclusive")
 REASON_MAX = 500
@@ -232,7 +237,11 @@ async def _sent_today(db: AsyncSession, user_id: int, now: datetime) -> int:
 async def config_view(db: AsyncSession, user: User) -> dict[str, Any]:
     """GET /red-packets/config。"""
     config = await get_settings(db)
-    return {"enabled": config["enabled"], "limits": _limits(config), "sent_today": await _sent_today(db, user.id, _now()), "features": list(FEATURES)}
+    from app.services import voice_asr
+
+    # 语音红包要有识别服务才开放
+    features = [*FEATURES, "voice"] if voice_asr.enabled() else list(FEATURES)
+    return {"enabled": config["enabled"], "limits": _limits(config), "sent_today": await _sent_today(db, user.id, _now()), "features": features}
 
 
 # ---------------------------------------------------------------- 金额分配
@@ -266,10 +275,11 @@ def split(kind: str, amount: int, count: int, min_each: int) -> list[int]:
 # ---------------------------------------------------------------- 展示
 
 
-def fallback_text(greeting: str, *, chain: bool = False, target_name: str | None = None) -> str:
+def fallback_text(greeting: str, *, chain: bool = False, target_name: str | None = None, voice: bool = False) -> str:
     """消息正文：给不认识 red_packet 类型的旧客户端、搜索、会话列表和通知预览用。"""
     exclusive = target_name is not None
-    label = "[专属接龙红包]" if chain and exclusive else "[专属红包]" if exclusive else "[接龙红包]" if chain else "[红包]"
+    play = "语音" if voice else "接龙" if chain else ""
+    label = f"[专属{play}红包]" if exclusive else f"[{play}红包]"
     head = f"{label} 给 {target_name}：" if exclusive else f"{label} "
     return f"{head}{greeting}（更新到新版才能领取）"
 
@@ -322,6 +332,8 @@ def _base_view(packet: RedPacket, users: dict[int, User], mine: RedPacketShare |
         "greeting": packet.greeting,
         "sender": _public(users.get(packet.sender_id)),
         "chain_text": packet.chain_text,
+        "voice": packet.voice_text is not None,
+        "voice_text": packet.voice_text,
         "target_user_id": target_id,
         "target": _public(users.get(target_id)) if target_id is not None else None,
         "conversation_id": packet.conversation_id,
@@ -457,6 +469,7 @@ async def pending_items(db: AsyncSession, packets: list[RedPacket]) -> list[dict
             "expires_at": _aware(packet.expires_at),
             "created_at": _aware(packet.created_at),
             "chain_text": packet.chain_text,
+            "voice_text": packet.voice_text,
             "target_user_id": packet.target_user_id,
             "target": _public(users.get(packet.target_user_id)) if packet.target_user_id is not None else None,
         }
@@ -540,19 +553,19 @@ def _clean_greeting(value: Any) -> str:
 _LINE_BREAKS = re.compile("[\r\n\v\f\x1c-\x1e\x85\u2028\u2029]")
 
 
-def _clean_chain_text(value: Any) -> str | None:
-    """接龙口令：不传、或者去掉首尾空白之后是空的 = 不是接龙红包。零宽字符删掉；不能有换行，最长 CHAIN_TEXT_MAX 字。"""
+def _clean_chain_text(value: Any, code: str = "chain_text_rejected", label: str = "接龙口令") -> str | None:
+    """接龙口令（语音口令同样）：不传、或者去掉首尾空白之后是空的 = 不是接龙红包。零宽字符删掉；不能有换行，最长 CHAIN_TEXT_MAX 字。"""
     if value is None:
         return None
     if not isinstance(value, str):
-        raise _error(status.HTTP_422_UNPROCESSABLE_ENTITY, "chain_text_rejected", "接龙口令格式不对")
+        raise _error(status.HTTP_422_UNPROCESSABLE_ENTITY, code, f"{label}格式不对")
     text = "".join(char for char in value if unicodedata.category(char) != "Cf").strip()
     if not text:
         return None
     if _LINE_BREAKS.search(text):
-        raise _error(status.HTTP_422_UNPROCESSABLE_ENTITY, "chain_text_rejected", "接龙口令不能换行")
+        raise _error(status.HTTP_422_UNPROCESSABLE_ENTITY, code, f"{label}不能换行")
     if len(text) > CHAIN_TEXT_MAX:
-        raise _error(status.HTTP_422_UNPROCESSABLE_ENTITY, "chain_text_rejected", f"接龙口令最多 {CHAIN_TEXT_MAX} 个字")
+        raise _error(status.HTTP_422_UNPROCESSABLE_ENTITY, code, f"{label}最多 {CHAIN_TEXT_MAX} 个字")
     return text
 
 
@@ -690,6 +703,14 @@ async def send_red_packet(db: AsyncSession, user: User, payload: dict[str, Any])
     kind, amount, count, total = _plan(payload, config, direct, exclusive)
     greeting = _clean_greeting(payload.get("greeting"))
     chain_text = _clean_chain_text(payload.get("chain_text"))
+    voice_text = _clean_chain_text(payload.get("voice_text"), "voice_text_rejected", "语音口令")
+    if voice_text is not None:
+        from app.services import voice_asr
+
+        if chain_text is not None:
+            raise _error(status.HTTP_422_UNPROCESSABLE_ENTITY, "voice_text_rejected", "语音红包和接龙红包只能选一个")
+        if not voice_asr.enabled():
+            raise _error(status.HTTP_422_UNPROCESSABLE_ENTITY, "voice_text_rejected", "语音红包暂时不可用")
     target = await _check_target(db, conversation_id, user_id, raw_target) if exclusive else None
     target_id = target.id if target is not None else None
     target_name = await _member_name(db, conversation_id, target) if target is not None else None
@@ -700,6 +721,8 @@ async def send_red_packet(db: AsyncSession, user: User, payload: dict[str, Any])
     await _ensure_greeting_allowed(db, user, greeting, conversation_id)
     if chain_text is not None:
         await _ensure_text_allowed(db, user, chain_text, conversation_id, "chain_text_rejected", "接龙口令未通过审核，请修改后重试")
+    if voice_text is not None:
+        await _ensure_text_allowed(db, user, voice_text, conversation_id, "voice_text_rejected", "语音口令未通过审核，请修改后重试")
     if await _sent_today(db, user_id, _now()) >= config["daily_send_limit"]:
         raise _daily_limit(config["daily_send_limit"])
     # 和商店购买一样：累计投币得是刚向 CCW 核实过的，核实不了就 503，不扣币
@@ -739,6 +762,7 @@ async def send_red_packet(db: AsyncSession, user: User, payload: dict[str, Any])
                     kind=kind,
                     greeting=greeting,
                     chain_text=chain_text,
+                    voice_text=voice_text,
                     target_user_id=target_id,
                     total=total,
                     count=count,
@@ -757,6 +781,8 @@ async def send_red_packet(db: AsyncSession, user: User, payload: dict[str, Any])
                 info: dict[str, Any] = {"id": packet.id, "kind": kind, "greeting": greeting, "count": count}
                 if chain_text is not None:
                     info["chain_text"] = chain_text
+                if voice_text is not None:
+                    info["voice_text"] = voice_text
                 if target_id is not None:
                     info["target_user_id"] = target_id
                     info["target"] = target_public
@@ -764,7 +790,7 @@ async def send_red_packet(db: AsyncSession, user: User, payload: dict[str, Any])
                     db,
                     conversation_id,
                     user,
-                    fallback_text(greeting, chain=chain_text is not None, target_name=target_name),
+                    fallback_text(greeting, chain=chain_text is not None, target_name=target_name, voice=voice_text is not None),
                     MessageType.RED_PACKET,
                     {"red_packet": info},
                     allow_red_packet=True,
@@ -985,10 +1011,14 @@ def _chain_send_error(exc: HTTPException) -> HTTPException:
     return _error(exc.status_code, "chain_send_failed", "接龙消息发不出去，这次没有领取，稍后再试")
 
 
-async def _take_share(db: AsyncSession, packet_id: int, user_id: int, now: datetime, chain: tuple[User, int, str] | None = None) -> tuple[str, Message | None]:
+ChainSend = tuple[User, int, str, MessageType, dict[str, Any]]
+
+
+async def _take_share(db: AsyncSession, packet_id: int, user_id: int, now: datetime, chain: ChainSend | None = None) -> tuple[str, Message | None]:
     """抢一份。返回 ("ok", 接龙消息或 None) / ("none", None)（没抢到：没有剩的了，或者红包已经不在进行中）/ ("already", None)（这个人已经有一份了）。
 
-    chain：接龙红包，(领取人, 会话 id, 接龙口令)。领到之后在**同一个事务**里以领取人的身份发接龙口令，两件事一起提交：
+    chain：接龙 / 语音红包，(领取人, 会话 id, 消息内容, 消息类型, metadata)。领到之后在**同一个事务**里以领取人的身份发这条消息
+    （接龙口令 / 那段语音），两件事一起提交：
     消息发不出去（比如这一刻刚被禁言）就整个回滚，钱没动、消息也没有，接口报错。实时推送由调用方在提交之后做。
     """
     free = (
@@ -1043,7 +1073,7 @@ async def _take_share(db: AsyncSession, packet_id: int, user_id: int, now: datet
         message: Message | None = None
         try:
             if chain is not None:
-                claimer, conversation_id, chain_text = chain
+                claimer, conversation_id, content, message_type, metadata = chain
                 from app.services import messages as message_service
 
                 # 前面的重试回滚过会话的话 claimer 的属性已经过期，发消息要读它们，先重新读出来（这时已经拿着写锁，读到的是最新的）
@@ -1052,9 +1082,9 @@ async def _take_share(db: AsyncSession, packet_id: int, user_id: int, now: datet
                     db,
                     conversation_id,
                     claimer,
-                    chain_text,
-                    MessageType.TEXT,
-                    {"red_packet_chain": {"red_packet_id": packet_id}},
+                    content,
+                    message_type,
+                    metadata,
                     red_packet_chain=True,
                     commit=False,
                 )
@@ -1087,11 +1117,14 @@ async def _ensure_can_speak_in_group(db: AsyncSession, packet: RedPacket, member
         raise _muted_in_group()
 
 
-async def claim(db: AsyncSession, user: User, packet_id: int) -> tuple[dict[str, Any], Message | None]:
+async def claim(
+    db: AsyncSession, user: User, packet_id: int, voice_url: str | None = None, voice_metadata: dict[str, Any] | None = None
+) -> tuple[dict[str, Any], Message | None]:
     """POST /red-packets/{id}/claim。没绑定 CCW 的人也能领：币记在账上，花的时候才要求绑定。
 
-    返回 (契约里的 { amount, red_packet, balance }, 接龙消息)。接龙红包领到时会以领取人的身份发一条消息（和领取一起提交），
-    它的广播由接口层做，和发普通消息一样；不是接龙红包时第二项是 None。
+    返回 (契约里的 { amount, red_packet, balance }, 接龙 / 语音消息)。接龙、语音红包领到时会以领取人的身份发一条消息
+    （和领取一起提交），它的广播由接口层做，和发普通消息一样；都不是时第二项是 None。
+    语音红包要带 voice_url（POST /uploads/message-voice 的地址），先识别、说对了才去抢，见 _check_voice。
     """
     user_id, oid = user.id, shop_service._bound_oid(user)
     # 这里不看总开关：关掉开关只是不让发新的，已经发出去的照常能领、照常过期退回（要止损用后台撤销）
@@ -1102,10 +1135,15 @@ async def claim(db: AsyncSession, user: User, packet_id: int) -> tuple[dict[str,
         raise _error(status.HTTP_403_FORBIDDEN, "not_target", "这是给别人的专属红包")
     if packet.conversation_type == "direct" and packet.sender_id == user_id:
         raise _error(status.HTTP_403_FORBIDDEN, "own_packet", "私聊里不能领自己发的红包")
-    if packet.chain_text:
-        # 先确认能发言再去抢：被禁言的人领不了接龙红包（事务里发消息那一步还会再查一遍，挡住这之间刚被禁言的）
+    if packet.chain_text or packet.voice_text:
+        # 先确认能发言再去抢：被禁言的人领不了接龙 / 语音红包（事务里发消息那一步还会再查一遍，挡住这之间刚被禁言的）
         await _ensure_can_speak_in_group(db, packet, member)
     now = _now()
+    chain: ChainSend | None = None
+    if packet.chain_text:
+        chain = (user, packet.conversation_id, packet.chain_text, MessageType.TEXT, {"red_packet_chain": {"red_packet_id": packet_id}})
+    elif packet.voice_text:
+        chain = await _check_voice(db, user, packet, voice_url, voice_metadata, now)
     chain_message: Message | None = None
     for _attempt in range(CLAIM_ATTEMPTS):
         if await _my_share(db, packet_id, user_id) is not None:
@@ -1114,7 +1152,7 @@ async def claim(db: AsyncSession, user: User, packet_id: int) -> tuple[dict[str,
         packet = await _settle_if_due(db, await _load(db, packet_id), now)
         if packet.status != "active":
             raise _gone(packet.status)
-        outcome, chain_message = await _take_share(db, packet_id, user_id, now, (user, packet.conversation_id, packet.chain_text) if packet.chain_text else None)
+        outcome, chain_message = await _take_share(db, packet_id, user_id, now, chain)
         if outcome == "ok":
             break
         if outcome == "already":
@@ -1134,6 +1172,104 @@ async def claim(db: AsyncSession, user: User, packet_id: int) -> tuple[dict[str,
         "balance": await shop_service._balance(db, user_id, oid),
     }, chain_message
 
+
+def _voice_metadata(packet_id: int, raw: dict[str, Any] | None, duration: float) -> dict[str, Any]:
+    """语音消息的 metadata：只留普通语音消息里的那几个字段（{ voice: { duration_ms, content_type, size, waveform } }），再标上是哪个红包。"""
+    voice = raw.get("voice") if isinstance(raw, dict) and isinstance(raw.get("voice"), dict) else {}
+    clean: dict[str, Any] = {}
+    duration_ms = voice.get("duration_ms")
+    valid = isinstance(duration_ms, (int, float)) and not isinstance(duration_ms, bool) and 0 < duration_ms <= (VOICE_MAX_SECONDS + 1) * 1000
+    clean["duration_ms"] = int(duration_ms) if valid else int(duration * 1000)
+    if isinstance(voice.get("content_type"), str):
+        clean["content_type"] = voice["content_type"][:60]
+    if isinstance(voice.get("size"), int) and not isinstance(voice.get("size"), bool):
+        clean["size"] = voice["size"]
+    waveform = voice.get("waveform")
+    if isinstance(waveform, list) and all(isinstance(item, (int, float)) and not isinstance(item, bool) for item in waveform[:200]):
+        clean["waveform"] = [int(item) for item in waveform[:200]]
+    return {"voice": clean, "red_packet_voice": {"red_packet_id": packet_id}}
+
+
+async def _voice_attempts(db: AsyncSession, packet_id: int, user_id: int) -> int:
+    value = await db.scalar(select(RedPacketVoiceAttempt.attempts).where(RedPacketVoiceAttempt.packet_id == packet_id, RedPacketVoiceAttempt.user_id == user_id))
+    return int(value or 0)
+
+
+async def _count_voice_attempt(db: AsyncSession, packet_id: int, user_id: int, now: datetime) -> int:
+    """说错一次：记下来并提交，返回累计次数。"""
+    row = (
+        await db.execute(select(RedPacketVoiceAttempt).where(RedPacketVoiceAttempt.packet_id == packet_id, RedPacketVoiceAttempt.user_id == user_id))
+    ).scalar_one_or_none()
+    if row is None:
+        db.add(RedPacketVoiceAttempt(packet_id=packet_id, user_id=user_id, attempts=1, updated_at=now))
+    else:
+        row.attempts = (row.attempts or 0) + 1
+        row.updated_at = now
+    try:
+        await db.commit()
+    except IntegrityError:
+        # 同一个人的两个请求同时说错：另一个已经插了这一行，在它上面加
+        await db.rollback()
+        await db.execute(
+            update(RedPacketVoiceAttempt)
+            .where(RedPacketVoiceAttempt.packet_id == packet_id, RedPacketVoiceAttempt.user_id == user_id)
+            .values(attempts=RedPacketVoiceAttempt.attempts + 1, updated_at=now)
+            .execution_options(synchronize_session=False)
+        )
+        await db.commit()
+    return await _voice_attempts(db, packet_id, user_id)
+
+
+async def _check_voice(
+    db: AsyncSession, user: User, packet: RedPacket, voice_url: str | None, voice_metadata: dict[str, Any] | None, now: datetime
+) -> ChainSend:
+    """语音红包：识别这段录音是不是口令。说对了返回要以领取人身份发的那条语音消息；说错了记一次并报 voice_mismatch。
+
+    抢之前先识别：识别要几百毫秒，不能拿着红包的行锁等。已经领过 / 红包结束了的先挡掉，免得白白浪费一次机会。
+    """
+    from app.services import storage, voice_asr
+    from app.services.upload_paths import MESSAGE_AUDIO_SUFFIXES, require_message_upload_url
+
+    packet_id, user_id, conversation_id = packet.id, user.id, packet.conversation_id
+    path = require_message_upload_url(voice_url) if voice_url else None
+    if path is None or PurePosixPath(path).suffix.lower() not in MESSAGE_AUDIO_SUFFIXES:
+        raise _error(status.HTTP_422_UNPROCESSABLE_ENTITY, "voice_required", "这是语音红包，说出口令才能领")
+    if await _my_share(db, packet_id, user_id) is not None:
+        raise _error(status.HTTP_409_CONFLICT, "already_claimed", "你已经领过这个红包了")
+    current = effective_status(packet, now)
+    if current != "active":
+        raise _gone(current)
+    used = await _voice_attempts(db, packet_id, user_id)
+    if used >= VOICE_ATTEMPTS_MAX:
+        raise _error(status.HTTP_429_TOO_MANY_REQUESTS, "voice_attempts_exhausted", f"这个红包每人只能说 {VOICE_ATTEMPTS_MAX} 次，次数用完了")
+    expected = packet.voice_text or ""
+    # 下面要等对象存储和识别服务：先把数据库连接还回去（见 release_connection）
+    await release_connection(db)
+    try:
+        stored = await asyncio.to_thread(storage.get_object, path, VOICE_MAX_BYTES)
+    except HTTPException as exc:
+        if exc.status_code == 413:
+            raise _error(status.HTTP_422_UNPROCESSABLE_ENTITY, "voice_too_long", f"录音最长 {VOICE_MAX_SECONDS} 秒") from None
+        raise _error(status.HTTP_422_UNPROCESSABLE_ENTITY, "voice_required", "录音没有上传成功，再录一次") from None
+    try:
+        result = await voice_asr.match(stored.data, PurePosixPath(path).name, stored.content_type or "audio/webm", expected)
+    except voice_asr.VoiceAsrUnavailable:
+        logger.exception("Voice ASR unavailable", extra={"red_packet_id": packet_id})
+        raise _error(status.HTTP_503_SERVICE_UNAVAILABLE, "voice_unavailable", "语音识别暂时不可用，稍后再试") from None
+    if result.duration > VOICE_MAX_SECONDS + 1:
+        raise _error(status.HTTP_422_UNPROCESSABLE_ENTITY, "voice_too_long", f"录音最长 {VOICE_MAX_SECONDS} 秒")
+    if not result.matched:
+        attempts = await _count_voice_attempt(db, packet_id, user_id, now)
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "code": "voice_mismatch",
+                "message": "没听清，再说一次",
+                "recognized": result.text[:60],
+                "attempts_left": max(0, VOICE_ATTEMPTS_MAX - attempts),
+            },
+        )
+    return (user, conversation_id, voice_url.strip(), MessageType.VOICE, _voice_metadata(packet_id, voice_metadata, result.duration))
 
 async def list_mine(db: AsyncSession, user: User, direction: str, limit: int, offset: int) -> dict[str, Any]:
     """GET /red-packets/mine：我发出的 / 我抢到的红包，新的在前。
@@ -1198,6 +1334,8 @@ def _admin_view(packet: RedPacket, users: dict[int, User], now: datetime) -> dic
         "message_id": packet.message_id,
         "chain": packet.chain_text is not None,
         "chain_text": packet.chain_text if group else None,
+        "voice": packet.voice_text is not None,
+        "voice_text": packet.voice_text if group else None,
         "target_user_id": packet.target_user_id,
         "target": shop_service._admin_user_view(users.get(packet.target_user_id)) if packet.target_user_id is not None else None,
         "total": packet.total,

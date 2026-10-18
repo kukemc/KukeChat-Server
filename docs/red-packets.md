@@ -246,6 +246,19 @@
 - 第 6 节的 `red_packet_pending` 和 `GET /red-packets/pending`：专属红包**只对目标本人**算「可领」，发的人和其他成员都不算。客户端在本地置「[有红包]」时也要照这个判断：收到 `message.created` 的红包消息，`metadata.red_packet.target_user_id` 有值且不是我，就不置。
 - 目标在红包结束前退群了：其他人还是领不了，到期退回发送者。
 
+### 3.7 语音红包
+
+领的人要**说出**发的人定的口令，服务端识别，说对了才能领；领到时这段语音以领取人的身份发进会话（和接龙红包一样，和领取在同一个事务里提交）。
+
+- 开放条件：配了 `VOICE_ASR_URL`（私有部署的识别服务，SenseVoice-Small；密钥沿用 `CONTENT_MODERATION_TOKEN`），`GET /red-packets/config` 的 `features` 里才有 `"voice"`。
+- 发：`POST /red-packets` 带 `voice_text`（1–30 字，不能换行，和 `chain_text` 互斥，发之前过一遍文本审核）。错误 422 `voice_text_rejected`。私聊、群聊、专属红包都可以。消息正文 `[语音红包] …` / `[专属语音红包] …`，`metadata.red_packet.voice_text` 是口令。
+- `RedPacketRead` 新增 `voice: boolean`、`voice_text`；pending 列表带 `voice_text`；后台视图带 `voice` / `voice_text`（私聊不给口令）。
+- 领：先用 `POST /uploads/message-voice` 上传现场录音（≤ 15 秒），再 `POST /red-packets/{id}/claim`，请求体 `{ "voice_url": "...", "voice_metadata": { "voice": { "duration_ms", "content_type", "size", "waveform" } } }`。别的红包不带请求体。
+  - 成功：`message` 是那条语音消息（type `voice`，content 是录音地址，metadata 是 `{ voice: {...}, red_packet_voice: { red_packet_id } }`）。
+  - 422 `voice_required`（没带录音、不是我们的上传）、422 `voice_mismatch`（`detail.recognized` 听到的文字，`detail.attempts_left` 剩几次）、422 `voice_too_long`、429 `voice_attempts_exhausted`（每人每个红包 5 次，只有说错才记）、503 `voice_unavailable`（识别服务出错，不记次数）。
+- 怎么算说对：识别服务把录音和口令都转成拼音音节（不带声调；平翘舌、前后鼻音、n/l 不分；数字按一位一位读），算编辑距离；口令 ≤ 3 个音节必须全对，4–7 个允许错 1 个，8–12 个允许错 2 个，更长的允许 20%（`services/voice_asr.allowed_errors`）。
+- 识别在抢之前做（几百毫秒，不拿红包的行锁）；已经领过 / 红包已结束的先挡掉，不浪费次数。
+
 ## 4. 实时事件
 
 | 事件 | data | 说明 |

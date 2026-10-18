@@ -1789,7 +1789,7 @@ class HttpTests(RedPacketTestCase):
         packet = sent["red_packet"]
         self.assertEqual(
             set(packet),
-            {"id", "kind", "greeting", "sender", "chain_text", "target_user_id", "target", "conversation_id", "message_id", "total", "count", "claimed_count", "claimed_amount", "refunded_amount", "status", "my_claim", "expires_at", "created_at", "finished_at", "claims"},
+            {"id", "kind", "greeting", "sender", "chain_text", "voice", "voice_text", "target_user_id", "target", "conversation_id", "message_id", "total", "count", "claimed_count", "claimed_amount", "refunded_amount", "status", "my_claim", "expires_at", "created_at", "finished_at", "claims"},
         )
         self.assertEqual((packet["kind"], packet["greeting"], packet["sender"]["username"], packet["total"], packet["count"], packet["status"], packet["claims"]), ("lucky", "开工大吉", "alice", 100, 3, "active", []))
         message = sent["message"]

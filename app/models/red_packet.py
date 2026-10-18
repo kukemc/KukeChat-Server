@@ -47,6 +47,8 @@ class RedPacket(Base):
     greeting: Mapped[str] = mapped_column(String(60))
     # 接龙口令：有值就是接龙红包，领取成功时以领取人的身份在会话里自动发这句话（docs/red-packets.md 3.4）
     chain_text: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    # 语音口令：有值就是语音红包，领的人要说出这句话（服务端识别），说对了以领取人的身份把这段语音发进会话
+    voice_text: Mapped[str | None] = mapped_column(String(60), nullable=True)
     # 专属红包的目标：有值时只有这个人能领（只在群里，count 恒为 1、kind 恒为 normal）
     target_user_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # 整包金额、份数。创建后不变
@@ -91,3 +93,16 @@ class RedPacketShare(Base):
     amount: Mapped[int] = mapped_column(Integer)
     user_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class RedPacketVoiceAttempt(Base):
+    """语音红包的识别次数：每人每个红包最多试 VOICE_ATTEMPTS_MAX 次（说错了才记，识别服务出错不记）。"""
+
+    __tablename__ = "red_packet_voice_attempts"
+    __table_args__ = (UniqueConstraint("packet_id", "user_id", name="uq_red_packet_voice_attempts"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    packet_id: Mapped[int] = mapped_column(Integer)
+    user_id: Mapped[int] = mapped_column(Integer)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
