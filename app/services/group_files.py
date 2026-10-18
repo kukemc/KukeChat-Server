@@ -28,7 +28,7 @@ from urllib.parse import quote
 from uuid import uuid4
 
 from fastapi import HTTPException, UploadFile, status
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, RedirectResponse, Response, StreamingResponse
 from sqlalchemy import case, delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -60,6 +60,7 @@ WORKER_STARTUP_DELAY_SECONDS = 60.0
 UPLOAD_URL_TTL_SECONDS = 900
 UPLOAD_TTL_SECONDS = 3600
 DOWNLOAD_URL_TTL_SECONDS = 300
+_DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 _CONTENT_TYPE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,60}/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,60}$")
 _ZERO_WIDTH = dict.fromkeys(map(ord, "​‌‍⁠﻿"), None)
 
@@ -614,13 +615,36 @@ async def download(db: AsyncSession, user_id: int, conversation_id: int, file_id
     path = storage.local_path_for_key(key)
     if path is not None:
         return FileResponse(path, media_type="application/octet-stream", headers=headers)
+    if storage.direct_transfer_enabled():
+        # 开了直连：302 到对象存储的预签名地址，文件不经过我们的服务器（安卓 2.0.3 及更早只会调这个接口）。
+        # 客户端跳到别的域名时会丢掉 Authorization（OkHttp / 浏览器 / reqwest 都是），不会和签名冲突
+        url = storage.presign_get(key, DOWNLOAD_URL_TTL_SECONDS, _disposition(name))
+        return RedirectResponse(url, status_code=status.HTTP_302_FOUND, headers={"Cache-Control": "private, no-store"})
     # 从对象存储整份读下来可能要很久（文件大）：先结束读事务、把连接还回去
     await release_connection(db)
     try:
-        stored = await asyncio.to_thread(storage.get_object, key)
+        opened = await asyncio.to_thread(storage.open_object_stream, key)
     except HTTPException:
         raise _error(status.HTTP_404_NOT_FOUND, "file_not_found", "文件已经不存在了") from None
-    return Response(content=stored.data, media_type="application/octet-stream", headers=headers)
+    if opened is None:
+        raise _error(status.HTTP_404_NOT_FOUND, "file_not_found", "文件已经不存在了")
+    body, length = opened
+    if length is not None:
+        headers["Content-Length"] = str(length)
+
+    # 边从对象存储读边发，每次 1MB，读在线程里。以前整份读进内存再发：一个 142MB 的安装包几个人同时下，
+    # 每份在内存里放好几遍（原文、gzip、没发完的发送缓冲），2026-10-18 早上两次把服务拖死
+    async def chunks():
+        try:
+            while True:
+                chunk = await asyncio.to_thread(body.read, _DOWNLOAD_CHUNK_BYTES)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            await asyncio.to_thread(body.close)
+
+    return StreamingResponse(chunks(), media_type="application/octet-stream", headers=headers)
 
 
 async def download_link(db: AsyncSession, user_id: int, conversation_id: int, file_id: int) -> dict[str, Any]:

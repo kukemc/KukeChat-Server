@@ -27,6 +27,7 @@ from app.services.account_levels import start_account_level_worker, stop_account
 from app.services.intimacy import start_intimacy_worker, stop_intimacy_worker
 from app.services.sparks import start_spark_worker, stop_spark_worker
 from app.services.read_coalescer import start_read_coalescer, stop_read_coalescer
+from app.core import loop_watch
 from app.services.cases import start_jury_sweep_worker, stop_jury_sweep_worker
 from app.services.ccw import start_ccw_binding_worker, stop_ccw_binding_worker
 from app.services.moderation import start_moderation_retry_worker, stop_moderation_retry_worker
@@ -91,6 +92,8 @@ def _download_icon_data_uri() -> str:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
+    # 事件循环卡顿监控 + SIGUSR2 现场转储（见 core/loop_watch.py），最先起，启动阶段卡住也能看到
+    loop_watch.start()
     await init_db()
     async with AsyncSessionLocal() as db:
         await ensure_task_assistant_bot(db)
@@ -126,6 +129,7 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
     try:
         yield
     finally:
+        await loop_watch.stop()
         await stop_read_coalescer()
         await stop_intimacy_worker()
         await stop_spark_worker()
@@ -156,7 +160,8 @@ class UploadAwareGZipMiddleware(GZipMiddleware):
             and settings.storage_backend == "local"
             and path.startswith("/uploads/")
             and CachedUploadFiles.is_public_media_path(path[len("/uploads/"):])
-        ):
+        ) or (scope["type"] == "http" and path.endswith("/download")):
+            # 文件下载（群文件等）是二进制大文件：apk、视频压不小，gzip 只会在事件循环里白烧 CPU、多占一份内存
             await self.app(scope, receive, send)
             return
         await super().__call__(scope, receive, send)
