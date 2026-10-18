@@ -381,8 +381,9 @@ class MentionPendingTests(ChatExtrasBase):
         self.assertEqual((receipt.last_read_message_id, receipt.mention_pending, await self._pending("bob")), (first, "all", "all"))
         self.assertEqual((await self._read("bob", middle)).mention_pending, "all")
         self.assertEqual(((await self._read("bob", second)).mention_pending, await self._pending("bob")), (None, None))
-        # 已读位置退回去（客户端传了更早的消息）：又成了未读，提示跟着回来
-        self.assertEqual((await self._read("bob", first)).mention_pending, "all")
+        # 客户端传了更早的消息（晚到的回执）：已读位置只进不退，提示不会回来
+        receipt = await self._read("bob", first)
+        self.assertEqual((receipt.last_read_message_id, receipt.mention_pending, await self._pending("bob")), (second, None, None))
         # 清空聊天记录等于都读过了
         async with self.sessions() as db:
             member = (await db.execute(select(ConversationMember).where(ConversationMember.conversation_id == self.group_id, ConversationMember.user_id == self.ids["bob"]))).scalar_one()
