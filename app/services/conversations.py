@@ -303,13 +303,17 @@ async def create_group_conversation(
     return conversation
 
 
-async def list_user_conversations(db: AsyncSession, user_id: int) -> list[Conversation]:
-    result = await db.execute(
+async def list_user_conversations(db: AsyncSession, user_id: int, *, include_self: bool = False) -> list[Conversation]:
+    """include_self：带上「我的设备」会话（docs/self-chat.md）。默认不带：老客户端不认识这种会话。"""
+    stmt = (
         select(Conversation)
         .join(ConversationMember, ConversationMember.conversation_id == Conversation.id)
         .where(ConversationMember.user_id == user_id)
         .order_by(ConversationMember.pinned.desc(), Conversation.updated_at.desc())
     )
+    if not include_self:
+        stmt = stmt.where(Conversation.type != ConversationType.SELF)
+    result = await db.execute(stmt)
     return list(result.scalars().unique().all())
 
 

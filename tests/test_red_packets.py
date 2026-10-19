@@ -1801,8 +1801,7 @@ class HttpTests(RedPacketTestCase):
         self.assertEqual(self.moderation.call_args_list[0].args, (message["id"],))
         # 广播出去的新消息一眼看得出是红包（客户端据此在会话列表上置「[有红包]」）
         self.assertEqual({data.type for data in created}, {MessageType.RED_PACKET})
-        # 列表里还有每人都有的「我的设备」会话（docs/self-chat.md），这里只看群聊和私聊
-        conversations = {item["id"]: item["red_packet_pending"] for item in await self._json("GET", "/conversations") if item["type"] != "self"}
+        conversations = {item["id"]: item["red_packet_pending"] for item in await self._json("GET", "/conversations")}
         self.assertEqual(conversations, {self.group_id: True, self.direct_id: False})
         # 消息列表里就是一条普通的 red_packet 消息
         listed = await self._json("GET", f"/conversations/{self.group_id}/messages")

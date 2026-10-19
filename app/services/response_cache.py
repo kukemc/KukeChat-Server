@@ -135,16 +135,21 @@ def set_conversation_members(conversation_id: int, value: Any, ttl_seconds: floa
         )
 
 
-def get_user_conversations(user_id: int) -> Any | None:
+def _conversations_key(user_id: int, include_self: bool) -> int:
+    """带不带「我的设备」会话（docs/self-chat.md）是两份结果：带的那份存在负数键下，失效时两份一起删。"""
+    return -user_id if include_self else user_id
+
+
+def get_user_conversations(user_id: int, *, include_self: bool = False) -> Any | None:
     with _lock:
-        return _fetch(_user_conversations_cache, user_id)
+        return _fetch(_user_conversations_cache, _conversations_key(user_id, include_self))
 
 
-def set_user_conversations(user_id: int, value: Any, ttl_seconds: float = 5.0) -> None:
+def set_user_conversations(user_id: int, value: Any, ttl_seconds: float = 5.0, *, include_self: bool = False) -> None:
     with _lock:
         _store(
             _user_conversations_cache,
-            user_id,
+            _conversations_key(user_id, include_self),
             CacheEntry(expires_at=time.monotonic() + ttl_seconds, value=value, size_bytes=_value_size(value)),
             MAX_USER_CONVERSATION_ENTRIES,
             _CACHE_BYTE_BUDGETS["conversations"],
@@ -219,6 +224,7 @@ def invalidate_user_conversations(user_ids: set[int] | list[int] | None = None) 
             return
         for user_id in user_ids:
             _drop(_user_conversations_cache, user_id)
+            _drop(_user_conversations_cache, -user_id)
 
 
 def invalidate_user_friends(user_ids: set[int] | list[int] | None = None) -> None:

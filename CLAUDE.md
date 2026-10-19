@@ -96,7 +96,7 @@ deploy_start.py Gunicorn + Uvicorn Worker 生产启动
 
 **发版服务**（应用版本、安装包、检查更新）：契约在 `docs/releases.md`。安装包放主桶 `releases/` 前缀（公开读，下载不经过后端）；`/desktop-update.json` 和 `/download` 页优先取发版服务里已发布的 stable 版本，没有才用后台「下载配置」手填的值。后台接口除了管理员登录令牌，还认只能管发版的 `X-Kuke-Release-Token`（`kcr_…`，库里只存 sha256）。
 
-**「我的电脑 / 我的手机」**（`type = self` 的会话）：契约在 `docs/self-chat.md`。每人一个只有自己的会话（`conversations.self_owner_id` 唯一），`GET /conversations` 里没有就顺手建。里面的消息带服务端写的 `metadata.device`，不送机器审核、不能举报；红包 / 礼物 / 投票 / @ / 成员管理一律 400 `self_chat_unsupported`。临时文件走 `/conversations/{id}/transfers`（`self_transfers` 表，`self-transfers/` 私有前缀，24 小时过期，`services/self_chat.py` 的 worker 清理），不能收藏 / 转发。新加「只看群」「只看私聊」的逻辑时记得想一下 self 该归哪边。
+**「我的电脑 / 我的手机」**（`type = self` 的会话）：契约在 `docs/self-chat.md`。每人一个只有自己的会话（`conversations.self_owner_id` 唯一），只由 `GET /conversations/self` 创建。老客户端看不到它：列表要带 `include_self=true` 才有，它的实时事件只发给 `/ws?features=self` 的连接（`send_to_users(..., feature="self")`）——给这个会话新加推送时记得带 feature。里面的消息带服务端写的 `metadata.device`，不送机器审核、不能举报；@ 被悄悄去掉；红包 / 礼物 / 投票 / 成员管理一律 400 `self_chat_unsupported`。临时文件走 `/conversations/{id}/transfers`（`self_transfers` 表，`self-transfers/` 私有前缀，24 小时过期，`services/self_chat.py` 的 worker 清理），不能收藏 / 转发。新加「只看群」「只看私聊」的逻辑时记得想一下 self 该归哪边。
 
 ## 已知问题
 

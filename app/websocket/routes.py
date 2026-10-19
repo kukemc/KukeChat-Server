@@ -14,7 +14,7 @@ from app.services.auth import mark_user_seen
 from app.services import response_cache
 from app.services import typing as typing_service
 from app.services.bots import authenticate_bot_key
-from app.websocket.manager import admin_manager, bot_manager, game_manager, manager
+from app.websocket.manager import admin_manager, bot_manager, game_manager, manager, parse_features
 
 
 router = APIRouter()
@@ -71,7 +71,8 @@ def _handle_client_event(user_id: int, raw: str) -> None:
 
 
 @router.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)) -> None:
+async def websocket_endpoint(websocket: WebSocket, token: str = Query(...), features: str = Query(default="", max_length=200)) -> None:
+    # features：客户端认识的新东西，逗号分隔。目前只有 self（「我的设备」会话的事件，docs/self-chat.md 第 6 节）
     async with AsyncSessionLocal() as db:
         try:
             user = await get_current_user_from_token(db, token)
@@ -81,7 +82,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)) -> N
         mark_user_seen(user, get_websocket_ip(websocket))
         await db.commit()
 
-    became_online = await manager.connect(user.id, websocket)
+    became_online = await manager.connect(user.id, websocket, parse_features(features))
     await manager.send_to_user(user.id, "connection.ready", {"user_id": user.id})
     if became_online:
         response_cache.invalidate_online_users()

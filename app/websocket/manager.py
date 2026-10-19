@@ -46,6 +46,16 @@ class _EventText(str):
         return result
 
 
+# 连接 /ws 时客户端用 ?features=self 声明自己认识的新东西。带 feature 的事件只发给声明了它的连接（docs/self-chat.md 第 6 节）：
+# 「我的设备」会话的事件不会发到不认识这种会话的老客户端上
+FEATURE_SELF_CHAT = "self"
+KNOWN_FEATURES = frozenset({FEATURE_SELF_CHAT})
+
+
+def parse_features(raw: str | None) -> frozenset[str]:
+    return frozenset(item.strip().lower() for item in (raw or "").split(",") if item.strip().lower() in KNOWN_FEATURES)
+
+
 @dataclass
 class _ConnectionState:
     connection_id: str
@@ -53,6 +63,21 @@ class _ConnectionState:
     task: asyncio.Task[None]
     close_code: int | None = None
     close_payload: dict[str, Any] | None = None
+    features: frozenset[str] = frozenset()
+
+
+def _event_feature(event: dict[str, Any]) -> str | None:
+    """Redis 信封里的 feature（别的 worker 发来的「只发给声明了它的连接」的事件）。"""
+    feature = event.get("feature")
+    return feature if isinstance(feature, str) and feature else None
+
+
+async def _dispatch_local(channel: Any, owner_ids: set[int], payload: dict[str, Any], feature: str | None) -> None:
+    # 没有 feature 的事件按原来的参数调用（不改变别处对它的约定）
+    if feature is None:
+        await channel._send_to_owners_local(owner_ids, payload)
+    else:
+        await channel._send_to_owners_local(owner_ids, payload, feature)
 
 
 class _QueuedRealtimeManager:
@@ -109,12 +134,12 @@ class _QueuedRealtimeManager:
         # subscription. In the application, shared listener health gates presence.
         return self._shared_subscriber is None or self._shared_subscriber.redis_enabled()
 
-    async def connect(self, owner_id: int, websocket: WebSocket) -> str:
+    async def connect(self, owner_id: int, websocket: WebSocket, features: frozenset[str] = frozenset()) -> str:
         await websocket.accept()
         connection_id = f"{self._instance_id}:{self._origin}:{id(websocket)}:{uuid.uuid4().hex}"
         queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=WEBSOCKET_SEND_QUEUE_SIZE)
         task = asyncio.create_task(self._send_loop(owner_id, websocket, queue))
-        self._connections[owner_id][websocket] = _ConnectionState(connection_id=connection_id, queue=queue, task=task)
+        self._connections[owner_id][websocket] = _ConnectionState(connection_id=connection_id, queue=queue, task=task, features=features)
         if self.transport_metrics is not None:
             self.transport_metrics.record_ws(namespace=self._namespace, event="other", operation="ws_connection_open")
         return connection_id
@@ -232,10 +257,13 @@ class _QueuedRealtimeManager:
     async def _after_connection_removed(self, owner_id: int, state: _ConnectionState) -> None:
         return None
 
-    async def _send_to_owner_local(self, owner_id: int, payload: dict[str, Any] | str) -> None:
+    async def _send_to_owner_local(self, owner_id: int, payload: dict[str, Any] | str, feature: str | None = None) -> None:
         stale_connections: list[WebSocket] = []
         text: str | None = payload if isinstance(payload, str) else None
         for websocket, state in list(self._connections.get(owner_id, {}).items()):
+            if feature is not None and feature not in state.features:
+                # 这条连接没声明认识这类事件（老客户端），不发
+                continue
             if websocket.application_state != WebSocketState.CONNECTED or state.queue.full():
                 if state.queue.full() and state.close_code is None and self.transport_metrics is not None:
                     self.transport_metrics.record_ws(namespace=self._namespace, event="other", operation="ws_queue_overflow")
@@ -251,7 +279,7 @@ class _QueuedRealtimeManager:
         for websocket in stale_connections:
             await self.close_connection(owner_id, websocket, code=1013)
 
-    async def _send_to_owners_local(self, owner_ids: set[int], payload: dict[str, Any]) -> None:
+    async def _send_to_owners_local(self, owner_ids: set[int], payload: dict[str, Any], feature: str | None = None) -> None:
         local_ids = owner_ids & self._connections.keys()
         if not local_ids:
             return
@@ -259,7 +287,7 @@ class _QueuedRealtimeManager:
         serialized = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
         text = (_EventText(serialized, payload.get("type")) if self.transport_metrics is not None
                 else serialized)
-        await asyncio.gather(*(self._send_to_owner_local(owner_id, text) for owner_id in local_ids), return_exceptions=True)
+        await asyncio.gather(*(self._send_to_owner_local(owner_id, text, feature) for owner_id in local_ids), return_exceptions=True)
 
     async def _broadcast_local(self, payload: dict[str, Any]) -> None:
         await self._send_to_owners_local(set(self._connections), payload)
@@ -269,7 +297,9 @@ class _QueuedRealtimeManager:
             for websocket in list(self._connections.get(owner_id, {})):
                 await self.close_connection(owner_id, websocket, code=1008, payload=payload)
 
-    async def _publish(self, action: str, event_type: str, encoded_data: Any, owner_ids: set[int] | None = None) -> None:
+    async def _publish(
+        self, action: str, event_type: str, encoded_data: Any, owner_ids: set[int] | None = None, feature: str | None = None
+    ) -> None:
         """把事件转发给其他 worker。
 
         ``encoded_data`` 必须是已经过 ``jsonable_encoder`` 的结果 —— 调用方为了
@@ -286,6 +316,9 @@ class _QueuedRealtimeManager:
             "event_type": event_type,
             "data": encoded_data,
         }
+        if feature is not None:
+            # 只有带 feature 的事件才多这一项，别的事件的信封和以前逐字节一样
+            message["feature"] = feature
         try:
             # Preserve the historical Redis envelope and its exact JSON serialization.
             serialized = json.dumps(message)
@@ -328,7 +361,7 @@ class _QueuedRealtimeManager:
                             if action == "disconnect":
                                 await self._close_owners_local(owner_ids, payload)
                             else:
-                                await self._send_to_owners_local(owner_ids, payload)
+                                await _dispatch_local(self, owner_ids, payload, _event_feature(event))
                     except (TypeError, ValueError, KeyError):
                         logger.warning("Ignoring malformed Redis realtime event")
             except asyncio.CancelledError:
@@ -448,7 +481,7 @@ class _SharedRealtimeSubscriber:
             elif action == "disconnect":
                 await channel._close_owners_local(owner_ids, payload)
             else:
-                await channel._send_to_owners_local(owner_ids, payload)
+                await _dispatch_local(channel, owner_ids, payload, _event_feature(event))
         except (TypeError, ValueError, KeyError):
             logger.warning("Ignoring malformed Redis realtime event")
         except asyncio.CancelledError:
@@ -507,9 +540,9 @@ class ConnectionManager(_QueuedRealtimeManager):
             self._presence_task = None
         await super().stop()
 
-    async def connect(self, user_id: int, websocket: WebSocket) -> bool:
+    async def connect(self, user_id: int, websocket: WebSocket, features: frozenset[str] = frozenset()) -> bool:
         was_online = await self.is_online_global(user_id)
-        connection_id = await super().connect(user_id, websocket)
+        connection_id = await super().connect(user_id, websocket, features)
         await self._add_presence(user_id, connection_id)
         self._invalidate_online_cache()
         return not was_online
@@ -696,21 +729,22 @@ class ConnectionManager(_QueuedRealtimeManager):
     def online_user_ids(self) -> set[int]:
         return set(self._connections)
 
-    async def send_to_user(self, user_id: int, event_type: str, data: Any) -> None:
+    async def send_to_user(self, user_id: int, event_type: str, data: Any, *, feature: str | None = None) -> None:
         # Publish for authorized recipients even when presence reads are stale/unavailable.
         payload = {"type": event_type, "data": jsonable_encoder(data)}
-        await self._send_to_owner_local(user_id, payload)
-        await self._publish("user", event_type, payload["data"], {user_id})
+        await self._send_to_owner_local(user_id, payload, feature)
+        await self._publish("user", event_type, payload["data"], {user_id}, feature)
 
-    async def send_to_users(self, user_ids: list[int] | set[int], event_type: str, data: Any) -> None:
+    async def send_to_users(self, user_ids: list[int] | set[int], event_type: str, data: Any, *, feature: str | None = None) -> None:
         # Membership/authorization is decided by the caller. A process-local presence
         # cache cannot be used as a delivery filter for users on another worker.
+        # feature：只发给连接时声明了它的连接（见 FEATURE_SELF_CHAT）
         owner_ids = set(user_ids)
         if not owner_ids:
             return
         payload = {"type": event_type, "data": jsonable_encoder(data)}
-        await self._send_to_owners_local(owner_ids, payload)
-        await self._publish("users", event_type, payload["data"], owner_ids)
+        await self._send_to_owners_local(owner_ids, payload, feature)
+        await self._publish("users", event_type, payload["data"], owner_ids, feature)
 
     async def disconnect_user(self, user_id: int, event_type: str, data: Any) -> None:
         payload = {"type": event_type, "data": jsonable_encoder(data)}

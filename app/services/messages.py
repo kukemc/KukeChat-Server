@@ -38,6 +38,8 @@ MAX_MESSAGES_PER_CONVERSATION = 1000
 PRUNE_BATCH_SIZE = 25
 # 「我的设备」会话里不能发的消息类型（docs/self-chat.md 第 4 节）→ 报错里说的功能名
 _SELF_CHAT_BLOCKED_TYPES = {MessageType.POLL: "发投票", MessageType.RED_PACKET: "发红包", MessageType.GIFT: "送礼物"}
+# 「我的设备」会话里发消息时去掉的 @ 字段
+_MENTION_KEYS = ("mentions", "mention_all", "mentionAll")
 
 
 async def _enforce_message_rate_limit(
@@ -685,10 +687,15 @@ async def send_message(
         # 「我的设备」会话只有自己（docs/self-chat.md 第 4 节）：投票、红包、礼物、@ 都没有意义
         if message_type in _SELF_CHAT_BLOCKED_TYPES:
             raise self_chat_unsupported(_SELF_CHAT_BLOCKED_TYPES[message_type])
-        if _mentioned_user_ids(metadata) or _metadata_mentions_all(metadata):
-            raise self_chat_unsupported("@ 人")
-    elif allow_transfer:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Transfers are only available in the self conversation")
+        # @ 在这里没有意义：不报错，悄悄去掉（客户端回复时自动带上的 @ 也不会让消息发不出去）
+        if isinstance(metadata, dict) and any(key in metadata for key in _MENTION_KEYS):
+            metadata = {key: value for key, value in metadata.items() if key not in _MENTION_KEYS} or None
+    else:
+        if allow_transfer:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Transfers are only available in the self conversation")
+        # metadata.device 是「我的设备」会话专用、由服务端写的；别的会话里客户端带了也去掉（推送时靠它认出「我的设备」的消息）
+        if isinstance(metadata, dict) and "device" in metadata:
+            metadata = {key: value for key, value in metadata.items() if key != "device"} or None
     if conversation.type == ConversationType.GROUP and membership.role not in STAFF_ROLES:
         if conversation.all_muted:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="This group is muted")

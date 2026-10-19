@@ -31,9 +31,12 @@
   "updated_at": "2026-10-20T08:00:00Z" }
 ```
 
-### 1.2 会话列表
+### 1.2 会话列表（要显式开启）
 
-- `GET /conversations` 的结果里**一定有**这个会话（`type = "self"`，每人恰好一个）：第一次列的时候服务端顺手建好。所以客户端一般不用专门调 `GET /conversations/self`，从列表里按 `type == "self"` 找就行；进会话页之前没拿到列表、或者列表是本地缓存的老数据时，再调一次 `GET /conversations/self`。
+老客户端不认识 `type = "self"`，所以这个会话默认**不出现**在任何列表里，新客户端要自己开：
+
+- **启动时（登录后、拉会话列表之前）调一次 `GET /conversations/self`**：这一步负责创建，之后拿到的 `id` 存起来。服务端**不会**在别的地方替你建。
+- 拉会话列表时带 **`GET /conversations?include_self=true`**：结果里才有它（每人恰好一个）。不带这个参数（老客户端）结果和以前一样，没有它。还没调过 `GET /conversations/self` 的账号，带了 `include_self=true` 也没有（还没建）。
 - 排序和别的会话一样（置顶在前，然后按 `updated_at` 新的在前），服务端不额外置顶。客户端可以自己决定放哪（比如固定放在列表顶部、或者放进「联系人」页的入口），这里不约束。
 - 置顶、免打扰、清空聊天记录（`PATCH /conversations/{id}/members/me/settings`、`POST /conversations/{id}/clear`）照常能用。
 - 会话 id 每个人不同，不要写死；同一个人在所有设备上是同一个 id。
@@ -61,7 +64,7 @@
 
 - 由服务端按**发送请求**的 `X-Kuke-Platform` 头写入（就是各端每个请求本来就带的那个，见 `device-bans.md`）。没带这个头时按 `X-Kuke-Client` 里有没有 `android` 猜，再猜不出算 `web`；不在上表里的值也算 `web`。客户端在 `metadata` 里自己带的 `device` 会被覆盖，不用带。
 - 临时文件消息的 `device` 是**开单**（`POST .../transfers`）那个请求的设备。
-- 只有「我的设备」会话里的消息有这个字段；别的会话里的消息没有。
+- 只有「我的设备」会话里的消息有这个字段；别的会话里的消息没有（客户端在别的会话里带了 `device` 也会被去掉）。
 
 **左右怎么放**：消息的 `sender_id` 永远是自己，不能再按「是不是我发的」决定左右。改成按设备类：
 
@@ -89,16 +92,19 @@
 
 ### 3.2 实时
 
-和别的会话一样推 `message.created` / `message.recalled` / `message.reaction.updated` / `conversation.updated` / `conversation.read`。会话成员只有自己，所以这些事件推给**自己所有在线的连接**，**包括发出这条消息的那台设备自己**：
+**连 WebSocket 时要声明：`/ws?token=…&features=self`**（`features` 是逗号分隔的列表，目前只认 `self`，不认识的值忽略）。「我的设备」会话的**所有**事件只发给声明了 `features=self` 的连接；没声明的连接（老客户端）一条都收不到，所以老客户端不会因为收到一个不认识的会话的消息而多出一行奇怪的会话。忘了带这个参数的新客户端也收不到——这是最容易漏的一步。
+
+和别的会话一样推 `message.created` / `message.recalled` / `message.reaction.updated` / `conversation.updated` / `conversation.read`。会话成员只有自己，所以这些事件推给**自己所有声明了 `features=self` 的在线连接**，**包括发出这条消息的那台设备自己**：
 
 - 发送端：POST 的返回和自己收到的 `message.created` 都会到，按 `client_nonce` 找到本地那条替换，另一份按 `id` 去重（和群聊里自己发的消息一样，客户端已经这么做了）。
 - 另一台设备：收到 `message.created` 就插进会话，`metadata.device` 决定左右。
 - 「正在输入」（`conversation.typing`）不会推（只推给会话里的其他人，这里没有其他人）。
 
-### 3.3 未读和通知
+### 3.3 未读和通知（客户端自己算）
 
-- 未读、已读是按**人**记的（不是按设备），而所有消息都是自己发的，所以 `unread_count` 恒为 0、`mention_pending` 恒为 `null`。
-- 客户端如果想在另一台设备上提示「有新消息」：自己在本地记——收到 `message.created` 且 `conversation.type == "self"` 且 `metadata.device` 的设备类和自己不同，就在本地给这个会话加一个未读角标 / 弹通知；打开会话后清掉。服务端不提供跨设备的未读数。
+- **服务端不提供这个会话的未读数**：未读、已读是按**人**记的（不是按设备），而所有消息都是自己发的，所以 `unread_count` 恒为 0、`mention_pending` 恒为 `null`，`POST .../read` 调不调都一样。以后也不打算改成按设备记。
+- 客户端在**本地**算：收到 `message.created` 且 `conversation_id` 是「我的设备」会话、且 `metadata.device` 的设备类和自己不同 → 本地未读 +1（会话正开着、窗口在前台的除外），列表上显示角标；打开会话后清零。本地未读存在本机（重启后可以丢，也可以持久化，各端自己定）。
+- 离线期间另一台设备发来的消息：重新连上后客户端拉一次 `GET /conversations/{id}/messages`，把「本机上次看到的最后一条 id」之后、设备类和自己不同的条数算进本地未读（「上次看到的 id」也是本地记）。
 - 一般会话的通知逻辑是「不是我发的才通知」，对这个会话要改成上面这条规则，否则另一台设备发来的东西永远不提示。
 
 ## 4. 不支持的功能
@@ -107,7 +113,6 @@
 
 | 功能 | 接口 | 说明 |
 | --- | --- | --- |
-| @ 某人 / @全体成员 | 发消息时 `metadata.mentions` 非空或 `mention_all: true` | 输入框里不要弹 @ 选人 |
 | 投票 | `POST /conversations/{id}/polls` | |
 | 红包 | `POST /red-packets` | |
 | 礼物 | `POST /gifts`（带这个会话的 `conversation_id`） | |
@@ -115,6 +120,8 @@
 | 举报 | `POST /reports`（`target_type` 是 `message` 且消息在这个会话里，或者 `conversation` 且就是这个会话） | 消息菜单里不要有「举报」 |
 | 加人 / 进群 / 申请进群 / 群设置 / 群公告 / 群资料 / 改角色 / 禁言 / 踢人 / 解散 / 机器人 | 各自的群接口 | |
 | 退出会话 | `DELETE /conversations/{id}/members/me` | 「我的设备」不能退出、不能删除，只能清空聊天记录 |
+
+**@ 不报错，悄悄去掉**：在这个会话里发消息时 `metadata` 里的 `mentions` / `mention_all` / `mentionAll` 被服务端直接删掉，消息照常发出（返回和推送里都没有这几项），不记「有人@我」。客户端输入框里不要弹 @ 选人；回复时自动带的 @ 不用特意去掉。
 
 另外（不是 `self_chat_unsupported`，沿用原来的错误）：
 
@@ -154,6 +161,7 @@
   - 和别的 API 请求一样带 `Authorization` 和客户端证明头（`X-Kuke-Client` / `X-Kuke-Timestamp` / `X-Kuke-Nonce` / `X-Kuke-Proof`，证明里的 path 就是 `/conversations/{cid}/transfers/{tid}/content`，方法 `PUT`），再加 `upload.headers`。
   - 请求体是文件字节（不是 multipart）。返回 200 `{ "transfer_id": 7, "uploaded_bytes": 1048576 }`。
   - 可以重传（覆盖上一次的），complete 之前随时可以再 PUT。
+  - 这条路要经过后端前面的 nginx，能传多大取决于那边的 `client_max_body_size`（以及反代超时），可能比 `max_file_bytes` 小。线上配了私有桶，走的是 `direct = true`，不受这个限制；`direct = false` 只在本地开发 / 自建没配对象存储时出现，传大文件前先确认反代的上限。
 
 开单之后 **1 小时**内要 complete（`transfer.upload_expires_at`），过了上传单作废（404 `upload_not_found`，传上去的东西也会被删），只能重新开单。直传的 PUT 地址 15 分钟就过期，传得慢超过 15 分钟的话重新开单。
 
@@ -265,9 +273,11 @@ complete 时在会话里落一条**普通文本消息**（`type = "text"`，没�
 
 ## 6. 实时事件一览
 
+都只发给 `/ws?features=self` 的连接（3.2）。
+
 | 事件 | 什么时候 | 备注 |
 | --- | --- | --- |
-| `message.created` | 发了消息 / complete 了临时文件 | 推给自己所有在线连接（包括发送端），`data` 是 `MessageRead`，带 `metadata.device`、可能带 `client_nonce` |
+| `message.created` | 发了消息 / complete 了临时文件 | 推给自己所有声明了 `features=self` 的在线连接（包括发送端），`data` 是 `MessageRead`，带 `metadata.device`、可能带 `client_nonce` |
 | `message.recalled` | 撤回 | 文件消息撤回后文件作废，不另推事件 |
 | `message.reaction.updated` / `conversation.updated` / `conversation.read` | 和私聊一样 | |
 
@@ -277,6 +287,7 @@ complete 时在会话里落一条**普通文本消息**（`type = "text"`，没�
 
 两端都要做的：
 
+0. 启动时调 `GET /conversations/self`；拉列表带 `include_self=true`；连 `/ws` 带 `features=self`（三件事缺一不可，见 1.2、3.2）。
 1. 会话列表认 `type == "self"`：按 1.3 显示名字和图标，不显示对方资料 / 在线状态 / 火花。老逻辑里「不是 group 就当私聊、去读 `direct_user`」的地方要先判断 self（`direct_user` 是 null）。
 2. 聊天页：左右按第 2 节的设备类规则；左边的消息头像 / 名字用对方设备类。
 3. 输入框：没有 @、红包、礼物、投票、戳一戳入口；多一个「文件」入口（任意类型），走第 5 节流程，显示上传进度，complete 前本地先插一条「发送中」的文件卡片（`client_nonce`）。
@@ -287,14 +298,19 @@ complete 时在会话里落一条**普通文本消息**（`type = "text"`，没�
 
 ## 8. 服务端实现要点（不影响契约）
 
-- **表**：`conversations` 新增列 `self_owner_id`（主人的用户 id，别的会话为空）+ 唯一索引 `uq_conversations_self_owner`，并发建会话时靠它只留一个（`services/self_chat.get_or_create` 撞了唯一约束就回头读）；`self_transfers`（临时文件，pending → ready → expired，不建外键，会话 / 用户删了 worker 照样能删对象）。启动时自动迁移。
+- **表**：`conversations` 新增列 `self_owner_id`（主人的用户 id，别的会话为空）+ 唯一索引 `uq_conversations_self_owner`，并发建会话时靠它只留一个（`services/self_chat.get_or_create` 撞了唯一约束就回头读；只有 `GET /conversations/self` 会建）；`self_transfers`（临时文件，pending → ready → expired，不建外键，会话 / 用户删了 worker 照样能删对象）。启动时自动迁移。
 - **存储**：对象放 `self-transfers/{用户 id}/{随机名}`。和 `group-files/` 一样是私有前缀：配了 `S3_PRIVATE_BUCKET` 时放私有桶、走预签名直传直下；本地存储时 `/uploads/self-transfers/...` 直链 404。
 - **清理**：`services/self_chat.sweep`，每 10 分钟一次：作废的上传单删行删对象、过期的文件标 expired 删对象、过期 7 天的行删掉。可以重复跑，多个 worker 同时跑也安全（改状态的语句带着原状态做条件；删对象幂等）。
 - **配置**：`SELF_TRANSFER_MAX_BYTES`（默认 1 GB）、`SELF_TRANSFER_QUOTA_BYTES`（默认 5 GB），见 `.env.example`。
+- **实时**：`/ws?features=self` 的声明存在连接状态上（`websocket/manager._ConnectionState.features`）。「我的设备」会话的事件发送时带 `feature="self"`，本机只投给声明了的连接；跨 worker 时 Redis 信封里多一个 `feature` 键，收到的 worker 同样过滤（不带 feature 的事件信封和以前逐字节一样）。消息事件靠 `metadata.device` 认出来（别的会话里客户端带的 `device` 在发消息时被去掉），不额外查库。
+- **列表**：`GET /conversations` 的缓存按「带不带 self」分两份，失效时一起删。
 - **审核**：发消息的接口看到 `_self_chat` 标记就不调度审核；`moderation._moderate_message_task` 里也按会话类型再挡一次（举报复核等别的入口也进不来）。空闲复查、风纪、机器案件本来就只看群聊。
 - **后台**：`GET /admin/conversations` 默认不列 `type = self`（每人一个，会把列表淹掉）；要看传 `type=self`，只有元数据，没有消息内容。
 
 ## 9. 老客户端
 
-- 老客户端会在会话列表里看到一个 `type = "self"`、`display_title = "我的设备"`、没有 `direct_user` 的会话，按私聊画（没有头像、名字「我的设备」），能正常收发文字消息，消息都显示在右边。
-- 文件消息在老客户端上是一行字「[文件] xxx（大小）」，点不开。
+老客户端**看不到**这个会话：
+
+- `GET /conversations` 不带 `include_self` → 没有它；服务端也不会在老客户端的请求里替它建会话。
+- `/ws` 不带 `features=self` → 这个会话的事件一条都不推，不会因为收到不认识的会话 id 而在列表里冒出一行。
+- 仍然可能间接碰到的地方（都是用户先在新客户端上用过「我的设备」才会有）：全局聊天记录搜索 `GET /search/messages` 的结果、「我的收藏」`GET /conversations/bookmarks/all` 里，可能出现这个会话里的普通消息（会话摘要 `type = "self"`、`display_title = "我的设备"`）。点进去老客户端会按私聊打开，能看能发，消息都在右边；不会崩，也不会多出会话行。临时文件消息不能收藏，所以收藏里不会有它。

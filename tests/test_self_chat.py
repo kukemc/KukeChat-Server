@@ -180,15 +180,22 @@ class ConversationTests(SelfChatCase):
             members = (await db.execute(select(ConversationMember.user_id).where(ConversationMember.conversation_id == ids[0]))).scalars().all()
         self.assertEqual((len(rows), members), (1, [self.ids["carol"]]))
 
-    async def test_list_always_contains_it(self) -> None:
-        listed = await self.json("GET", "/conversations", as_="bob")
-        mine = [item for item in listed if item["type"] == "self"]
-        self.assertEqual(len(mine), 1)
-        self.assertIn(self.direct_id, [item["id"] for item in listed])
-        # 再列一次不会多出来，也就是 GET /conversations/self 的那个
-        again = await self.json("GET", "/conversations", as_="bob")
-        self.assertEqual([item["id"] for item in again if item["type"] == "self"], [mine[0]["id"]])
-        self.assertEqual(await self.self_id("bob"), mine[0]["id"])
+    async def test_list_only_with_include_self(self) -> None:
+        # 列表不会顺手建：还没调过 GET /conversations/self 的人，带不带 include_self 都没有
+        self.assertEqual([item["type"] for item in await self.json("GET", "/conversations", as_="bob", params={"include_self": "true"})], ["direct"])
+        cid = await self.self_id("bob")
+        # 老客户端（不带 include_self）看不到它；新客户端带上就有，而且只有一个
+        self.assertEqual([item["id"] for item in await self.json("GET", "/conversations", as_="bob")], [self.direct_id])
+        listed = await self.json("GET", "/conversations", as_="bob", params={"include_self": "true"})
+        self.assertEqual(sorted(item["id"] for item in listed), sorted([cid, self.direct_id]))
+        self.assertEqual([item["id"] for item in listed if item["type"] == "self"], [cid])
+        # 两种结果各自缓存，互不串：再列一次老的仍然没有
+        self.assertEqual([item["id"] for item in await self.json("GET", "/conversations", as_="bob")], [self.direct_id])
+        # 发了消息（失效缓存）之后两份都是新的
+        await self.send(cid, "新消息", as_="bob")
+        latest = {item["id"]: item for item in await self.json("GET", "/conversations", as_="bob", params={"include_self": "true"})}
+        self.assertEqual(latest[cid]["last_message"]["content"], "新消息")
+        self.assertNotIn(cid, [item["id"] for item in await self.json("GET", "/conversations", as_="bob")])
 
     async def test_others_cannot_read_join_or_be_invited(self) -> None:
         cid = await self.self_id()
@@ -236,6 +243,9 @@ class MessageTests(SelfChatCase):
         # 发给自己（所有在线的设备，包括发送的这台；客户端按 client_nonce 去重）
         self.assertEqual(set(events[0][0]), {self.ids["alice"]})
         self.assertEqual(events[0][2].metadata["device"], "android")
+        # 只发给连接时声明了 features=self 的连接（老客户端收不到）
+        self.assertEqual(self.send_to_users.await_args_list[0].kwargs, {"feature": "self"})
+        self.assertTrue(all(call.kwargs == {"feature": "self"} for call in self.send_to_users.await_args_list))
         # 客户端自己带的 device 被请求头覆盖；没带头时按 X-Kuke-Client 猜，再没有算 web
         forged = await self.send(cid, "伪造", platform="desktop", metadata={"device": "ios"})
         self.assertEqual(forged["metadata"]["device"], "desktop")
@@ -245,14 +255,22 @@ class MessageTests(SelfChatCase):
         self.assertEqual(guessed["metadata"]["device"], "android")
         self.assertEqual((await self.send(cid, "默认", platform=None))["metadata"]["device"], "web")
         self.assertEqual((await self.send(cid, "乱写", platform="toaster"))["metadata"]["device"], "web")
-        # 别的会话不加 device
-        self.assertNotIn("device", (await self.send(self.direct_id, "私聊")).get("metadata") or {})
+        # 已读、会话更新这些事件也一样只发给新客户端
+        self.send_to_users.reset_mock()
+        await self.json("POST", f"/conversations/{cid}/read")
+        read_events = {call.args[1]: call.kwargs for call in self.send_to_users.await_args_list}
+        self.assertEqual(read_events.get("conversation.read"), {"feature": "self"})
+        # 别的会话不加 device，事件也照旧发给所有连接
+        self.send_to_users.reset_mock()
+        # （客户端在别的会话里带的 device 也去掉：推送时靠它认出「我的设备」的消息）
+        self.assertNotIn("device", (await self.send(self.direct_id, "私聊", metadata={"device": "ios"})).get("metadata") or {})
+        self.assertTrue(self.send_to_users.await_args_list and all(call.kwargs == {} for call in self.send_to_users.await_args_list))
         # 历史、搜索、会话列表的最后一条都带着
         history = await self.json("GET", f"/conversations/{cid}/messages")
         self.assertEqual([item["metadata"]["device"] for item in history], ["android", "desktop", "android", "web", "web"])
         found = await self.json("GET", f"/conversations/{cid}/messages/search", params={"q": "手机"})
         self.assertEqual(found["items"][0]["message"]["metadata"]["device"], "android")
-        listed = {item["id"]: item for item in await self.json("GET", "/conversations")}
+        listed = {item["id"]: item for item in await self.json("GET", "/conversations", params={"include_self": "true"})}
         self.assertEqual((listed[cid]["last_message"]["content"], listed[cid]["unread_count"]), ("乱写", 0))
 
     async def test_normal_features_work(self) -> None:
@@ -280,14 +298,17 @@ class MessageTests(SelfChatCase):
 
     async def test_disabled_features(self) -> None:
         cid = await self.self_id()
-        mention = await self.code(
-            "POST", f"/conversations/{cid}/messages", 400, json={"content": "@我", "metadata": {"mentions": [{"user_id": self.ids["alice"], "name": "alice"}]}}
-        )
-        self.assertEqual(mention["code"], "self_chat_unsupported")
-        self.assertEqual(
-            (await self.code("POST", f"/conversations/{cid}/messages", 400, json={"content": "@全体", "metadata": {"mention_all": True}}))["code"],
-            "self_chat_unsupported",
-        )
+        # @ 不报错，悄悄去掉，别的 metadata 留着
+        mention = await self.send(cid, "@我", metadata={"mentions": [{"user_id": self.ids["alice"], "name": "alice"}], "reply_to": {"message_id": 1}})
+        self.assertEqual(mention["metadata"], {"reply_to": {"message_id": 1}, "device": "android"})
+        everyone = await self.send(cid, "@全体", metadata={"mention_all": True, "mentionAll": True})
+        self.assertEqual(everyone["metadata"], {"device": "android"})
+        async with self.sessions() as db:
+            member = (
+                await db.execute(select(ConversationMember).where(ConversationMember.conversation_id == cid, ConversationMember.user_id == self.ids["alice"]))
+            ).scalar_one()
+            conversation = await db.get(Conversation, cid)
+        self.assertEqual((member.last_mention_message_id, conversation.last_mention_all_message_id), (None, None))
         poll = await self.code("POST", f"/conversations/{cid}/polls", 400, json={"title": "吃什么", "options": ["面", "饭"]})
         self.assertEqual(poll["code"], "self_chat_unsupported")
         with patch.object(red_packet_service, "get_settings", AsyncMock(return_value={**red_packet_service.DEFAULTS, "enabled": True})):
@@ -533,6 +554,58 @@ class DirectTransferTests(SelfChatCase):
         link = await self.json("GET", f"/conversations/{cid}/transfers/{tid}/link")
         self.assertEqual(link["url"], f"https://bucket.test/{key}?sig=get")
         self.assertTrue((await self.json("GET", f"/conversations/{cid}/transfers"))["direct"])
+
+
+class _FakeSocket:
+    def __init__(self) -> None:
+        from starlette.websockets import WebSocketState
+
+        self.application_state = WebSocketState.CONNECTED
+
+
+class _FakeRedis:
+    def __init__(self) -> None:
+        self.published: list[str] = []
+
+    async def publish(self, _channel: str, message: str) -> None:
+        self.published.append(message)
+
+
+class RealtimeFeatureTests(unittest.IsolatedAsyncioTestCase):
+    """「我的设备」的事件只发给 /ws?features=self 的连接；跨 worker 时 feature 跟着 Redis 信封走。"""
+
+    def test_parse_features(self) -> None:
+        from app.websocket.manager import parse_features
+
+        self.assertEqual(parse_features("self"), frozenset({"self"}))
+        self.assertEqual(parse_features(" Self , bogus,,"), frozenset({"self"}))
+        self.assertEqual(parse_features(""), frozenset())
+        self.assertEqual(parse_features(None), frozenset())
+
+    async def test_only_declared_connections_get_feature_events(self) -> None:
+        import json as json_module
+
+        from app.websocket.manager import ConnectionManager, _ConnectionState
+
+        channel = ConnectionManager()
+        idle = asyncio.create_task(asyncio.sleep(3600))
+        self.addCleanup(idle.cancel)
+        old, new = _FakeSocket(), _FakeSocket()
+        channel._connections[7][old] = _ConnectionState(connection_id="old", queue=asyncio.Queue(), task=idle)
+        channel._connections[7][new] = _ConnectionState(connection_id="new", queue=asyncio.Queue(), task=idle, features=frozenset({"self"}))
+        redis = _FakeRedis()
+        channel._redis = redis
+
+        await channel.send_to_users({7}, "message.created", {"conversation_id": 1}, feature="self")
+        self.assertEqual((channel._connections[7][old].queue.qsize(), channel._connections[7][new].queue.qsize()), (0, 1))
+        self.assertEqual(json_module.loads(redis.published[-1])["feature"], "self")
+        # 没有 feature 的事件两条连接都收到，Redis 信封里也不多出 feature 这一项
+        await channel.send_to_users({7}, "message.created", {"conversation_id": 2})
+        self.assertEqual((channel._connections[7][old].queue.qsize(), channel._connections[7][new].queue.qsize()), (1, 2))
+        self.assertNotIn("feature", json_module.loads(redis.published[-1]))
+        # 别的 worker 发来的带 feature 的事件同样只给声明了的连接
+        await channel._send_to_owners_local({7}, {"type": "message.created", "data": {}}, "self")
+        self.assertEqual((channel._connections[7][old].queue.qsize(), channel._connections[7][new].queue.qsize()), (1, 3))
 
 
 class StorageTests(unittest.TestCase):

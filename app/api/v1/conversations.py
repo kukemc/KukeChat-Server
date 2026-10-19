@@ -73,7 +73,7 @@ from app.services import pokes as poke_service
 from app.services import response_cache
 from app.services import voice_transcripts as voice_transcript_service
 from app.services import self_chat as self_chat_service
-from app.websocket.manager import admin_manager, bot_manager, game_manager, manager
+from app.websocket.manager import FEATURE_SELF_CHAT, admin_manager, bot_manager, game_manager, manager
 
 
 router = APIRouter()
@@ -253,6 +253,37 @@ async def emit_system_message(
     return message
 
 
+def _feature_for(conversation: Conversation | None) -> str | None:
+    """这个会话的事件要不要只发给新客户端：「我的设备」会话（docs/self-chat.md 第 6 节）的事件只发给连接时带了 features=self 的连接，
+    不认识这种会话的老客户端收不到。"""
+    return FEATURE_SELF_CHAT if conversation is not None and conversation.type == ConversationType.SELF else None
+
+
+def message_feature(message: Message) -> str | None:
+    """消息事件的 feature，不查库：「我的设备」会话里的消息一定带服务端写的 metadata.device（别的会话里客户端带的 device
+    在 send_message 里会被去掉），刚发出的还有 _self_chat 标记。"""
+    if getattr(message, "_self_chat", False):
+        return FEATURE_SELF_CHAT
+    raw = getattr(message, "metadata_json", None)
+    if not isinstance(raw, str) or '"device"' not in raw:
+        return None
+    metadata = _metadata_from_json(raw)
+    return FEATURE_SELF_CHAT if metadata is not None and "device" in metadata else None
+
+
+async def realtime_feature(db: AsyncSession, conversation_id: int) -> str | None:
+    # 发消息的路径上会话刚被加载过，这里通常是一次 identity map 命中
+    return _feature_for(await db.get(Conversation, conversation_id))
+
+
+async def send_to_members(user_ids: list[int] | set[int], event_type: str, data, feature: str | None) -> None:
+    """manager.send_to_users，带上会话的 feature（没有时和以前的调用一模一样）。"""
+    if feature is None:
+        await manager.send_to_users(user_ids, event_type, data)
+    else:
+        await manager.send_to_users(user_ids, event_type, data, feature=feature)
+
+
 async def send_conversation_updates(db: AsyncSession, conversation_id: int, user_ids: list[int] | set[int]) -> None:
     await send_conversation_patch(db, conversation_id, user_ids)
 
@@ -315,7 +346,7 @@ async def send_conversation_patch(
     }
     if extra:
         data.update(extra)
-    await manager.send_to_users(online_ids, "conversation.updated", data)
+    await send_to_members(online_ids, "conversation.updated", data, _feature_for(conversation))
 
 
 async def send_message_updates(db: AsyncSession, event_type: str, message: Message, user_ids: list[int] | set[int]) -> None:
@@ -323,6 +354,7 @@ async def send_message_updates(db: AsyncSession, event_type: str, message: Messa
     # fresh presence read). A second global Redis scan adds O(online users) work and
     # can drop someone who connected between the two reads.
     online_ids = set(user_ids)
+    feature = message_feature(message)
     if event_type == "message.created" and message.sender is not None:
         if getattr(message, "_sender_display_name", None) is None:
             data = await message_service.build_message_read(db, message, message.sender_id)
@@ -332,7 +364,7 @@ async def send_message_updates(db: AsyncSession, event_type: str, message: Messa
         if isinstance(client_nonce, str) and client_nonce and getattr(data, "client_nonce", None) is None:
             data.client_nonce = client_nonce
         if online_ids:
-            await manager.send_to_users(online_ids, event_type, data)
+            await send_to_members(online_ids, event_type, data, feature)
         await send_bot_message_updates(db, event_type, message.conversation_id, data, sender_id=message.sender_id)
         await send_game_message_updates(db, event_type, message.conversation_id, data)
         return
@@ -345,7 +377,7 @@ async def send_message_updates(db: AsyncSession, event_type: str, message: Messa
             "recalled_by_id": message.recalled_by_id,
         }
         if online_ids:
-            await manager.send_to_users(online_ids, event_type, data)
+            await send_to_members(online_ids, event_type, data, feature)
         await send_bot_message_updates(
             db,
             event_type,
@@ -358,7 +390,7 @@ async def send_message_updates(db: AsyncSession, event_type: str, message: Messa
         return
     for user_id in online_ids:
         data = await message_service.build_message_read(db, message, user_id)
-        await manager.send_to_user(user_id, event_type, data)
+        await send_to_members({user_id}, event_type, data, feature)
 
 
 async def send_game_message_updates(db: AsyncSession, event_type: str, conversation_id: int, data) -> None:
@@ -421,7 +453,7 @@ async def send_reaction_updates(db: AsyncSession, conversation_id: int, message_
     event_data = {"conversation_id": conversation_id, "message_id": message_id, "reactions": reactions}
     online_ids = set(user_ids) & await manager.online_user_ids_global(fresh=True)
     if online_ids:
-        await manager.send_to_users(online_ids, "message.reaction.updated", event_data)
+        await send_to_members(online_ids, "message.reaction.updated", event_data, await realtime_feature(db, conversation_id))
     await send_bot_conversation_event(db, "message.reaction.updated", conversation_id, event_data)
 
 
@@ -430,19 +462,16 @@ async def conversations(
     request: Request,
     current_user: Annotated[User, Depends(get_current_user)],
     db: Annotated[AsyncSession, Depends(get_db)],
+    include_self: Annotated[bool, Query(description="列出「我的设备」会话（docs/self-chat.md）；老客户端不带，看不到它")] = False,
 ) -> Response:
-    cached = response_cache.get_user_conversations(current_user.id)
+    cached = response_cache.get_user_conversations(current_user.id, include_self=include_self)
     if cached is not None:
         return cached_json_response(cached, request, 5)
 
-    items = await conversation_service.list_user_conversations(db, current_user.id)
-    if not current_user.is_bot and not any(item.type == ConversationType.SELF for item in items):
-        # 每个人的列表里都有「我的设备」（docs/self-chat.md）：还没有就建上再列一遍。只有第一次会走到这里
-        await self_chat_service.get_or_create(db, current_user)
-        items = await conversation_service.list_user_conversations(db, current_user.id)
+    items = await conversation_service.list_user_conversations(db, current_user.id, include_self=include_self)
     data = jsonable_encoder(await conversation_service.build_conversation_reads(db, items, current_user.id))
     payload = response_cache.build_json(data)
-    response_cache.set_user_conversations(current_user.id, payload)
+    response_cache.set_user_conversations(current_user.id, payload, include_self=include_self)
     return cached_json_response(payload, request, 5)
 
 
@@ -1432,7 +1461,9 @@ async def read_conversation(
     # 只推给读的人自己（多设备同步未读数）。PC / 安卓都只处理 user_id 是自己的已读事件；
     # 以前广播给全会话，大群里每次已读要推几百份，抢红包时把 CPU 吃满（2026-10-17）。
     # mention_pending 只放在返回里、和发给本人的 conversation.updated 里
-    await manager.send_to_users({current_user.id}, "conversation.read", receipt.model_dump(exclude={"mention_pending"}))
+    await send_to_members(
+        {current_user.id}, "conversation.read", receipt.model_dump(exclude={"mention_pending"}), await realtime_feature(db, conversation_id)
+    )
     await send_conversation_patch(db, conversation_id, {current_user.id}, {"mention_pending": receipt.mention_pending})
     return receipt
 

@@ -1,10 +1,11 @@
 """「我的电脑 / 我的手机」（docs/self-chat.md）：每个人一个只有自己的会话（type = self），在自己的几台设备之间传消息和文件。
 
 会话本身（get_or_create）：每人一个，conversations.self_owner_id 上的唯一索引兜底，两个请求同时建也只会留一个。
-会话列表（GET /conversations）里没有时顺手建上，所以每个人的列表里一定有它。
+只有 GET /conversations/self 会建它。老客户端不认识这种会话：GET /conversations 要带 include_self=true 才列出来，
+它的实时事件只发给 /ws?features=self 的连接（api/v1/conversations.py 的 send_to_members）。
 
-消息照常走 messages.send_message：那边看到 type = self 时拦掉投票 / 红包 / 礼物 / @，并把发送设备（X-Kuke-Platform）
-写进 metadata.device；接口层看到 _self_chat 标记就不送机器审核（只有自己看得到）。
+消息照常走 messages.send_message：那边看到 type = self 时拦掉投票 / 红包 / 礼物，并把发送设备（X-Kuke-Platform）
+写进 metadata.device、去掉 @；接口层看到 _self_chat 标记就不送机器审核（只有自己看得到）。
 
 临时文件（第 5 节）：任意类型，24 小时后过期，过期后下载 410、存储里的对象删掉；不能收藏 / 转发。和群文件一样放私有前缀
 （self-transfers/{用户 id}/{随机名}，配了 S3_PRIVATE_BUCKET 时放私有桶），对外不暴露直链：
