@@ -8,11 +8,20 @@
 
 KukeChat 的服务端：一套 FastAPI 应用，用 REST 与 WebSocket 承载私聊、群聊、社区动态和社区自治。
 
-[![License](https://img.shields.io/badge/License-MIT-111111?style=flat-square)](LICENSE)
-[![Python](https://img.shields.io/badge/Python-3.11%2B-111111?style=flat-square)](https://www.python.org)
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.110%2B-111111?style=flat-square)](https://fastapi.tiangolo.com)
-[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-15-111111?style=flat-square)](https://www.postgresql.org)
-[![CI](https://img.shields.io/github/actions/workflow/status/kukemc/KukeChat-Server/ci.yml?branch=main&style=flat-square&label=CI&color=111111)](https://github.com/kukemc/KukeChat-Server/actions/workflows/ci.yml)
+<p align="center">
+<img src=".github/assets/icons/lock.svg" width="16" height="16" align="absmiddle">&nbsp;私聊不可翻阅&emsp;&emsp;
+<img src=".github/assets/icons/radio.svg" width="16" height="16" align="absmiddle">&nbsp;REST + WebSocket&emsp;&emsp;
+<img src=".github/assets/icons/scale.svg" width="16" height="16" align="absmiddle">&nbsp;社区自治&emsp;&emsp;
+<img src=".github/assets/icons/server.svg" width="16" height="16" align="absmiddle">&nbsp;可自部署
+</p>
+
+[![License](https://img.shields.io/badge/License-MIT-111111?style=flat-square&logo=opensourceinitiative&logoColor=white)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.11%2B-111111?style=flat-square&logo=python&logoColor=white)](https://www.python.org)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.110%2B-111111?style=flat-square&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-15-111111?style=flat-square&logo=postgresql&logoColor=white)](https://www.postgresql.org)
+[![Redis](https://img.shields.io/badge/Redis-7-111111?style=flat-square&logo=redis&logoColor=white)](https://redis.io)
+[![Docker](https://img.shields.io/badge/Docker-Compose-111111?style=flat-square&logo=docker&logoColor=white)](docker-compose.yml)
+[![CI](https://img.shields.io/github/actions/workflow/status/kukemc/KukeChat-Server/ci.yml?branch=main&style=flat-square&label=CI&color=111111&logo=githubactions&logoColor=white)](https://github.com/kukemc/KukeChat-Server/actions/workflows/ci.yml)
 
 **简体中文** · [English](README.en.md)
 
@@ -74,20 +83,24 @@ KukeChat 是一个面向 Scratch / CCW 创作社区的聊天应用。这个仓�
 
 ## 功能
 
-| 领域 | 能力 |
+| &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;领&#8288;域&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; | 能力 |
 | --- | --- |
-| 消息 | 私聊、群聊、临时会话；文本、图片、语音、表情包；引用、@ 提及、表情回应、戳一戳；撤回、转发与合并转发、收藏、精华消息；投票；正在输入；语音转文字（需配置识别服务）；只限本人会话的聊天记录搜索 |
-| 群组 | 角色与权限、禁言、慢速模式、加群审批、邀请链接；成员头衔、群等级、签到排行；群公告；群表情；群升级（人数上限、群文件、永久精华、群待办） |
-| 社交 | 好友与申请流、好友亲密度与成就、好友火花、资料点赞、账号等级、生日 |
-| 社区 | 动态（话题、评论、点赞、置顶）、组队中心、任务协作、站内公告与回应、通知 |
-| 金币 | 商店装饰、礼物、红包（普通、拼手气、接龙、语音口令、专属）；余额来自外部金币账本，见[集成点](#集成点) |
-| 机器人 | 机器人广场与评价、安装到群、Bot API（Key 鉴权）与 `/bot/ws` 实时事件、消息内按钮组件 |
-| 治理 | 举报并案处理、违规台账与阶梯处罚、申诉；风纪委员（考试、投票、资深合议与复审、判例、议事厅）；外部内容审核接入；设备封禁与注册限制；审计日志 |
-| 平台 | CCW 账号绑定与资料同步、游戏模式（作品内嵌聊天）、应用发版与检查更新、下载页、作品介绍页用的公开数据接口、本地或 S3 兼容存储、SMTP 邮件、健康检查 |
+| <img src=".github/assets/icons/message-circle.svg" width="16" height="16" align="absmiddle">&nbsp;消息 | 私聊、群聊、临时会话；文本、图片、语音、表情包；引用、@ 提及、表情回应、戳一戳；撤回、转发与合并转发、收藏、精华消息；投票；正在输入；语音转文字（需配置识别服务）；只限本人会话的聊天记录搜索 |
+| <img src=".github/assets/icons/users.svg" width="16" height="16" align="absmiddle">&nbsp;群组 | 角色与权限、禁言、慢速模式、加群审批、邀请链接；成员头衔、群等级、签到排行；群公告；群表情；群升级（人数上限、群文件、永久精华、群待办） |
+| <img src=".github/assets/icons/heart.svg" width="16" height="16" align="absmiddle">&nbsp;社交 | 好友与申请流、好友亲密度与成就、好友火花、资料点赞、账号等级、生日 |
+| <img src=".github/assets/icons/newspaper.svg" width="16" height="16" align="absmiddle">&nbsp;社区 | 动态（话题、评论、点赞、置顶）、组队中心、任务协作、站内公告与回应、通知 |
+| <img src=".github/assets/icons/coins.svg" width="16" height="16" align="absmiddle">&nbsp;金币 | 商店装饰、礼物、红包（普通、拼手气、接龙、语音口令、专属）；余额来自外部金币账本，见[集成点](#集成点) |
+| <img src=".github/assets/icons/bot.svg" width="16" height="16" align="absmiddle">&nbsp;机器人 | 机器人广场与评价、安装到群、Bot API（Key 鉴权）与 `/bot/ws` 实时事件、消息内按钮组件 |
+| <img src=".github/assets/icons/shield-check.svg" width="16" height="16" align="absmiddle">&nbsp;治理 | 举报并案处理、违规台账与阶梯处罚、申诉；风纪委员（考试、投票、资深合议与复审、判例、议事厅）；外部内容审核接入；设备封禁与注册限制；审计日志 |
+| <img src=".github/assets/icons/plug.svg" width="16" height="16" align="absmiddle">&nbsp;平台 | CCW 账号绑定与资料同步、游戏模式（作品内嵌聊天）、应用发版与检查更新、下载页、作品介绍页用的公开数据接口、本地或 S3 兼容存储、SMTP 邮件、健康检查 |
 
 机器人接入文档在客户端仓库：[`docs/bot-api.md`](https://github.com/kukemc/KukeChat-Client/blob/main/docs/bot-api.md)。
 
 ## 技术栈
+
+<p align="center">
+<img src="https://skillicons.dev/icons?i=py,fastapi,postgres,sqlite,redis,docker,nginx&theme=dark" height="40" alt="Python, FastAPI, PostgreSQL, SQLite, Redis, Docker, Nginx">
+</p>
 
 | 层 | 选型 |
 | --- | --- |
@@ -212,22 +225,22 @@ deploy_start.py    生产启动脚本（Gunicorn + Uvicorn Worker）
 
 | 文档 | 内容 |
 | --- | --- |
-| [`moderation-v2.md`](docs/moderation-v2.md) | 审核、处罚、举报、风纪委员的接口契约 |
-| [`jury-v2.md`](docs/jury-v2.md) | 风纪系统 v2：考试、合议、复审、判例、议事厅 |
-| [`jury-demo.md`](docs/jury-demo.md) | 风纪系统本地联调实例 |
-| [`device-bans.md`](docs/device-bans.md) | 设备信号、账号关联与设备封禁 |
-| [`chat-features.md`](docs/chat-features.md) | 投票、正在输入、群表情、戳一戳、公告回应、资料点赞等 |
-| [`group-plus.md`](docs/group-plus.md) | 群升级、群文件、永久精华、群待办、聊天记录搜索 |
-| [`group-announcements.md`](docs/group-announcements.md) | 群公告 v2 |
-| [`group-levels.md`](docs/group-levels.md) | 群等级与等级头衔 |
-| [`account-level.md`](docs/account-level.md) | 账号等级 |
-| [`intimacy.md`](docs/intimacy.md) | 好友亲密度与好友成就 |
-| [`sparks.md`](docs/sparks.md) | 好友火花 |
-| [`shop.md`](docs/shop.md) | 商店 |
-| [`gifts.md`](docs/gifts.md) | 礼物 |
-| [`red-packets.md`](docs/red-packets.md) | 红包 |
-| [`releases.md`](docs/releases.md) | 发版服务：应用版本、安装包、更新日志、自动更新 |
-| [`postgres-cutover.md`](docs/postgres-cutover.md) | 从 SQLite 切换到 PostgreSQL 的手册 |
+| <img src=".github/assets/icons/file-text.svg" width="16" height="16" align="absmiddle">&nbsp;[`moderation-v2.md`](docs/moderation-v2.md) | 审核、处罚、举报、风纪委员的接口契约 |
+| <img src=".github/assets/icons/file-text.svg" width="16" height="16" align="absmiddle">&nbsp;[`jury-v2.md`](docs/jury-v2.md) | 风纪系统 v2：考试、合议、复审、判例、议事厅 |
+| <img src=".github/assets/icons/file-text.svg" width="16" height="16" align="absmiddle">&nbsp;[`jury-demo.md`](docs/jury-demo.md) | 风纪系统本地联调实例 |
+| <img src=".github/assets/icons/file-text.svg" width="16" height="16" align="absmiddle">&nbsp;[`device-bans.md`](docs/device-bans.md) | 设备信号、账号关联与设备封禁 |
+| <img src=".github/assets/icons/file-text.svg" width="16" height="16" align="absmiddle">&nbsp;[`chat-features.md`](docs/chat-features.md) | 投票、正在输入、群表情、戳一戳、公告回应、资料点赞等 |
+| <img src=".github/assets/icons/file-text.svg" width="16" height="16" align="absmiddle">&nbsp;[`group-plus.md`](docs/group-plus.md) | 群升级、群文件、永久精华、群待办、聊天记录搜索 |
+| <img src=".github/assets/icons/file-text.svg" width="16" height="16" align="absmiddle">&nbsp;[`group-announcements.md`](docs/group-announcements.md) | 群公告 v2 |
+| <img src=".github/assets/icons/file-text.svg" width="16" height="16" align="absmiddle">&nbsp;[`group-levels.md`](docs/group-levels.md) | 群等级与等级头衔 |
+| <img src=".github/assets/icons/file-text.svg" width="16" height="16" align="absmiddle">&nbsp;[`account-level.md`](docs/account-level.md) | 账号等级 |
+| <img src=".github/assets/icons/file-text.svg" width="16" height="16" align="absmiddle">&nbsp;[`intimacy.md`](docs/intimacy.md) | 好友亲密度与好友成就 |
+| <img src=".github/assets/icons/file-text.svg" width="16" height="16" align="absmiddle">&nbsp;[`sparks.md`](docs/sparks.md) | 好友火花 |
+| <img src=".github/assets/icons/file-text.svg" width="16" height="16" align="absmiddle">&nbsp;[`shop.md`](docs/shop.md) | 商店 |
+| <img src=".github/assets/icons/file-text.svg" width="16" height="16" align="absmiddle">&nbsp;[`gifts.md`](docs/gifts.md) | 礼物 |
+| <img src=".github/assets/icons/file-text.svg" width="16" height="16" align="absmiddle">&nbsp;[`red-packets.md`](docs/red-packets.md) | 红包 |
+| <img src=".github/assets/icons/file-text.svg" width="16" height="16" align="absmiddle">&nbsp;[`releases.md`](docs/releases.md) | 发版服务：应用版本、安装包、更新日志、自动更新 |
+| <img src=".github/assets/icons/file-text.svg" width="16" height="16" align="absmiddle">&nbsp;[`postgres-cutover.md`](docs/postgres-cutover.md) | 从 SQLite 切换到 PostgreSQL 的手册 |
 
 ## 部署
 
@@ -258,9 +271,9 @@ proxy_set_header Connection "upgrade";
 
 | 仓库 | 说明 |
 | --- | --- |
-| [KukeChat-Client](https://github.com/kukemc/KukeChat-Client) | 社区扩展、桌面端与 H5 |
-| [KukeChat-Android](https://github.com/kukemc/KukeChat-Android) | 原生 Android 客户端，Kotlin + Jetpack Compose |
-| **KukeChat-Server** | 本仓库：后端 API 与实时服务 |
+| <img src=".github/assets/icons/monitor.svg" width="16" height="16" align="absmiddle">&nbsp;[KukeChat-Client](https://github.com/kukemc/KukeChat-Client) | 社区扩展与桌面端（Windows，macOS 测试中） |
+| <img src=".github/assets/icons/smartphone.svg" width="16" height="16" align="absmiddle">&nbsp;[KukeChat-Android](https://github.com/kukemc/KukeChat-Android) | 原生 Android 客户端，Kotlin + Jetpack Compose |
+| <img src=".github/assets/icons/server.svg" width="16" height="16" align="absmiddle">&nbsp;**KukeChat-Server** | 本仓库：后端 API 与实时服务 |
 
 ## 贡献
 

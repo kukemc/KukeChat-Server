@@ -8,11 +8,20 @@
 
 The server behind KukeChat: a FastAPI application that carries direct messages, group chats, community posts and community self-moderation over REST and WebSocket.
 
-[![License](https://img.shields.io/badge/License-MIT-111111?style=flat-square)](LICENSE)
-[![Python](https://img.shields.io/badge/Python-3.11%2B-111111?style=flat-square)](https://www.python.org)
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.110%2B-111111?style=flat-square)](https://fastapi.tiangolo.com)
-[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-15-111111?style=flat-square)](https://www.postgresql.org)
-[![CI](https://img.shields.io/github/actions/workflow/status/kukemc/KukeChat-Server/ci.yml?branch=main&style=flat-square&label=CI&color=111111)](https://github.com/kukemc/KukeChat-Server/actions/workflows/ci.yml)
+<p align="center">
+<img src=".github/assets/icons/lock.svg" width="16" height="16" align="absmiddle">&nbsp;Private chats stay private&emsp;&emsp;
+<img src=".github/assets/icons/radio.svg" width="16" height="16" align="absmiddle">&nbsp;REST + WebSocket&emsp;&emsp;
+<img src=".github/assets/icons/scale.svg" width="16" height="16" align="absmiddle">&nbsp;Community self-moderation&emsp;&emsp;
+<img src=".github/assets/icons/server.svg" width="16" height="16" align="absmiddle">&nbsp;Self-hostable
+</p>
+
+[![License](https://img.shields.io/badge/License-MIT-111111?style=flat-square&logo=opensourceinitiative&logoColor=white)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.11%2B-111111?style=flat-square&logo=python&logoColor=white)](https://www.python.org)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.110%2B-111111?style=flat-square&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-15-111111?style=flat-square&logo=postgresql&logoColor=white)](https://www.postgresql.org)
+[![Redis](https://img.shields.io/badge/Redis-7-111111?style=flat-square&logo=redis&logoColor=white)](https://redis.io)
+[![Docker](https://img.shields.io/badge/Docker-Compose-111111?style=flat-square&logo=docker&logoColor=white)](docker-compose.yml)
+[![CI](https://img.shields.io/github/actions/workflow/status/kukemc/KukeChat-Server/ci.yml?branch=main&style=flat-square&label=CI&color=111111&logo=githubactions&logoColor=white)](https://github.com/kukemc/KukeChat-Server/actions/workflows/ci.yml)
 
 [简体中文](README.md) · **English**
 
@@ -74,20 +83,24 @@ If you deploy this service, you are the one in control of this data. At a minimu
 
 ## Features
 
-| Area | Capabilities |
+| &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Area&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; | Capabilities |
 | --- | --- |
-| Messaging | Direct messages, group chats, temporary conversations; text, images, voice, stickers; replies, @mentions, reactions, pokes; recall, forwarding and bundled forwarding, bookmarks, featured messages; polls; typing indicators; voice-to-text (requires a speech recognition service); chat history search limited to your own conversations |
-| Groups | Roles and permissions, mutes, slow mode, join approval, invite links; member titles, group levels, check-in leaderboards; group announcements; group emojis; group upgrades (member limit, group files, permanent featured messages, group to-dos) |
-| Social | Friends and friend requests, friend intimacy and achievements, friend sparks, profile likes, account levels, birthdays |
-| Community | Posts (topics, comments, likes, pinning), team-up hub, collaborative tasks, site announcements with reactions, notifications |
-| Coins | Shop cosmetics, gifts, red packets (fixed, random-split, chain, voice passphrase, targeted); balances come from an external coin ledger — see [Integration points](#integration-points) |
-| Bots | Bot directory with reviews, installing bots into groups, Bot API (key auth) with real-time events over `/bot/ws`, interactive button components in messages |
-| Governance | Reports grouped into cases, a violation ledger with escalating penalties, appeals; community jury (exam, voting, senior panels and re-review, precedents, assembly hall); external content moderation; device bans and registration limits; audit log |
-| Platform | CCW account binding and profile sync, game mode (chat embedded in a project), app releases and update checks, download page, a public data endpoint for project showcase pages, local or S3-compatible storage, SMTP email, health checks |
+| <img src=".github/assets/icons/message-circle.svg" width="16" height="16" align="absmiddle">&nbsp;Messaging | Direct messages, group chats, temporary conversations; text, images, voice, stickers; replies, @mentions, reactions, pokes; recall, forwarding and bundled forwarding, bookmarks, featured messages; polls; typing indicators; voice-to-text (requires a speech recognition service); chat history search limited to your own conversations |
+| <img src=".github/assets/icons/users.svg" width="16" height="16" align="absmiddle">&nbsp;Groups | Roles and permissions, mutes, slow mode, join approval, invite links; member titles, group levels, check-in leaderboards; group announcements; group emojis; group upgrades (member limit, group files, permanent featured messages, group to-dos) |
+| <img src=".github/assets/icons/heart.svg" width="16" height="16" align="absmiddle">&nbsp;Social | Friends and friend requests, friend intimacy and achievements, friend sparks, profile likes, account levels, birthdays |
+| <img src=".github/assets/icons/newspaper.svg" width="16" height="16" align="absmiddle">&nbsp;Community | Posts (topics, comments, likes, pinning), team-up hub, collaborative tasks, site announcements with reactions, notifications |
+| <img src=".github/assets/icons/coins.svg" width="16" height="16" align="absmiddle">&nbsp;Coins | Shop cosmetics, gifts, red packets (fixed, random-split, chain, voice passphrase, targeted); balances come from an external coin ledger — see [Integration points](#integration-points) |
+| <img src=".github/assets/icons/bot.svg" width="16" height="16" align="absmiddle">&nbsp;Bots | Bot directory with reviews, installing bots into groups, Bot API (key auth) with real-time events over `/bot/ws`, interactive button components in messages |
+| <img src=".github/assets/icons/shield-check.svg" width="16" height="16" align="absmiddle">&nbsp;Governance | Reports grouped into cases, a violation ledger with escalating penalties, appeals; community jury (exam, voting, senior panels and re-review, precedents, assembly hall); external content moderation; device bans and registration limits; audit log |
+| <img src=".github/assets/icons/plug.svg" width="16" height="16" align="absmiddle">&nbsp;Platform | CCW account binding and profile sync, game mode (chat embedded in a project), app releases and update checks, download page, a public data endpoint for project showcase pages, local or S3-compatible storage, SMTP email, health checks |
 
 Bot integration docs live in the client repository: [`docs/bot-api.md`](https://github.com/kukemc/KukeChat-Client/blob/main/docs/bot-api.md).
 
 ## Tech stack
+
+<p align="center">
+<img src="https://skillicons.dev/icons?i=py,fastapi,postgres,sqlite,redis,docker,nginx&theme=dark" height="40" alt="Python, FastAPI, PostgreSQL, SQLite, Redis, Docker, Nginx">
+</p>
 
 | Layer | Choice |
 | --- | --- |
@@ -212,22 +225,22 @@ Real-time channels: `/ws` (users), `/admin/ws` (admin refresh signals), `/bot/ws
 
 | Document | Contents |
 | --- | --- |
-| [`moderation-v2.md`](docs/moderation-v2.md) | API contract for moderation, penalties, reports and the community jury |
-| [`jury-v2.md`](docs/jury-v2.md) | Jury system v2: exams, panels, re-review, precedents, assembly hall |
-| [`jury-demo.md`](docs/jury-demo.md) | A local end-to-end demo instance of the jury system |
-| [`device-bans.md`](docs/device-bans.md) | Device signals, linked accounts and device bans |
-| [`chat-features.md`](docs/chat-features.md) | Polls, typing indicators, group emojis, pokes, announcement reactions, profile likes and more |
-| [`group-plus.md`](docs/group-plus.md) | Group upgrades, group files, permanent featured messages, group to-dos, chat history search |
-| [`group-announcements.md`](docs/group-announcements.md) | Group announcements v2 |
-| [`group-levels.md`](docs/group-levels.md) | Group levels and level titles |
-| [`account-level.md`](docs/account-level.md) | Account levels |
-| [`intimacy.md`](docs/intimacy.md) | Friend intimacy and friend achievements |
-| [`sparks.md`](docs/sparks.md) | Friend sparks |
-| [`shop.md`](docs/shop.md) | Shop |
-| [`gifts.md`](docs/gifts.md) | Gifts |
-| [`red-packets.md`](docs/red-packets.md) | Red packets |
-| [`releases.md`](docs/releases.md) | Release service: app versions, installers, changelogs, auto-update |
-| [`postgres-cutover.md`](docs/postgres-cutover.md) | Runbook for switching from SQLite to PostgreSQL |
+| <img src=".github/assets/icons/file-text.svg" width="16" height="16" align="absmiddle">&nbsp;[`moderation-v2.md`](docs/moderation-v2.md) | API contract for moderation, penalties, reports and the community jury |
+| <img src=".github/assets/icons/file-text.svg" width="16" height="16" align="absmiddle">&nbsp;[`jury-v2.md`](docs/jury-v2.md) | Jury system v2: exams, panels, re-review, precedents, assembly hall |
+| <img src=".github/assets/icons/file-text.svg" width="16" height="16" align="absmiddle">&nbsp;[`jury-demo.md`](docs/jury-demo.md) | A local end-to-end demo instance of the jury system |
+| <img src=".github/assets/icons/file-text.svg" width="16" height="16" align="absmiddle">&nbsp;[`device-bans.md`](docs/device-bans.md) | Device signals, linked accounts and device bans |
+| <img src=".github/assets/icons/file-text.svg" width="16" height="16" align="absmiddle">&nbsp;[`chat-features.md`](docs/chat-features.md) | Polls, typing indicators, group emojis, pokes, announcement reactions, profile likes and more |
+| <img src=".github/assets/icons/file-text.svg" width="16" height="16" align="absmiddle">&nbsp;[`group-plus.md`](docs/group-plus.md) | Group upgrades, group files, permanent featured messages, group to-dos, chat history search |
+| <img src=".github/assets/icons/file-text.svg" width="16" height="16" align="absmiddle">&nbsp;[`group-announcements.md`](docs/group-announcements.md) | Group announcements v2 |
+| <img src=".github/assets/icons/file-text.svg" width="16" height="16" align="absmiddle">&nbsp;[`group-levels.md`](docs/group-levels.md) | Group levels and level titles |
+| <img src=".github/assets/icons/file-text.svg" width="16" height="16" align="absmiddle">&nbsp;[`account-level.md`](docs/account-level.md) | Account levels |
+| <img src=".github/assets/icons/file-text.svg" width="16" height="16" align="absmiddle">&nbsp;[`intimacy.md`](docs/intimacy.md) | Friend intimacy and friend achievements |
+| <img src=".github/assets/icons/file-text.svg" width="16" height="16" align="absmiddle">&nbsp;[`sparks.md`](docs/sparks.md) | Friend sparks |
+| <img src=".github/assets/icons/file-text.svg" width="16" height="16" align="absmiddle">&nbsp;[`shop.md`](docs/shop.md) | Shop |
+| <img src=".github/assets/icons/file-text.svg" width="16" height="16" align="absmiddle">&nbsp;[`gifts.md`](docs/gifts.md) | Gifts |
+| <img src=".github/assets/icons/file-text.svg" width="16" height="16" align="absmiddle">&nbsp;[`red-packets.md`](docs/red-packets.md) | Red packets |
+| <img src=".github/assets/icons/file-text.svg" width="16" height="16" align="absmiddle">&nbsp;[`releases.md`](docs/releases.md) | Release service: app versions, installers, changelogs, auto-update |
+| <img src=".github/assets/icons/file-text.svg" width="16" height="16" align="absmiddle">&nbsp;[`postgres-cutover.md`](docs/postgres-cutover.md) | Runbook for switching from SQLite to PostgreSQL |
 
 The documents are written in Chinese.
 
@@ -260,9 +273,9 @@ proxy_set_header Connection "upgrade";
 
 | Repository | Description |
 | --- | --- |
-| [KukeChat-Client](https://github.com/kukemc/KukeChat-Client) | Community extension, desktop app and H5 |
-| [KukeChat-Android](https://github.com/kukemc/KukeChat-Android) | Native Android client, Kotlin + Jetpack Compose |
-| **KukeChat-Server** | This repository: the backend API and real-time service |
+| <img src=".github/assets/icons/monitor.svg" width="16" height="16" align="absmiddle">&nbsp;[KukeChat-Client](https://github.com/kukemc/KukeChat-Client) | Community extension and desktop app (Windows; macOS in beta) |
+| <img src=".github/assets/icons/smartphone.svg" width="16" height="16" align="absmiddle">&nbsp;[KukeChat-Android](https://github.com/kukemc/KukeChat-Android) | Native Android client, Kotlin + Jetpack Compose |
+| <img src=".github/assets/icons/server.svg" width="16" height="16" align="absmiddle">&nbsp;**KukeChat-Server** | This repository: the backend API and real-time service |
 
 ## Contributing
 
