@@ -496,6 +496,14 @@ async def send_gift(db: AsyncSession, user: User, payload: dict[str, Any]) -> tu
     if not config["enabled"]:
         raise _error(status.HTTP_403_FORBIDDEN, "disabled", "礼物功能还没有开放")
 
+    # 「我的设备」会话里不能送礼（docs/self-chat.md 第 4 节）：先说清楚原因，不报「不能送给这个人」
+    raw_conversation_id = _positive_int(payload.get("conversation_id"))
+    if raw_conversation_id is not None and await _is_member(db, raw_conversation_id, user_id) is not None:
+        target_conversation = await db.get(Conversation, raw_conversation_id)
+        if target_conversation is not None and target_conversation.type == ConversationType.SELF:
+            from app.services.conversations import self_chat_unsupported
+
+            raise self_chat_unsupported("送礼物")
     to_user_id = _positive_int(payload.get("to_user_id"))
     to_user = await db.get(User, to_user_id) if to_user_id is not None and to_user_id != user_id else None
     # 机器人收不了礼物：没有人会看到，币白花

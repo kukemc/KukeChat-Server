@@ -689,6 +689,11 @@ async def send_red_packet(db: AsyncSession, user: User, payload: dict[str, Any])
     conversation = await db.get(Conversation, conversation_id)
     if conversation is None:
         raise _not_member()
+    if conversation.type == ConversationType.SELF:
+        # 「我的设备」会话里只有自己（docs/self-chat.md 第 4 节）
+        from app.services.conversations import self_chat_unsupported
+
+        raise self_chat_unsupported("发红包")
     _ensure_not_muted(user)
     direct = conversation.type != ConversationType.GROUP
     if not direct and member.role not in STAFF_ROLES:

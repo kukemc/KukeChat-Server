@@ -369,6 +369,8 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("report_cases", "bank_audit_at", "bank_audit_at DATETIME"),
     ("report_cases", "bank_audit_flag", "bank_audit_flag VARCHAR(8)"),
     ("user_violations", "appeal_judge_p", "appeal_judge_p FLOAT"),
+    # 「我的设备」会话的主人（docs/self-chat.md）
+    ("conversations", "self_owner_id", "self_owner_id INTEGER"),
 )
 
 _ADDED_INDEXES: tuple[tuple[str, str], ...] = (
@@ -439,6 +441,8 @@ _ADDED_INDEXES: tuple[tuple[str, str], ...] = (
         "content_moderation_records",
         "CREATE INDEX IF NOT EXISTS ix_moderation_records_created_risk ON content_moderation_records (created_at, risk_score) WHERE risk_score IS NOT NULL",
     ),
+    # 每人最多一个「我的设备」会话（docs/self-chat.md）；新库由模型的 Index 建好，这里只给老库补
+    ("conversations", "CREATE UNIQUE INDEX IF NOT EXISTS uq_conversations_self_owner ON conversations (self_owner_id)"),
 )
 
 # 存量数据的回填，可重复执行（WHERE 条件挡住已经回填过的行）。布尔值一律走绑定参数，SQLite 的 1 / PG 的 true 由驱动处理。

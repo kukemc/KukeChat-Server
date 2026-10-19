@@ -84,6 +84,12 @@ def _system_message_not_reportable() -> HTTPException:
     )
 
 
+def _self_chat_not_reportable() -> HTTPException:
+    from app.services.conversations import self_chat_unsupported
+
+    return self_chat_unsupported("举报")
+
+
 async def create_report(db: AsyncSession, reporter_id: int, payload: ReportCreate) -> UserReport:
     case_service.validate_report_payload(
         payload.target_type, payload.reason.strip(), payload.details, payload.attachments, payload.evidence_message_ids
@@ -100,11 +106,14 @@ async def create_report(db: AsyncSession, reporter_id: int, payload: ReportCreat
                 status_code=status.HTTP_409_CONFLICT,
                 detail={"code": "already_handled", "message": "这条消息已经被处理过了"},
             )
+        conversation = await db.get(Conversation, message.conversation_id)
+        if conversation is not None and conversation.type == ConversationType.SELF:
+            # 「我的设备」会话里只有自己的消息（docs/self-chat.md 第 4 节）
+            raise _self_chat_not_reportable()
         if message.sender_id == reporter_id:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot report your own message")
         if message.type == MessageType.SYSTEM:
             raise _system_message_not_reportable()
-        conversation = await db.get(Conversation, message.conversation_id)
         conversation_id = message.conversation_id
         message_id = message.id
         reported_user_id = message.sender_id
@@ -119,6 +128,8 @@ async def create_report(db: AsyncSession, reporter_id: int, payload: ReportCreat
         conversation = await db.get(Conversation, payload.target_id)
         if conversation is None or not await _can_view_conversation(db, payload.target_id, reporter_id):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
+        if conversation.type == ConversationType.SELF:
+            raise _self_chat_not_reportable()
         conversation_id = conversation.id
         target_snapshot = await _conversation_report_snapshot(db, conversation, reporter_id)
     else:
@@ -1700,6 +1711,9 @@ async def list_conversations(
     stmt = select(Conversation)
     if conversation_type is not None:
         stmt = stmt.where(Conversation.type == conversation_type)
+    else:
+        # 每个用户都有一个「我的设备」会话（docs/self-chat.md），默认不列，免得把私聊和群聊淹掉；要看传 type=self
+        stmt = stmt.where(Conversation.type != ConversationType.SELF)
     if participant_user_id is not None:
         stmt = stmt.where(
             exists().where(
@@ -1784,7 +1798,11 @@ async def build_conversation_reads(db: AsyncSession, items: list[Conversation]) 
             id=item.id,
             type=conversation_type,
             title=item.title,
-            display_title=" ↔ ".join(direct_names.get(item.id, [])) if conversation_type == ConversationType.DIRECT.value else item.title or "未命名群聊",
+            display_title=(
+                " ↔ ".join(direct_names.get(item.id, []))
+                if conversation_type == ConversationType.DIRECT.value
+                else "我的设备" if conversation_type == ConversationType.SELF.value else item.title or "未命名群聊"
+            ),
             avatar_url=item.avatar_url,
             description=item.description,
             category=item.category,

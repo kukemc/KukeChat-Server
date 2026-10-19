@@ -605,7 +605,12 @@ def _disposition(name: str) -> str:
 
 async def download(db: AsyncSession, user_id: int, conversation_id: int, file_id: int) -> Response:
     row = await _downloadable(db, user_id, conversation_id, file_id)
-    name, key = row.name, row.storage_key
+    return await stored_file_response(db, row.storage_key, row.name)
+
+
+async def stored_file_response(db: AsyncSession, key: str, name: str) -> Response:
+    """私有前缀里一个对象的下载响应（群文件、「我的设备」临时文件共用）：本地存储直接发文件；开了直连 302 到预签名地址；
+    否则从对象存储边读边发。一律 attachment + octet-stream，不内联渲染。"""
     headers = {
         "Content-Disposition": _disposition(name),
         "X-Content-Type-Options": "nosniff",

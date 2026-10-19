@@ -22,7 +22,7 @@ from app.models.user import User
 from app.schemas.message import FeaturedMessageRead, MessageRead, MessageReactionSummary, ReadReceipt
 from app.schemas.user import UserPublic
 from app.services.penalties import ensure_can_post
-from app.services.conversations import _member_mute_expired, clear_expired_member_mute, require_membership
+from app.services.conversations import SELF_TITLE, _member_mute_expired, clear_expired_member_mute, require_membership, self_chat_unsupported
 from app.services import group_activity as group_activity_service
 from app.services import group_snapshots
 from app.services.ccw import enrich_metadata_with_previews, extract_creation_refs
@@ -36,6 +36,8 @@ MAX_BOT_MESSAGE_CONTENT_LENGTH = 8000
 MESSAGE_RATE_LIMIT_PER_MINUTE = 20
 MAX_MESSAGES_PER_CONVERSATION = 1000
 PRUNE_BATCH_SIZE = 25
+# 「我的设备」会话里不能发的消息类型（docs/self-chat.md 第 4 节）→ 报错里说的功能名
+_SELF_CHAT_BLOCKED_TYPES = {MessageType.POLL: "发投票", MessageType.RED_PACKET: "发红包", MessageType.GIFT: "送礼物"}
 
 
 async def _enforce_message_rate_limit(
@@ -396,6 +398,16 @@ async def _message_sender_titles(
     return titles
 
 
+def _read_metadata(metadata_json: str | None) -> dict[str, Any] | None:
+    """返回给客户端的 metadata。「我的设备」的临时文件（metadata.transfer）现场补上 expired（docs/self-chat.md 5.3）。"""
+    metadata = _metadata_from_json(metadata_json)
+    if metadata is not None and isinstance(metadata.get("transfer"), dict):
+        from app.services import self_chat
+
+        metadata["transfer"] = self_chat.transfer_metadata_view(metadata["transfer"])
+    return metadata
+
+
 def _message_read_from_orm(
     message: Message,
     reactions: list[MessageReactionSummary],
@@ -415,7 +427,7 @@ def _message_read_from_orm(
         sender_level=sender_level,
         type=message.type,
         content=message.content,
-        metadata=_metadata_from_json(message.metadata_json),
+        metadata=_read_metadata(message.metadata_json),
         created_at=message.created_at,
         recalled_at=message.recalled_at,
         recalled_by_id=message.recalled_by_id,
@@ -600,7 +612,9 @@ async def send_message(
     allow_gift: bool = False,
     allow_file: bool = False,
     allow_group_todo: bool = False,
+    allow_transfer: bool = False,
     red_packet_chain: bool = False,
+    device: str | None = None,
     commit: bool = True,
 ) -> Message:
     """commit=False：消息只 flush 不提交，由调用方和自己的改动一起提交（发红包、送礼用：扣款、记录、消息要么都成要么都不成）。
@@ -636,6 +650,9 @@ async def send_message(
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail={"code": "group_todo_not_sendable", "message": "群待办提醒只能通过群待办接口发送"}
         )
+    # 「我的设备」的临时文件消息（metadata.transfer）只能由 transfers/complete 创建；客户端原样转发出去的同样拦掉
+    if isinstance(metadata, dict) and "transfer" in metadata and not allow_transfer:
+        raise _transfer_not_forwardable()
     max_content_length = MAX_BOT_MESSAGE_CONTENT_LENGTH if sender.is_bot else MAX_MESSAGE_CONTENT_LENGTH
     if len(content) > max_content_length:
         detail = (
@@ -663,6 +680,15 @@ async def send_message(
     conversation = await db.get(Conversation, conversation_id)
     if conversation is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
+    self_chat = conversation.type == ConversationType.SELF
+    if self_chat:
+        # 「我的设备」会话只有自己（docs/self-chat.md 第 4 节）：投票、红包、礼物、@ 都没有意义
+        if message_type in _SELF_CHAT_BLOCKED_TYPES:
+            raise self_chat_unsupported(_SELF_CHAT_BLOCKED_TYPES[message_type])
+        if _mentioned_user_ids(metadata) or _metadata_mentions_all(metadata):
+            raise self_chat_unsupported("@ 人")
+    elif allow_transfer:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Transfers are only available in the self conversation")
     if conversation.type == ConversationType.GROUP and membership.role not in STAFF_ROLES:
         if conversation.all_muted:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="This group is muted")
@@ -708,6 +734,11 @@ async def send_message(
     if membership.muted:
         await clear_expired_member_mute(db, membership, now)
 
+    if self_chat:
+        # 哪种设备发的：服务端按请求头记，客户端带的 device 一律覆盖（客户端据此决定气泡放左边还是右边）
+        from app.services.self_chat import normalize_device
+
+        metadata = {**(metadata or {}), "device": normalize_device(device)}
     message = Message(
         conversation_id=conversation_id,
         sender_id=sender.id,
@@ -718,6 +749,9 @@ async def send_message(
     db.add(message)
     await db.flush()
     message.sender = sender
+    if self_chat:
+        # 接口层据此跳过机器审核、后台刷新信号（docs/self-chat.md 第 4 节）
+        setattr(message, "_self_chat", True)
     setattr(message, "_sender_display_name", membership.nickname)
     setattr(message, "_sender_title", membership.title)
     previous_level = membership.level
@@ -828,6 +862,18 @@ def _red_packet_not_forwardable() -> HTTPException:
     return HTTPException(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail={"code": "red_packet_not_forwardable", "message": "红包不能转发"}
     )
+
+
+def _transfer_not_forwardable() -> HTTPException:
+    """「我的设备」的临时文件不能转发、不能当普通消息再发一遍（docs/self-chat.md 5.5）。"""
+    return HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail={"code": "transfer_not_forwardable", "message": "临时文件不能转发"}
+    )
+
+
+def _is_transfer_message(message: Message) -> bool:
+    metadata = _metadata_from_json(message.metadata_json)
+    return isinstance(metadata, dict) and "transfer" in metadata
 
 
 def _gift_not_forwardable() -> HTTPException:
@@ -982,7 +1028,7 @@ async def hide_message_for_user(db: AsyncSession, conversation_id: int, actor_id
 
 
 async def toggle_message_bookmark(db: AsyncSession, conversation_id: int, actor_id: int, message_id: int) -> bool:
-    await _get_visible_message(db, conversation_id, actor_id, message_id, allow_recalled=False)
+    message = await _get_visible_message(db, conversation_id, actor_id, message_id, allow_recalled=False)
     result = await db.execute(
         select(MessageBookmark).where(
             MessageBookmark.message_id == message_id,
@@ -991,6 +1037,11 @@ async def toggle_message_bookmark(db: AsyncSession, conversation_id: int, actor_
     )
     bookmark = result.scalar_one_or_none()
     if bookmark is None:
+        if _is_transfer_message(message):
+            # 临时文件 24 小时后就没了，收藏了也打不开（docs/self-chat.md 5.5）
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail={"code": "transfer_not_savable", "message": "临时文件不能收藏"}
+            )
         db.add(MessageBookmark(message_id=message_id, user_id=actor_id))
         bookmarked = True
     else:
@@ -1061,6 +1112,8 @@ async def toggle_featured_message(db: AsyncSession, conversation_id: int, actor_
     conversation = await db.get(Conversation, conversation_id)
     if conversation is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
+    if conversation.type == ConversationType.SELF:
+        raise self_chat_unsupported("设精华")
     if conversation.type != ConversationType.GROUP:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only group messages can be featured")
     if actor.role not in STAFF_ROLES:
@@ -1519,6 +1572,8 @@ async def _conversation_snapshot_title(db: AsyncSession, conversation: Conversat
         )
     )
     membership = membership_result.scalar_one_or_none()
+    if conversation.type == ConversationType.SELF:
+        return SELF_TITLE
     if conversation.type == ConversationType.GROUP:
         if membership is not None and membership.remark:
             return membership.remark
@@ -1544,6 +1599,7 @@ async def create_forward_bundle(
     source_conversation_id: int,
     message_ids: list[int],
     note: str | None = None,
+    device: str | None = None,
 ) -> Message:
     ensure_can_post(actor)
     source_membership = await require_membership(db, source_conversation_id, actor.id)
@@ -1584,6 +1640,8 @@ async def create_forward_bundle(
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail={"code": "file_not_forwardable", "message": "文件消息不能转发"}
             )
+        if isinstance(meta, dict) and "transfer" in meta:
+            raise _transfer_not_forwardable()
 
     source_title = await _conversation_snapshot_title(db, source_conversation, actor.id)
     metadata: dict[str, Any] = {
@@ -1613,6 +1671,7 @@ async def create_forward_bundle(
         f"{source_title} 的聊天记录",
         MessageType.FORWARD_BUNDLE,
         metadata,
+        device=device,
     )
 
 

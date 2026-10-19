@@ -4,7 +4,7 @@ from datetime import date, datetime, timezone
 
 UTC = timezone.utc
 
-from sqlalchemy import Boolean, Date, DateTime, Enum as SAEnum, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, Date, DateTime, Enum as SAEnum, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -18,6 +18,8 @@ def utc_now() -> datetime:
 
 class Conversation(Base):
     __tablename__ = "conversations"
+    # 每人最多一个「我的设备」会话（docs/self-chat.md）。NULL 不参与唯一约束，私聊 / 群聊都是 NULL
+    __table_args__ = (Index("uq_conversations_self_owner", "self_owner_id", unique=True),)
 
     id: Mapped[int] = mapped_column(primary_key=True, index=True)
     type: Mapped[ConversationType] = mapped_column(SAEnum(ConversationType, native_enum=False), index=True)
@@ -45,6 +47,9 @@ class Conversation(Base):
     level_titles: Mapped[str | None] = mapped_column(Text, nullable=True)
     task_creation_permission: Mapped[str] = mapped_column(String(20), default="members", server_default="members")
     direct_key: Mapped[str | None] = mapped_column(String(80), unique=True, nullable=True, index=True)
+    # 「我的设备」会话（type = self）的主人；别的会话为空。不建外键：线上 SQLite 这一列是后加的，本来就加不上外键，
+    # 两种库保持一致；用户注销时成员行级联删掉，这一行留着也没人能进来
+    self_owner_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # 最近一条 @全体成员 的消息（docs/chat-features.md 第 7 节）。不建外键：只拿来和成员的已读位置比大小
     last_mention_all_message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # 群升级（docs/group-plus.md）：记录的档位和到期时间。有效档位要看到期时间（core/group_plus_tiers.conversation_tier）

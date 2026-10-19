@@ -24,7 +24,7 @@ from app.models.user import User
 from app.schemas.message import MessageRead
 from app.schemas.poll import PollCreate
 from app.services import messages as message_service
-from app.services.conversations import STAFF_ROLES, require_membership
+from app.services.conversations import STAFF_ROLES, require_membership, self_chat_unsupported
 
 UTC = timezone.utc
 MAX_TITLE_LENGTH = 80
@@ -89,6 +89,11 @@ def fallback_text(title: str, options: list[str]) -> str:
 
 async def create_poll(db: AsyncSession, conversation_id: int, actor: User, payload: PollCreate) -> Message:
     title, options, closes_at = _normalize(payload)
+    # 「我的设备」会话里不能发投票（docs/self-chat.md 第 4 节）。在审核标题之前挡掉，不为它调审核服务
+    conversation = await db.get(Conversation, conversation_id)
+    if conversation is not None and conversation.type == ConversationType.SELF:
+        await require_membership(db, conversation_id, actor.id, clear_expired_mute=False)
+        raise self_chat_unsupported("发投票")
     await _ensure_text_allowed(db, actor, "\n".join([title, *options]), f"poll:{conversation_id}")
     definition = {
         "id": None,

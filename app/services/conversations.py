@@ -37,6 +37,16 @@ from app.services.upload_paths import require_avatar_upload_url
 
 
 STAFF_ROLES = {MemberRole.OWNER, MemberRole.ADMIN}
+# 「我的设备」会话（type = self，docs/self-chat.md）在服务端的显示名。客户端按自己是哪种设备显示「我的手机」/「我的电脑」
+SELF_TITLE = "我的设备"
+
+
+def self_chat_unsupported(feature: str = "这样操作") -> HTTPException:
+    """「我的设备」会话里不支持的功能（红包、礼物、投票、@、成员管理、举报……）统一返回这个（docs/self-chat.md 第 4 节）。"""
+    return HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail={"code": "self_chat_unsupported", "message": f"「{SELF_TITLE}」里不能{feature}"},
+    )
 
 
 def _clean_text(value: str | None) -> str | None:
@@ -96,6 +106,8 @@ async def clear_expired_mutes_for_conversation(db: AsyncSession, conversation_id
 
 
 def _conversation_display_title(conversation: Conversation, membership: ConversationMember, direct_user: User | None = None) -> str:
+    if conversation.type == ConversationType.SELF:
+        return SELF_TITLE
     if conversation.type == ConversationType.GROUP:
         return _clean_text(membership.remark) or _clean_text(conversation.title) or "未命名群聊"
     return _user_display_name(direct_user, _clean_text(conversation.title) or "私聊")
@@ -147,6 +159,9 @@ async def get_member(db: AsyncSession, conversation_id: int, user_id: int, *, cl
 
 async def require_group_conversation(db: AsyncSession, conversation_id: int) -> Conversation:
     conversation = await get_conversation(db, conversation_id)
+    if conversation.type == ConversationType.SELF:
+        # 加人、进群、群设置、机器人……都走这里：「我的设备」会话只有自己，这些一律不支持
+        raise self_chat_unsupported("管理成员或修改群设置")
     if conversation.type != ConversationType.GROUP:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This operation is only available in group conversations")
     return conversation
@@ -900,6 +915,8 @@ async def remove_member(db: AsyncSession, conversation_id: int, actor_id: int, t
 async def leave_group(db: AsyncSession, conversation_id: int, user_id: int) -> None:
     membership = await require_membership(db, conversation_id, user_id)
     conversation = await get_conversation(db, conversation_id)
+    if conversation.type == ConversationType.SELF:
+        raise self_chat_unsupported("退出")
     if conversation.type != ConversationType.GROUP:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Direct conversations cannot be left")
     if membership.role == MemberRole.OWNER:

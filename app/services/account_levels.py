@@ -330,6 +330,8 @@ async def _message_counts(
                 Message.created_at >= start,
                 Message.created_at < end,
                 Message.type != MessageType.SYSTEM,
+                # 「我的设备」里自己给自己发的不算活跃（docs/self-chat.md），否则一个人就能刷满
+                Conversation.type != ConversationType.SELF,
                 or_(Message.created_at < utc_midnight, Conversation.type == ConversationType.DIRECT),
             )
             .group_by(Message.sender_id)

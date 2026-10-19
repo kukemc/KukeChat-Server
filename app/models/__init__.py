@@ -33,6 +33,7 @@ from app.models.profile_like import ProfileLike
 from app.models.red_packet import RedPacket, RedPacketShare
 from app.models.release import AppRelease, AppReleaseArtifact, ReleaseApiToken
 from app.models.report import AdminAuditLog, ContentModerationRecord, PasswordResetRequest, UserReport
+from app.models.self_chat import SelfTransfer
 from app.models.shop import CoinGrant, ShopAccount, ShopItem, ShopPurchase
 from app.models.spark import FriendSpark, SparkRelight
 from app.models.sticker import FavoriteSticker, StickerAsset
@@ -42,6 +43,7 @@ from app.models.teamup import TeamupComment, TeamupCommentLike, TeamupEvent, Tea
 from app.models.user import AuthSession, CcwBindingChallenge, User
 
 __all__ = [
+    "SelfTransfer",
     "AccountLevelDay",
     "AccountLevelNotification",
     "Announcement",

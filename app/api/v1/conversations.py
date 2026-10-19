@@ -72,6 +72,7 @@ from app.services import moderation as moderation_service
 from app.services import pokes as poke_service
 from app.services import response_cache
 from app.services import voice_transcripts as voice_transcript_service
+from app.services import self_chat as self_chat_service
 from app.websocket.manager import admin_manager, bot_manager, game_manager, manager
 
 
@@ -435,6 +436,10 @@ async def conversations(
         return cached_json_response(cached, request, 5)
 
     items = await conversation_service.list_user_conversations(db, current_user.id)
+    if not current_user.is_bot and not any(item.type == ConversationType.SELF for item in items):
+        # 每个人的列表里都有「我的设备」（docs/self-chat.md）：还没有就建上再列一遍。只有第一次会走到这里
+        await self_chat_service.get_or_create(db, current_user)
+        items = await conversation_service.list_user_conversations(db, current_user.id)
     data = jsonable_encoder(await conversation_service.build_conversation_reads(db, items, current_user.id))
     payload = response_cache.build_json(data)
     response_cache.set_user_conversations(current_user.id, payload)
@@ -1186,10 +1191,15 @@ async def trigger_message_interaction(
 async def send_message(
     conversation_id: int,
     payload: MessageCreate,
+    request: Request,
     current_user: Annotated[User, Depends(get_current_user)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> MessageRead:
-    message = await message_service.send_message(db, conversation_id, current_user, payload.content, payload.type, payload.metadata)
+    message = await message_service.send_message(
+        db, conversation_id, current_user, payload.content, payload.type, payload.metadata, device=self_chat_service.device_of(request)
+    )
+    # 「我的设备」会话（docs/self-chat.md）：只有自己看得到，不送机器审核、不发后台刷新信号
+    self_chat = getattr(message, "_self_chat", False)
     # 乐观发送：client_nonce 不落库，挂在这次的消息对象上，POST 返回和 message.created 都原样带回
     if payload.client_nonce:
         setattr(message, "_client_nonce", payload.client_nonce)
@@ -1200,7 +1210,8 @@ async def send_message(
         await send_message_updates(db, "message.created", message, member_ids)
     except Exception:
         logger.exception("Committed message %s realtime delivery failed", message.id)
-    schedule_realtime_task(send_admin_message_signal("admin.message.changed", message, "created"))
+    if not self_chat:
+        schedule_realtime_task(send_admin_message_signal("admin.message.changed", message, "created"))
     previous_level = getattr(message, "_level_previous", None)
     current_level = getattr(message, "_level_current", None)
     if isinstance(previous_level, int) and isinstance(current_level, int) and current_level > previous_level:
@@ -1216,7 +1227,7 @@ async def send_message(
                 },
             )
         )
-    if not current_user.content_moderation_whitelisted:
+    if not current_user.content_moderation_whitelisted and not self_chat:
         moderation_service.schedule_message_moderation(message.id)
     # 好友之间的私聊涨亲密度（docs/intimacy.md）：后台用自己的会话记，不拖慢发送，失败只记日志
     intimacy_service.schedule_message(conversation_id, current_user.id, message.type, message.created_at, bind=db.bind)
@@ -1229,6 +1240,7 @@ async def send_message(
 async def forward_bundle(
     target_conversation_id: int,
     payload: ForwardBundleCreate,
+    request: Request,
     current_user: Annotated[User, Depends(get_current_user)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> MessageRead:
@@ -1239,7 +1251,9 @@ async def forward_bundle(
         payload.source_conversation_id,
         payload.message_ids,
         payload.note,
+        device=self_chat_service.device_of(request),
     )
+    self_chat = getattr(message, "_self_chat", False)
     message_data = message_service.build_new_message_read(message, current_user.id)
     member_ids = await online_conversation_member_ids(db, target_conversation_id)
     response_cache.invalidate_user_conversations(set(member_ids) | {current_user.id})
@@ -1247,7 +1261,8 @@ async def forward_bundle(
         await send_message_updates(db, "message.created", message, member_ids)
     except Exception:
         logger.exception("Committed message %s realtime delivery failed", message.id)
-    schedule_realtime_task(send_admin_message_signal("admin.message.changed", message, "created"))
+    if not self_chat:
+        schedule_realtime_task(send_admin_message_signal("admin.message.changed", message, "created"))
     previous_level = getattr(message, "_level_previous", None)
     current_level = getattr(message, "_level_current", None)
     if isinstance(previous_level, int) and isinstance(current_level, int) and current_level > previous_level:
@@ -1263,7 +1278,7 @@ async def forward_bundle(
                 },
             )
         )
-    if not current_user.content_moderation_whitelisted:
+    if not current_user.content_moderation_whitelisted and not self_chat:
         moderation_service.schedule_message_moderation(message.id)
     intimacy_service.schedule_message(target_conversation_id, current_user.id, message.type, message.created_at, bind=db.bind)
     spark_service.schedule_message(target_conversation_id, current_user.id, message.type, message.created_at, bind=db.bind)
@@ -1278,6 +1293,8 @@ async def recall_message(
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> MessageRead:
     message = await message_service.recall_message(db, conversation_id, current_user.id, message_id)
+    # 撤回「我的设备」里的临时文件消息：文件跟着作废，马上从存储里删掉（docs/self-chat.md 5.4）
+    await self_chat_service.expire_for_message(db, message)
     message_data = await message_service.build_message_read(db, message, current_user.id)
     member_ids = await online_conversation_member_ids(db, conversation_id)
     await send_message_updates(db, "message.recalled", message, member_ids)

@@ -6,6 +6,8 @@ from enum import Enum
 class ConversationType(str, Enum):
     DIRECT = "direct"
     GROUP = "group"
+    # 「我的电脑 / 我的手机」：每人一个、只有自己一个成员的会话，在自己的几台设备之间传消息和临时文件（docs/self-chat.md）
+    SELF = "self"
 
 
 class FriendRequestStatus(str, Enum):

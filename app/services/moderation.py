@@ -23,7 +23,7 @@ from sqlalchemy.orm import joinedload
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal, release_connection
 from app.models.conversation import Conversation
-from app.models.enums import MessageType, ModerationAction, ModerationSource, ModerationStatus, UserStatus
+from app.models.enums import ConversationType, MessageType, ModerationAction, ModerationSource, ModerationStatus, UserStatus
 from app.models.message import Message
 from app.models.post import Post, PostComment, PostTopic
 from app.models.penalty import UserViolation
@@ -332,6 +332,10 @@ async def _moderate_message_task(
         if message is None or message.type == MessageType.SYSTEM:
             return
         if message.sender is not None and message.sender.content_moderation_whitelisted:
+            return
+        # 「我的设备」会话（docs/self-chat.md）只有自己看得到：不调审核服务、不落审核记录，也就不会有二审 / 空闲复查 / 机器案件
+        conversation_type = await session.scalar(select(Conversation.type).where(Conversation.id == message.conversation_id))
+        if conversation_type == ConversationType.SELF:
             return
 
         records = await _moderate_message_content(session, message, source, report_id)

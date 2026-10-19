@@ -99,6 +99,9 @@ _S3_PRIVATE_CLIENT = None
 _S3_PRIVATE_PRESIGN_CLIENT = None
 # 群文件（docs/group-plus.md 第 5 节）：配了 S3_PRIVATE_BUCKET 时这个前缀下的对象放私有桶，其余照旧放主桶（主桶开着公开读）
 PRIVATE_PREFIX = "group-files/"
+# 「我的设备」会话的临时文件（docs/self-chat.md 第 5 节）同样只能鉴权下载，和群文件一起放私有桶
+SELF_TRANSFER_PREFIX = "self-transfers/"
+PRIVATE_PREFIXES = (PRIVATE_PREFIX, SELF_TRANSFER_PREFIX)
 OCTET_STREAM = "application/octet-stream"
 
 
@@ -229,8 +232,8 @@ def _s3_client():
 
 
 def _bucket_for(normalized: str) -> str | None:
-    """这个 key 放哪个桶：群文件前缀且配了私有桶 → 私有桶；否则主桶。endpoint 共用；凭据见 _client_for。"""
-    if settings.s3_private_bucket and normalized.startswith(PRIVATE_PREFIX):
+    """这个 key 放哪个桶：群文件 / 「我的设备」临时文件前缀且配了私有桶 → 私有桶；否则主桶。endpoint 共用；凭据见 _client_for。"""
+    if settings.s3_private_bucket and normalized.startswith(PRIVATE_PREFIXES):
         return settings.s3_private_bucket
     return settings.s3_bucket
 

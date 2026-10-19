@@ -99,3 +99,8 @@ api_router.include_router(group_announcements.router, prefix="/conversations", t
 from app.api.v1 import admin_devices  # noqa: E402
 
 api_router.include_router(admin_devices.router, prefix="/admin", tags=["admin"])
+
+# 「我的电脑 / 我的手机」（docs/self-chat.md）：/conversations/self、/conversations/{id}/transfers/...
+from app.api.v1 import self_chat  # noqa: E402
+
+api_router.include_router(self_chat.router, prefix="/conversations", tags=["self-chat"])

@@ -35,6 +35,7 @@ from app.services.ccw import start_ccw_binding_worker, stop_ccw_binding_worker
 from app.services.moderation import start_moderation_retry_worker, stop_moderation_retry_worker
 from app.services.moderation_idle import start_idle_scan_worker, stop_idle_scan_worker
 from app.services.group_files import start_group_file_worker, stop_group_file_worker
+from app.services.self_chat import start_self_transfer_worker, stop_self_transfer_worker
 from app.services.red_packets import start_red_packet_worker, stop_red_packet_worker
 from app.services.gifts import ensure_default_gifts
 from app.services.shop import ensure_default_items as ensure_default_shop_items
@@ -123,6 +124,8 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
     start_shop_expiry_worker()
     # 群文件：每小时删过期的、以及群升级到期超过宽限期的文件
     start_group_file_worker()
+    # 「我的设备」临时文件：每 10 分钟删过期的文件和没传完就作废的上传单（docs/self-chat.md）
+    start_self_transfer_worker()
     # 好友亲密度：上线后第一次启动给老好友回填一次；之后每小时补「成为好友满 N 天」的徽章
     start_intimacy_worker()
     # 好友火花：每 10 分钟把连续两天没续上的火花清零（记下原来的天数，3 天内可重燃）并通知双方
@@ -142,6 +145,7 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
         await stop_intimacy_worker()
         await stop_spark_worker()
         await stop_group_file_worker()
+        await stop_self_transfer_worker()
         await stop_shop_expiry_worker()
         await stop_red_packet_worker()
         await stop_account_level_worker()
@@ -702,8 +706,8 @@ class CachedUploadFiles(StaticFiles):
             folder == "messages" and len(parts) == 2 and suffix in cls._audio_suffixes
         )
 
-    # 群文件（docs/group-plus.md 第 5 节）只能走带鉴权的下载接口，不能通过 /uploads 直链拿
-    _private_folders = {"group-files"}
+    # 群文件（docs/group-plus.md 第 5 节）和「我的设备」临时文件（docs/self-chat.md）只能走带鉴权的下载接口，不能通过 /uploads 直链拿
+    _private_folders = {"group-files", "self-transfers"}
 
     async def get_response(self, path: str, scope: dict) -> Response:
         first = PurePosixPath(path.replace("\\", "/")).parts[:1]

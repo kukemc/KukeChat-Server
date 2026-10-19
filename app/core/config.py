@@ -48,6 +48,9 @@ class Settings(BaseSettings):
     s3_private_secret_access_key: str | None = None
     # 发版服务（docs/releases.md）单个安装包的大小上限
     release_max_artifact_bytes: int = Field(default=1024 * 1024 * 1024, ge=1024 * 1024, le=8 * 1024 * 1024 * 1024)
+    # 「我的设备」会话的临时文件（docs/self-chat.md 第 5 节）：单个文件的上限，和每人同时存着的（没过期的）文件总量上限
+    self_transfer_max_bytes: int = Field(default=1024 * 1024 * 1024, ge=1024 * 1024, le=8 * 1024 * 1024 * 1024)
+    self_transfer_quota_bytes: int = Field(default=5 * 1024 * 1024 * 1024, ge=1024 * 1024, le=64 * 1024 * 1024 * 1024)
     image_quality: int = Field(default=82, ge=1, le=95)
     image_max_dimension: int = Field(default=2048, ge=128, le=8192)
     image_thumbnail_max_dimension: int = Field(default=360, ge=64, le=2048)
