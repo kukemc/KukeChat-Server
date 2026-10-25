@@ -169,6 +169,7 @@ All configuration is injected through `.env`. See [`.env.example`](.env.example)
 | `STORAGE_BACKEND` | `local` or `s3`; with `s3`, fill in `S3_*`, and use `S3_PRIVATE_BUCKET` for group files |
 | `CONTENT_MODERATION_ENABLED` | Off by default. No moderation service is bundled; when enabled, `CONTENT_MODERATION_URL` is required |
 | `VOICE_ASR_URL` | Speech recognition service URL; when empty, voice-to-text and voice passphrase red packets are unavailable |
+| `SHOP_FONT_BASE_URL` | Directory (https) holding the shop's exclusive bubble font files; when empty, no fonts are sent. See [`docs/shop.md`](docs/shop.md) 2.6 |
 | `CCW_BIND_*` | CCW account binding; the feature is unavailable when empty, and it also needs a CCW gateway — see [Integration points](#integration-points) |
 | `SMTP_*` | Outgoing email, off by default |
 | `INVITE_BASE_URL` | Landing page for invite links, usually your deployed client |

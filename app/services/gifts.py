@@ -47,6 +47,7 @@ from app.models.user import User
 from app.schemas.user import UserPublic
 from app.services import shop as shop_service
 from app.services.penalties import mute_state
+from app.services.shop_style import font_view, split_font
 from app.services.reports import log_admin_action
 
 logger = logging.getLogger(__name__)
@@ -350,11 +351,14 @@ def _item_ref(record: GiftRecord) -> dict[str, Any] | None:
         style = json.loads(record.item_style or "{}")
     except ValueError:
         style = {}
+    # 样式里的 font 不能发给客户端（老客户端会整件作废，docs/shop.md 2.6）
+    style, font = split_font(style if isinstance(style, dict) else {})
     return {
         "sku": record.item_sku,
         "name": record.item_name or "",
         "category": record.item_category or "",
-        "style": style if isinstance(style, dict) else {},
+        "style": style,
+        "font": font_view(font),
         "duration_days": record.item_duration_days,
     }
 

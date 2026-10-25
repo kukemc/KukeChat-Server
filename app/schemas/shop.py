@@ -41,6 +41,8 @@ class ShopItemBase(BaseModel):
     duration_days: int | None = None
     # false 表示已下架。用户侧只会在「我已拥有但已下架」的商品上看到 false
     is_active: bool = True
+    # 气泡的专属字体 { key, name, woff2, ttf }（docs/shop.md 2.6）；没有、或者服务端没配置字体文件时为 null
+    font: dict[str, str] | None = None
 
 
 class ShopItemRead(ShopItemBase):
@@ -50,6 +52,8 @@ class ShopItemRead(ShopItemBase):
     obtainable: Literal["buy", "level", "locked", "owned", "renew"] = "locked"
     # 我拥有的这一件什么时候到期；永久或者没拥有为 null
     expires_at: datetime | None = None
+    # 装备着这件、而且它有专属字体时：我有没有打开字体。其余情况恒为 true
+    font_enabled: bool = True
 
 
 class ShopBalance(BaseModel):
@@ -99,6 +103,8 @@ class ShopEquipRequest(BaseModel):
     slot: str = Field(max_length=40)
     # null 表示卸下
     sku: str | None = Field(default=None, max_length=80)
+    # 用不用这件的专属字体（docs/shop.md 2.6）。不传：还是这一件就保持原来的选择，换了一件就是打开
+    use_font: bool | None = None
 
 
 class ShopEquipResult(BaseModel):
@@ -302,6 +308,15 @@ class AdminShopRevoke(BaseModel):
     refund: bool = False
 
 
+class AdminShopFont(BaseModel):
+    """气泡能用的一种专属字体（docs/shop.md 2.6）。available：服务端配了 SHOP_FONT_BASE_URL、客户端拿得到字体文件"""
+
+    key: str
+    name: str
+    license: str
+    available: bool = False
+
+
 class AdminShopSettings(BaseModel):
     # 能不能核实余额（接入了余额来源，并且它需要的配置都齐了）
     configured: bool = False
@@ -324,6 +339,8 @@ class AdminShopSettings(BaseModel):
     frame_animations: list[str] = Field(default_factory=list)
     frame_ornaments: list[str] = Field(default_factory=list)
     frame_positions: list[str] = Field(default_factory=list)
+    # 气泡 style.font 能填的字体
+    fonts: list[AdminShopFont] = Field(default_factory=list)
     price_max: int
     unlock_level_max: int
     # 限时商品一次最多多少天

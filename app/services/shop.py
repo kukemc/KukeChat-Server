@@ -51,12 +51,15 @@ from app.schemas.user import UserPublic, load_cosmetics, parse_cosmetics
 from app.services.reports import log_admin_action
 from app.services.shop_style import (
     ANIMATIONS,
+    FONTS,
     FRAME_ANIMATIONS,
     FRAME_ORNAMENTS,
     FRAME_POSITIONS,
     ORNAMENTS,
     PATTERNS,
     StyleError,
+    font_view,
+    split_font,
     validate_bubble_style,
     validate_frame_style,
 )
@@ -272,6 +275,8 @@ def _obtainable(item: ShopItem, owned: bool, level: int, *, timed: bool = False,
 
 
 def _item_base(item: ShopItem) -> dict[str, Any]:
+    """发给用户的商品。样式里的 font 拿出来放在旁边（docs/shop.md 2.6）：老客户端不认识 style.font，会把整件皮肤作废。"""
+    style, font = split_font(_style(item))
     return {
         "id": item.id,
         "sku": item.sku,
@@ -280,7 +285,8 @@ def _item_base(item: ShopItem) -> dict[str, Any]:
         "description": item.description or "",
         "price": item.price,
         "unlock_level": item.unlock_level,
-        "style": _style(item),
+        "style": style,
+        "font": font_view(font),
         "preview_text": item.preview_text,
         "tag": item.tag,
         "available_until": _aware(item.available_until),
@@ -290,23 +296,38 @@ def _item_base(item: ShopItem) -> dict[str, Any]:
 
 
 def _item_view(
-    item: ShopItem, *, owned: bool, equipped: dict[str, str], level: int, expires_at: datetime | None = None, now: datetime | None = None
+    item: ShopItem,
+    *,
+    owned: bool,
+    equipped: dict[str, str],
+    level: int,
+    expires_at: datetime | None = None,
+    now: datetime | None = None,
+    fonts_off: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
-    """expires_at：我拥有的这一件什么时候到期（永久或者没拥有为 None）。"""
+    """expires_at：我拥有的这一件什么时候到期（永久或者没拥有为 None）。fonts_off：我关掉了专属字体的那几个槽。"""
     slot = _slot(item)
     expires_at = _aware(expires_at) if owned else None
+    worn = owned and slot is not None and equipped.get(slot) == item.sku
+    has_font = split_font(_style(item))[1] is not None
     return {
         **_item_base(item),
         "owned": owned,
-        "equipped": owned and slot is not None and equipped.get(slot) == item.sku,
+        "equipped": worn,
         "obtainable": _obtainable(item, owned, level, timed=expires_at is not None, now=now),
         "expires_at": expires_at,
+        "font_enabled": not (worn and has_font and slot in fonts_off),
     }
 
 
 def equipped_map(user: User) -> dict[str, str]:
     """每个槽装备的 sku，从 users.cosmetics 读。已经到期的限时商品不算装备着（parse_cosmetics 现场判断）。"""
     return {slot: entry["sku"] for slot, entry in load_cosmetics(user.cosmetics, _now()).items()}
+
+
+def fonts_off(user: User) -> frozenset[str]:
+    """本人关掉了专属字体的那几个槽（docs/shop.md 2.6）。"""
+    return frozenset(slot for slot, entry in load_cosmetics(user.cosmetics, _now()).items() if entry.get("font_off"))
 
 
 def _set_cosmetics(user: User, cosmetics: dict[str, Any]) -> None:
@@ -739,9 +760,13 @@ async def overview(db: AsyncSession, user: User) -> dict[str, Any]:
     if owned:
         clause = or_(clause, ShopItem.id.in_(owned))
     items = (await db.execute(select(ShopItem).where(clause).order_by(ShopItem.sort.asc(), ShopItem.id.asc()))).scalars().all()
+    off = fonts_off(user)
     return {
         "categories": categories_view(),
-        "items": [_item_view(item, owned=item.id in owned, equipped=equipped, level=level, expires_at=owned.get(item.id), now=now) for item in items],
+        "items": [
+            _item_view(item, owned=item.id in owned, equipped=equipped, level=level, expires_at=owned.get(item.id), now=now, fonts_off=off)
+            for item in items
+        ],
         "balance": await _balance(db, user_id, oid),
         "equipped": equipped,
         "donate_url": get_coin_ledger().topup_url(),
@@ -756,6 +781,8 @@ async def purchase(db: AsyncSession, user: User, item_id: int) -> dict[str, Any]
     永久拥有着的重复购买是 409 already_owned。
     """
     user_id, oid, level, equipped = user.id, _bound_oid(user), user_level(user), equipped_map(user)
+    # 和上面几项一样先读出来：中途回滚过的话 user 已经过期，再读 user.cosmetics 会在异步会话里懒加载出错
+    off = fonts_off(user)
     item = await db.get(ShopItem, item_id)
     if item is None:
         raise _item_not_found()
@@ -840,14 +867,18 @@ async def purchase(db: AsyncSession, user: User, item_id: int) -> dict[str, Any]
     # 中途回滚过的话 item 已经过期，重新读出来
     await db.refresh(item)
     return {
-        "item": _item_view(item, owned=True, equipped=equipped, level=level, expires_at=expires_at),
+        "item": _item_view(item, owned=True, equipped=equipped, level=level, expires_at=expires_at, fonts_off=off),
         "balance": await _balance(db, user_id, oid),
         "equipped": equipped,
     }
 
 
-async def set_equipped(db: AsyncSession, user: User, slot: str, sku: str | None) -> dict[str, Any]:
-    """PUT /shop/equipped：装备自己拥有的一件，sku 为 None 表示卸下。装备有变化时发 user.cosmetics.updated。"""
+async def set_equipped(db: AsyncSession, user: User, slot: str, sku: str | None, use_font: bool | None = None) -> dict[str, Any]:
+    """PUT /shop/equipped：装备自己拥有的一件，sku 为 None 表示卸下。装备有变化时发 user.cosmetics.updated。
+
+    use_font：用不用这件的专属字体（docs/shop.md 2.6）。不传时，还是原来那一件就保持原来的选择，换了一件就是打开。
+    关掉记在 users.cosmetics 的这一槽上（font_off），别人看到的 cosmetics 里就没有 font。
+    """
     if slot not in SLOTS:
         raise _error(status.HTTP_422_UNPROCESSABLE_ENTITY, "invalid_slot", "没有这个装备槽")
     now = _now()
@@ -869,6 +900,11 @@ async def set_equipped(db: AsyncSession, user: User, slot: str, sku: str | None)
         if owned[item.id] is not None:
             # 限时商品：到期时间和样式一起记在 users.cosmetics 里，序列化用户时不查库也知道它到没到期
             entry["expires_at"] = _iso(owned[item.id])
+        previous = cosmetics.get(slot)
+        keep_off = previous is not None and previous.get("sku") == item.sku and previous.get("font_off") is True
+        # 没有专属字体的那几件不记（记了也没用，还会让 font_enabled 变成 false）
+        if split_font(entry["style"])[1] is not None and (use_font is False or (use_font is None and keep_off)):
+            entry["font_off"] = True
         changed = cosmetics.get(slot) != entry
         cosmetics[slot] = entry
     if changed:
@@ -1190,8 +1226,10 @@ async def _sync_equipped(db: AsyncSession, item: ShopItem) -> list[int]:
 
 
 def _admin_item_view(item: ShopItem, sold: int = 0, owners: int = 0) -> dict[str, Any]:
+    # 后台要编辑原样的样式（带着 font）；font 那一项照样给，后台用来显示字体名
     return {
         **_item_base(item),
+        "style": _style(item),
         "sort": item.sort,
         "sold": sold,
         "owners": owners,
@@ -1863,6 +1901,7 @@ def admin_settings() -> dict[str, Any]:
         "frame_animations": list(FRAME_ANIMATIONS),
         "frame_ornaments": list(FRAME_ORNAMENTS),
         "frame_positions": list(FRAME_POSITIONS),
+        "fonts": [{"key": key, "name": name, "license": license, "available": font_view(key) is not None} for key, (name, _stem, license) in FONTS.items()],
         "price_max": PRICE_MAX,
         "unlock_level_max": UNLOCK_LEVEL_MAX,
         "duration_max": DURATION_MAX,
@@ -1882,6 +1921,7 @@ def _conic(start: int, *stops: str) -> str:
 
 
 # 8 件气泡皮肤，按档次递进：便宜的两件是干净的配色，中档的带纹样 / 一个角饰，
+# （2.0.10 起付费的都改成买一次 31 天、价格跟着降了；等级奖励的两件仍然永久。线上已有的商品由 scripts/shop_reprice_2_0_10.py 改）
 # 最贵的两件是「渐变 + 纹样 + 角饰 + 动效」的整套；两件等级奖励分别用月亮和太阳，对应等级图标。
 # 每件都有深色模式的覆盖。正文颜色对底色每一段（包括叠上纹样之后）的对比度都不低于 4.5，测试里有检查。
 # 链接色也一样（不低于 4.3）；浅色、深色底色明暗相反的几件在深色覆盖里单独配了链接色。
@@ -1891,7 +1931,8 @@ DEFAULT_ITEMS: tuple[dict[str, Any], ...] = (
         "sku": "bubble.mint",
         "name": "薄荷汽水",
         "description": "清清爽爽的薄荷绿，像夏天的第一口汽水",
-        "price": 10,
+        "price": 8,
+        "duration_days": 31,
         "preview_text": "来一口冰的！",
         "style": {
             "version": 1,
@@ -1912,7 +1953,8 @@ DEFAULT_ITEMS: tuple[dict[str, Any], ...] = (
         "sku": "bubble.peach",
         "name": "蜜桃乌龙",
         "description": "软乎乎的蜜桃色，说什么都显得温柔",
-        "price": 30,
+        "price": 18,
+        "duration_days": 31,
         "preview_text": "抱抱～",
         "style": {
             "version": 1,
@@ -1933,7 +1975,8 @@ DEFAULT_ITEMS: tuple[dict[str, Any], ...] = (
         "sku": "bubble.ocean",
         "name": "深海",
         "description": "从浅滩一路沉到深海的蓝，水面下有一层层暗涌的波纹",
-        "price": 60,
+        "price": 30,
+        "duration_days": 31,
         "preview_text": "潜水中，勿扰",
         "style": {
             "version": 1,
@@ -1955,7 +1998,8 @@ DEFAULT_ITEMS: tuple[dict[str, Any], ...] = (
         "sku": "bubble.pixel",
         "name": "像素心跳",
         "description": "方方正正的复古游戏机风格，角上挂着一颗像素爱心",
-        "price": 60,
+        "price": 35,
+        "duration_days": 31,
         "preview_text": "PRESS START",
         "style": {
             "version": 1,
@@ -1980,7 +2024,8 @@ DEFAULT_ITEMS: tuple[dict[str, Any], ...] = (
         "sku": "bubble.galaxy",
         "name": "星河",
         "description": "洒满星点的深紫色夜空，时不时有一道光扫过，角上的星星会闪",
-        "price": 100,
+        "price": 50,
+        "duration_days": 31,
         "preview_text": "抬头，有流星",
         "tag": "new",
         "style": {
@@ -2010,7 +2055,8 @@ DEFAULT_ITEMS: tuple[dict[str, Any], ...] = (
         "sku": "bubble.aurora",
         "name": "极光",
         "description": "紫、蓝、青缓缓流动的极光，蒙着一层细细的霜，角上落着雪花和闪光",
-        "price": 200,
+        "price": 88,
+        "duration_days": 31,
         "preview_text": "今天也要开心呀",
         "tag": "hot",
         "style": {
@@ -2098,7 +2144,7 @@ DEFAULT_ITEMS: tuple[dict[str, Any], ...] = (
         },
     },
     # —— 11 件头像框。前 8 件和上面的气泡成套（同样的档次和价位，等级奖励也是 4 级、16 级各一件），
-    # 后 3 件各用一种头像框专用的装饰（蝴蝶结、小恶魔角、翅膀），其中「小恶魔」「天使」是限时的（买一次 30 天，见 duration_days）。
+    # 后 3 件各用一种头像框专用的装饰（蝴蝶结、小恶魔角、翅膀）。付费的都是买一次 31 天（见 duration_days），等级奖励永久。
     # 样式是客户端那边先拟好、在浅色和深色聊天背景上都截图看过的那一套（客户端仓库 dev/mocks/shop.ts 的 FRAMES），
     # 这里原样照搬；要调配色先在客户端看效果，再两边一起改。
     {
@@ -2106,7 +2152,8 @@ DEFAULT_ITEMS: tuple[dict[str, Any], ...] = (
         "category": "frame",
         "name": "薄荷",
         "description": "清爽的薄荷绿，角上一片小叶子",
-        "price": 10,
+        "price": 8,
+        "duration_days": 31,
         "style": {
             "version": 1,
             "ring": {"background": _gradient(140, "#a8f5d8 0%", "#3ecfa0 55%", "#8ff0cf 100%"), "width": 3, "gap": 1},
@@ -2119,7 +2166,8 @@ DEFAULT_ITEMS: tuple[dict[str, Any], ...] = (
         "category": "frame",
         "name": "樱花",
         "description": "粉色的环带着淡淡的光晕，飘着两片花瓣",
-        "price": 30,
+        "price": 18,
+        "duration_days": 31,
         "style": {
             "version": 1,
             "ring": {"background": _gradient(160, "#ffd9e6 0%", "#ff8fb3 55%", "#ffc4d8 100%"), "width": 3, "gap": 1},
@@ -2135,7 +2183,8 @@ DEFAULT_ITEMS: tuple[dict[str, Any], ...] = (
         "category": "frame",
         "name": "海盐",
         "description": "浅浅的海蓝，偶尔一道光扫过去，角上一点闪光",
-        "price": 60,
+        "price": 30,
+        "duration_days": 31,
         "style": {
             "version": 1,
             "ring": {"background": _gradient(180, "#d6f1ff 0%", "#6bbcf7 60%", "#a9dcff 100%"), "width": 3, "gap": 1},
@@ -2149,7 +2198,8 @@ DEFAULT_ITEMS: tuple[dict[str, Any], ...] = (
         "category": "frame",
         "name": "猫耳",
         "description": "头顶一对猫耳，偶尔会抖一下，角上还有个小爪印",
-        "price": 60,
+        "price": 35,
+        "duration_days": 31,
         "style": {
             "version": 1,
             "ring": {"background": _gradient(180, "#ffd9a0 0%", "#f2a954 100%"), "width": 3, "gap": 0},
@@ -2164,7 +2214,8 @@ DEFAULT_ITEMS: tuple[dict[str, Any], ...] = (
         "category": "frame",
         "name": "星环",
         "description": "缓缓旋转的渐变星环，挂着一颗会闪的星星",
-        "price": 100,
+        "price": 50,
+        "duration_days": 31,
         "style": {
             "version": 1,
             "ring": {"background": _conic(0, "#7f7fd5", "#91eae4", "#ffe9a8", "#b08cf0", "#7f7fd5"), "width": 3, "gap": 1},
@@ -2181,7 +2232,8 @@ DEFAULT_ITEMS: tuple[dict[str, Any], ...] = (
         "category": "frame",
         "name": "极光",
         "description": "极光的颜色绕着头像慢慢转，带着一圈青绿色的光晕",
-        "price": 200,
+        "price": 88,
+        "duration_days": 31,
         "style": {
             "version": 1,
             "ring": {"background": _conic(90, "#4c3fd1", "#2fb6dd", "#3ddc97", "#b05cff", "#4c3fd1"), "width": 4, "gap": 1},
@@ -2227,7 +2279,8 @@ DEFAULT_ITEMS: tuple[dict[str, Any], ...] = (
         "category": "frame",
         "name": "蝴蝶结",
         "description": "粉粉的一圈，角上系着蝴蝶结，还有一颗小爱心",
-        "price": 30,
+        "price": 20,
+        "duration_days": 31,
         "style": {
             "version": 1,
             "ring": {"background": "#ff9ec0", "width": 3, "gap": 1},
@@ -2242,8 +2295,8 @@ DEFAULT_ITEMS: tuple[dict[str, Any], ...] = (
         "category": "frame",
         "name": "小恶魔",
         "description": "暗红色的环一明一暗，头顶一对小恶魔角，角上一道闪电",
-        "price": 50,
-        "duration_days": 30,
+        "price": 40,
+        "duration_days": 31,
         "style": {
             "version": 1,
             "ring": {"background": _gradient(160, "#ff6b7d 0%", "#8a1f3d 100%"), "width": 3, "gap": 0},
@@ -2260,8 +2313,8 @@ DEFAULT_ITEMS: tuple[dict[str, Any], ...] = (
         "category": "frame",
         "name": "天使",
         "description": "洁白的环泛着淡蓝的光，身侧一对翅膀，头顶一圈光环",
-        "price": 120,
-        "duration_days": 30,
+        "price": 66,
+        "duration_days": 31,
         "style": {
             "version": 1,
             "ring": {"background": _gradient(180, "#ffffff 0%", "#cfe4ff 100%"), "width": 2, "gap": 1},
@@ -2269,6 +2322,282 @@ DEFAULT_ITEMS: tuple[dict[str, Any], ...] = (
             "ornaments": [
                 {"key": "wings", "position": "right", "color": "#f4f8ff", "size": 24, "animated": True},
                 {"key": "halo", "position": "top", "color": "#ffe38a", "size": 18, "animated": True},
+            ],
+        },
+    },
+    # —— 2.0.10 的新一批：6 件气泡 + 6 件头像框，都是买一次 31 天（多送一天），价格按实际效果定：装饰多、会动、带专属字体的贵一些，和老商品的档位（最高 88）对齐。
+    # 用到了 2.0.10 新加的纹样（scanlines / circuit / fizz / ruled / confetti）、角饰（cursor / stamp / cherry / note / koi / planet）、
+    # 头像框装饰（headphones / flame）和动效（气泡 scan、头像框 flicker）；老客户端不认识的只跳过那一项，其余照画。
+    # 四件气泡带专属字体（style.font，见契约 2.6；发给客户端时拿到样式外面）。
+    {
+        "sku": "bubble.soda",
+        "name": "汽水",
+        "description": "冰镇蓝色汽水，气泡一串串往上冒，杯口插着一颗樱桃。专属字体：站酷快乐体",
+        "price": 38,
+        "duration_days": 31,
+        "preview_text": "干杯！",
+        "tag": "new",
+        "style": {
+            "version": 1,
+            "background": _gradient(180, "#E3F7FF 0%", "#B9E6FF 100%"),
+            "text": "#0B3954",
+            "link": "#0A4F8A",
+            "radius": 20,
+            "pattern": {"key": "fizz", "color": "#FFFFFF", "opacity": 0.55, "scale": 1},
+            "ornaments": [{"key": "cherry", "corner": "tr", "color": "#E63950", "size": 18, "animated": True}],
+            "font": "kuaile",
+            "dark": {
+                "background": _gradient(180, "#173B57 0%", "#0F2A40 100%"),
+                "text": "#E3F4FF",
+                "link": "#9AD4FF",
+                "pattern": {"key": "fizz", "color": "#9AD4FF", "opacity": 0.14, "scale": 1},
+            },
+        },
+    },
+    {
+        "sku": "bubble.letter",
+        "name": "信笺",
+        "description": "米色信纸上一行行横线，角上贴着一枚邮票。专属字体：霞鹜文楷",
+        "price": 45,
+        "duration_days": 31,
+        "preview_text": "见字如面",
+        "style": {
+            "version": 1,
+            "background": "#FBF5E6",
+            "text": "#4A3A24",
+            "link": "#7A3B12",
+            "border": {"color": "#E6D6B0", "width": 1},
+            "radius": 6,
+            "shadow": "0 2px 6px #8A6D3B26",
+            "pattern": {"key": "ruled", "color": "#B89B6A", "opacity": 0.35, "scale": 1},
+            "ornaments": [{"key": "stamp", "corner": "tr", "color": "#C8553D", "size": 20}],
+            "font": "wenkai",
+            "dark": {
+                "background": "#2E281F",
+                "text": "#F3E9D2",
+                "link": "#F2B48A",
+                "border": {"color": "#4A3F2E", "width": 1},
+                "shadow": "0 2px 6px #00000040",
+                "pattern": {"key": "ruled", "color": "#F3E9D2", "opacity": 0.12, "scale": 1},
+            },
+        },
+    },
+    {
+        "sku": "bubble.koi",
+        "name": "锦鲤",
+        "description": "朱红色的水面泛着金光，一尾锦鲤在角上摆尾，转发好运",
+        "price": 52,
+        "duration_days": 31,
+        "preview_text": "好运来！",
+        "style": {
+            "version": 1,
+            "background": _gradient(135, "#B3122E 0%", "#D7263D 55%", "#C2410C 100%"),
+            "text": "#FFF6E8",
+            "link": "#FFEED6",
+            "border": {"color": "#FFD27A55", "width": 1},
+            "radius": 16,
+            "shadow": "0 3px 12px #D7263D55",
+            "animation": "shimmer",
+            "pattern": {"key": "waves", "color": "#8A0F22", "opacity": 0.25, "scale": 1},
+            "ornaments": [
+                {"key": "koi", "corner": "tr", "color": "#F5A623", "size": 20, "animated": True},
+                {"key": "sparkle", "corner": "bl", "color": "#FFC93C", "size": 12, "animated": True},
+            ],
+            "dark": {
+                "background": _gradient(135, "#7E0D22 0%", "#9A1B2E 55%", "#8C2F0C 100%"),
+                "text": "#FFF1E0",
+                "border": {"color": "#FFD27A40", "width": 1},
+                "shadow": "0 3px 12px #00000055",
+                "pattern": {"key": "waves", "color": "#000000", "opacity": 0.2, "scale": 1},
+            },
+        },
+    },
+    {
+        "sku": "bubble.party",
+        "name": "派对",
+        "description": "深紫色的舞池里撒满彩纸，音符跟着节拍跳",
+        "price": 58,
+        "duration_days": 31,
+        "preview_text": "今晚不睡！",
+        "style": {
+            "version": 1,
+            "background": _gradient(135, "#2D1B69 0%", "#4A1D8F 100%"),
+            "text": "#FFFFFF",
+            "link": "#E5D4FF",
+            "border": {"color": "#FFFFFF26", "width": 1},
+            "radius": 18,
+            "shadow": "0 3px 12px #4A1D8F66",
+            "animation": "flow",
+            "pattern": {"key": "confetti", "color": "#FFD166", "opacity": 0.3, "scale": 1},
+            "ornaments": [
+                {"key": "note", "corner": "tr", "color": "#FF7AC6", "size": 18, "animated": True},
+                {"key": "star", "corner": "bl", "color": "#FFC93C", "size": 12, "animated": True},
+            ],
+            "dark": {
+                "background": _gradient(135, "#1E1248 0%", "#341466 100%"),
+                "text": "#F6F0FF",
+                "border": {"color": "#FFFFFF1F", "width": 1},
+                "shadow": "0 3px 12px #0A0B2080",
+                "pattern": {"key": "confetti", "color": "#FFD166", "opacity": 0.22, "scale": 1},
+            },
+        },
+    },
+    {
+        "sku": "bubble.terminal",
+        "name": "终端",
+        "description": "老式 CRT 显示器：黑底绿字、一道道扫描线，末尾的光标一闪一闪。专属字体：缝合像素体",
+        "price": 68,
+        "duration_days": 31,
+        "preview_text": "> hello world_",
+        "tag": "hot",
+        "style": {
+            "version": 1,
+            "background": "#0A0F0B",
+            "text": "#8CFF9E",
+            "link": "#7FD1FF",
+            "border": {"color": "#1F3B25", "width": 1},
+            "radius": 4,
+            "shadow": "0 0 8px #3FDC5F33",
+            "animation": "scan",
+            "pattern": {"key": "scanlines", "color": "#8CFF9E", "opacity": 0.07, "scale": 1},
+            "ornaments": [{"key": "cursor", "corner": "br", "color": "#3FDC5F", "size": 16, "animated": True}],
+            "font": "pixel",
+            "dark": {
+                "background": "#050806",
+                "text": "#8CFF9E",
+                "border": {"color": "#1F3B25", "width": 1},
+                "pattern": {"key": "scanlines", "color": "#8CFF9E", "opacity": 0.06, "scale": 1},
+            },
+        },
+    },
+    {
+        "sku": "bubble.neon",
+        "name": "霓虹",
+        "description": "深夜街头的霓虹灯牌：粉色灯管描边，底下铺着青色电路。专属字体：得意黑",
+        "price": 78,
+        "duration_days": 31,
+        "preview_text": "NIGHT CITY",
+        "tag": "new",
+        "style": {
+            "version": 1,
+            "background": _gradient(135, "#120A2E 0%", "#1E0B3D 100%"),
+            "text": "#FFE9FF",
+            "link": "#7DF9FF",
+            "border": {"color": "#FF4FD8", "width": 2},
+            "radius": 12,
+            "shadow": "0 0 10px #FF4FD866, 0 0 2px #FF4FD8",
+            "animation": "shimmer",
+            "pattern": {"key": "circuit", "color": "#00E5FF", "opacity": 0.12, "scale": 1},
+            "ornaments": [
+                {"key": "bolt", "corner": "tr", "color": "#FF4FD8", "size": 16, "animated": True},
+                {"key": "sparkle", "corner": "bl", "color": "#00E5FF", "size": 12, "animated": True},
+            ],
+            "font": "smiley",
+            "dark": {
+                "background": _gradient(135, "#0A0520 0%", "#150828 100%"),
+                "text": "#FFE9FF",
+                "border": {"color": "#FF4FD8", "width": 2},
+                "pattern": {"key": "circuit", "color": "#00E5FF", "opacity": 0.1, "scale": 1},
+            },
+        },
+    },
+    {
+        "sku": "frame.koi",
+        "category": "frame",
+        "name": "锦鲤",
+        "description": "朱红到金色的环，一尾锦鲤绕在角上摆尾",
+        "price": 38,
+        "duration_days": 31,
+        "style": {
+            "version": 1,
+            "ring": {"background": _gradient(160, "#ff8a5c 0%", "#d7263d 60%", "#ffc861 100%"), "width": 3, "gap": 1},
+            "glow": {"color": "#ff6b4a55", "blur": 6},
+            "ornaments": [
+                {"key": "koi", "position": "br", "color": "#f5a623", "size": 17, "animated": True},
+                {"key": "sparkle", "position": "tr", "color": "#ffd27a", "size": 11, "animated": True},
+            ],
+        },
+    },
+    {
+        "sku": "frame.flame",
+        "category": "frame",
+        "name": "烈焰",
+        "description": "橙红色的火环一呼一吸，头顶窜着一簇火苗",
+        "price": 58,
+        "duration_days": 31,
+        "style": {
+            "version": 1,
+            "ring": {"background": _gradient(180, "#ffd166 0%", "#ff6b35 55%", "#d62828 100%"), "width": 3, "gap": 0},
+            "glow": {"color": "#ff6b3566", "blur": 10},
+            "animation": "pulse",
+            "ornaments": [{"key": "flame", "position": "top", "color": "#ff7b2e", "size": 22, "animated": True}],
+        },
+    },
+    {
+        "sku": "frame.headphones",
+        "category": "frame",
+        "name": "耳机",
+        "description": "戴上一副头戴式耳机，旁边飘着音符",
+        "price": 52,
+        "duration_days": 31,
+        "style": {
+            "version": 1,
+            "ring": {"background": _gradient(160, "#4a4f6e 0%", "#1f2236 100%"), "width": 3, "gap": 1},
+            "ornaments": [
+                {"key": "headphones", "position": "top", "color": "#6c63ff", "size": 28},
+                {"key": "note", "position": "br", "color": "#ff7ac6", "size": 13, "animated": True},
+            ],
+            "dark": {"ring": {"background": _gradient(160, "#9aa1c8 0%", "#5a6088 100%")}},
+        },
+    },
+    {
+        "sku": "frame.planet",
+        "category": "frame",
+        "name": "行星",
+        "description": "星云色的环缓缓旋转，一颗带环的小行星挂在角上",
+        "price": 66,
+        "duration_days": 31,
+        "style": {
+            "version": 1,
+            "ring": {"background": _conic(0, "#5b8cff", "#b06bff", "#ff8fd8", "#5b8cff"), "width": 3, "gap": 1},
+            "glow": {"color": "#8c7bff55", "blur": 8},
+            "animation": "spin",
+            "ornaments": [
+                {"key": "planet", "position": "tr", "color": "#ffb84d", "size": 18, "animated": True},
+                {"key": "star", "position": "bl", "color": "#fff3b0", "size": 10, "animated": True},
+            ],
+        },
+    },
+    {
+        "sku": "frame.terminal",
+        "category": "frame",
+        "name": "终端",
+        "description": "荧光绿的细环像老显示器一样偶尔闪一下，角上一个闪烁的光标",
+        "price": 30,
+        "duration_days": 31,
+        "style": {
+            "version": 1,
+            "ring": {"background": "#3fdc5f", "width": 2, "gap": 1},
+            "glow": {"color": "#3fdc5f66", "blur": 8},
+            "animation": "flicker",
+            "ornaments": [{"key": "cursor", "position": "br", "color": "#3fdc5f", "size": 14, "animated": True}],
+        },
+    },
+    {
+        "sku": "frame.neon",
+        "category": "frame",
+        "name": "霓虹",
+        "description": "粉青两色的霓虹灯管，接触不良似的一闪一闪，带着闪电",
+        "price": 78,
+        "duration_days": 31,
+        "style": {
+            "version": 1,
+            "ring": {"background": _gradient(135, "#ff4fd8 0%", "#7df9ff 100%"), "width": 3, "gap": 1},
+            "glow": {"color": "#ff4fd888", "blur": 12},
+            "animation": "flicker",
+            "ornaments": [
+                {"key": "bolt", "position": "tr", "color": "#ff4fd8", "size": 15, "animated": True},
+                {"key": "sparkle", "position": "bl", "color": "#7df9ff", "size": 11, "animated": True},
             ],
         },
     },

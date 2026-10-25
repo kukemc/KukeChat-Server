@@ -15,11 +15,18 @@ import math
 import re
 from typing import Any
 
+from app.core.config import settings
+
 BUBBLE_STYLE_VERSION = 1
-ANIMATIONS = ("none", "flow", "shimmer", "breathe")
+# scan（一道扫描线从上往下扫）是 2.0.10 加的；老客户端不认识，只丢掉动效、其余照画
+ANIMATIONS = ("none", "flow", "shimmer", "breathe", "scan")
 # 客户端内置的纹样和角饰（契约 2.2）
-PATTERNS = ("dots", "grid", "stripes", "waves", "stars", "hearts", "pixels", "clouds", "petals", "noise")
-ORNAMENTS = ("sparkle", "star", "moon", "sun", "heart", "petal", "cloud", "paw", "leaf", "crown", "pixel_heart", "bolt", "snow")
+# 每张表后面那一截是 2.0.10 加的：老客户端遇到不认识的纹样 / 角饰只跳过那一项（契约 2.2）
+PATTERNS = ("dots", "grid", "stripes", "waves", "stars", "hearts", "pixels", "clouds", "petals", "noise", "scanlines", "circuit", "fizz", "ruled", "confetti")
+ORNAMENTS = (
+    "sparkle", "star", "moon", "sun", "heart", "petal", "cloud", "paw", "leaf", "crown", "pixel_heart", "bolt", "snow",
+    "cursor", "stamp", "cherry", "note", "koi", "planet",
+)
 CORNERS = ("tl", "tr", "bl", "br")
 PATTERN_OPACITY_RANGE = (0, 0.6)
 PATTERN_SCALE_RANGE = (0.5, 2)
@@ -37,14 +44,25 @@ _TEXT_MAX_LENGTH = 240
 
 # —— 头像框（契约 2.4）。尺寸都按 40px 的头像计，客户端按头像实际大小等比缩放 ——
 FRAME_STYLE_VERSION = 1
-FRAME_ANIMATIONS = ("none", "spin", "pulse", "shimmer")
-# 气泡的角饰头像框都能用，另外多几个只适合戴在头像上的
-FRAME_ORNAMENTS = (*ORNAMENTS, "cat_ears", "halo", "horns", "laurel", "wings", "bow")
+# flicker（霓虹灯管那样不规则地闪）是 2.0.10 加的
+FRAME_ANIMATIONS = ("none", "spin", "pulse", "shimmer", "flicker")
+# 气泡的角饰头像框都能用，另外多几个只适合戴在头像上的（headphones、flame 是 2.0.10 加的）
+FRAME_ORNAMENTS = (*ORNAMENTS, "cat_ears", "halo", "horns", "laurel", "wings", "bow", "headphones", "flame")
 FRAME_POSITIONS = ("top", "tr", "right", "br", "bottom", "bl", "left", "tl")
 FRAME_ORNAMENTS_MAX = 3
 RING_WIDTH_RANGE = (2, 6)
 RING_GAP_RANGE = (0, 3)
 GLOW_BLUR_RANGE = (0, 16)
+
+# 气泡的专属字体（契约 2.6）：key -> (名字, 文件名, 授权)。字体文件放在 SHOP_FONT_BASE_URL 下面，
+# <文件名>.woff2 给电脑端，<文件名>.ttf 给安卓；换了字体文件就换文件名（客户端按地址缓存）。
+FONTS: dict[str, tuple[str, str, str]] = {
+    "pixel": ("缝合像素体", "fusion-pixel-12px-zh-v1", "OFL-1.1"),
+    "wenkai": ("霞鹜文楷", "lxgw-wenkai-gb-v1", "OFL-1.1"),
+    "kuaile": ("站酷快乐体", "zcool-kuaile-v1", "OFL-1.1"),
+    "smiley": ("得意黑", "smiley-sans-v1", "OFL-1.1"),
+}
+FONT_KEYS = tuple(FONTS)
 
 # 数字一律写 [0-9]：\d 会放进全角数字
 _HEX = r"#(?:[0-9a-fA-F]{8}|[0-9a-fA-F]{6}|[0-9a-fA-F]{3})"
@@ -58,7 +76,8 @@ _LENGTH_RE = re.compile(r"(-?[0-9]{1,2}(?:\.[0-9])?)px|(0)")
 # 渐变和阴影里可能出现的全部字符；别的（分号、引号、斜杠、换行……）直接拒绝
 _SAFE_TEXT_RE = re.compile(r"[0-9a-zA-Z#%.,() -]*")
 
-_BUBBLE_KEYS = ("version", "background", "text", "link", "border", "radius", "shadow", "animation", "pattern", "ornaments", "dark")
+# font 只存在库里和后台：发给客户端之前要用 split_font 拿出来，见那里的说明
+_BUBBLE_KEYS = ("version", "background", "text", "link", "border", "radius", "shadow", "animation", "pattern", "ornaments", "font", "dark")
 # 深色覆盖里只有配色相关的这几项；圆角、动效、角饰两种配色共用
 _DARK_KEYS = ("background", "text", "link", "border", "shadow", "pattern")
 _BORDER_KEYS = ("color", "width")
@@ -303,6 +322,8 @@ def validate_bubble_style(style: Any) -> dict[str, Any]:
         ornaments = _ornaments(source["ornaments"], "ornaments")
         if ornaments:
             result["ornaments"] = ornaments
+    if source.get("font") is not None:
+        result["font"] = _choice(source["font"], "font", FONT_KEYS)
     if source.get("dark") is not None:
         dark = _surface(_object(source["dark"], "dark", _DARK_KEYS), "dark.", required=False)
         if dark:
@@ -361,3 +382,25 @@ def validate_frame_style(style: Any) -> dict[str, Any]:
         if dark:
             result["dark"] = dark
     return result
+
+
+def split_font(style: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
+    """把气泡样式里的 font 拿出来：返回（不带 font 的样式, 字体 key）。
+
+    契约 2.2 规定客户端遇到不认识的字段整件皮肤作废，2.0.10 之前的客户端不认识 font —— 所以 font 只存在库里和后台，
+    凡是发给客户端的样式（商店列表、用户的 cosmetics、礼物记录）都先过这里，字体另外放在样式旁边（font_view）。
+    """
+    if "font" not in style:
+        return style, None
+    rest = {key: value for key, value in style.items() if key != "font"}
+    key = style["font"]
+    return rest, key if isinstance(key, str) and key in FONTS else None
+
+
+def font_view(key: str | None) -> dict[str, str] | None:
+    """发给客户端的字体：{ key, name, woff2, ttf }。没配置 SHOP_FONT_BASE_URL（字体文件没地方放）时一律是 None。"""
+    base = (settings.shop_font_base_url or "").rstrip("/")
+    if not key or key not in FONTS or not base:
+        return None
+    name, stem, _license = FONTS[key]
+    return {"key": key, "name": name, "woff2": f"{base}/{stem}.woff2", "ttf": f"{base}/{stem}.ttf"}

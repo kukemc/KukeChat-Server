@@ -82,7 +82,7 @@
       "id": 12,                                    // 送礼记录的 id
       "kind": "gift",
       "gift": { "key": "cake", "name": "蛋糕", "icon": "cake", "price": 20, "tier": 2 },                   // kind = item 时为 null
-      "item": null,                                // kind = item：{ sku, name, category, style, duration_days }
+      "item": null,                                // kind = item：{ sku, name, category, style, font, duration_days }（font 见 shop.md 2.6）
       "count": 3,
       "to_user": { "id": 42, "display_name": "阿夸", "avatar_url": "…" },
       "message": "生日快乐！"                       // 没写留言是 ""
@@ -121,7 +121,7 @@
 ```jsonc
 { "id": 12, "kind": "gift",
   "gift": { "key": "cake", "name": "蛋糕", "icon": "cake", "price": 20, "tier": 2 },   // kind = item 时为 null
-  "item": null,                       // kind = item：{ sku, name, category, style, duration_days }
+  "item": null,                       // kind = item：{ sku, name, category, style, font, duration_days }（font 见 shop.md 2.6）
   "count": 3,
   "amount": 60,                       // 送礼人花掉的币，也是收礼人涨的心意值
   "from_user": { /* UserPublic */ }, "to_user": { /* UserPublic */ },

@@ -477,7 +477,7 @@ class TimedItemTests(GiftTestCase):
         self.assertEqual((await self._overview_item("carol", "bubble.timed"))["obtainable"], "level")
         self.assertEqual((await self._buy("carol", "timed"))["item"]["expires_at"], self.now + 30 * DAY)
 
-    async def test_default_frames_include_the_two_timed_ones(self) -> None:
+    async def test_default_frames_are_timed_except_level_rewards(self) -> None:
         async with self.sessions() as db:
             await shop_service.ensure_default_items(db)
             rows = await db.execute(select(ShopItem.sku, ShopItem.price, ShopItem.duration_days).where(ShopItem.sku.like("frame.%")))
@@ -487,8 +487,10 @@ class TimedItemTests(GiftTestCase):
             await db.commit()
             self.assertEqual(await shop_service.ensure_default_items(db), 0)
             self.assertEqual(await db.scalar(select(ShopItem.price).where(ShopItem.sku == "frame.angel")), 999)
-        self.assertEqual((frames["frame.angel"], frames["frame.devil"]), ((120, 30), (50, 30)))
-        self.assertEqual({days for sku, (_price, days) in frames.items() if sku not in ("frame.angel", "frame.devil")}, {None})
+        self.assertEqual((frames["frame.angel"], frames["frame.devil"]), ((66, 31), (40, 31)))
+        # 2.0.10 起付费的都是 31 天，只有等级奖励的两件永久
+        self.assertEqual({sku for sku, (_price, days) in frames.items() if days is None}, {"frame.halo", "frame.crown"})
+        self.assertEqual({days for _price, days in frames.values() if days is not None}, {31})
 
     async def test_style_edits_keep_the_expiry_of_equipped_items(self) -> None:
         self.ledger.donate(OID_A, 200)
@@ -787,13 +789,27 @@ class SendTests(GiftTestCase):
 
 
 class ItemGiftTests(GiftTestCase):
+    async def test_item_ref_keeps_the_font_out_of_the_style(self) -> None:
+        """送的是带专属字体的气泡：礼物记录和消息里 style 不带 font，字体放在旁边（docs/shop.md 2.6）。"""
+        with patch.object(settings, "shop_font_base_url", "https://cdn.example/fonts/"):
+            await self._as("admin", shop_service.admin_update_item, self.items["timed"], {"style": {**STYLE, "font": "wenkai"}})
+            self.ledger.donate(OID_A, 100)
+            sent = await self._send_item("bubble.timed")
+            font = {"key": "wenkai", "name": "霞鹜文楷", "woff2": "https://cdn.example/fonts/lxgw-wenkai-gb-v1.woff2", "ttf": "https://cdn.example/fonts/lxgw-wenkai-gb-v1.ttf"}
+            self.assertEqual((sent["record"]["item"]["style"], sent["record"]["item"]["font"]), (STYLE, font))
+            self.assertEqual(json.loads(sent["message"].metadata_json)["gift"]["item"]["style"], STYLE)
+        # 没配字体地址：照样不带 font，字体那一项是 null
+        async with self.sessions() as db:
+            record = (await db.execute(select(GiftRecord))).scalar_one()
+        self.assertEqual((gift_service._item_ref(record)["style"], gift_service._item_ref(record)["font"]), (STYLE, None))
+
     async def test_the_three_cases_of_giving_an_item(self) -> None:
         self.ledger.donate(OID_A, 1000)
         # 一、对方没有：按现价扣币，对方直接拥有（不自动装备），心意值 = 价格
         first = await self._send_item("bubble.timed", message="戴上试试")
         record = first["record"]
         self.assertEqual((record["kind"], record["count"], record["amount"], record["gift"]), ("item", 1, 50, None))
-        self.assertEqual(record["item"], {"sku": "bubble.timed", "name": "限时", "category": "bubble", "style": STYLE, "duration_days": 30})
+        self.assertEqual(record["item"], {"sku": "bubble.timed", "name": "限时", "category": "bubble", "style": STYLE, "font": None, "duration_days": 30})
         self.assertEqual(first["message"].content, "[礼物] 送给 阿夸 「限时」")
         self.assertEqual((await self._coins("alice"), await self._charm("bob"), await self._expiry("bob", "timed")), (950, 50, START + 30 * DAY))
         self.assertEqual(((await self._public("bob"))["cosmetics"], (await self._overview_item("bob", "bubble.timed"))["owned"]), ({}, True))

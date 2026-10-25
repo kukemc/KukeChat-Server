@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
 from app.core import localtime
 from app.models.enums import PlatformRole, PresenceStatus, UserStatus
+from app.services.shop_style import font_view, split_font
 
 
 def _cosmetic_expired(entry: dict[str, Any], now: datetime) -> bool:
@@ -25,7 +26,7 @@ def _cosmetic_expired(entry: dict[str, Any], now: datetime) -> bool:
 
 
 def load_cosmetics(value: Any, now: datetime | None = None) -> dict[str, Any]:
-    """users.cosmetics 那一列（JSON 文本）-> { 槽位: { sku, style[, expires_at] } }，已经到期的限时商品不在里面。
+    """users.cosmetics 那一列（JSON 文本）-> { 槽位: { sku, style[, expires_at][, font_off] } }，已经到期的限时商品不在里面。
 
     限时商品的到期时间和样式一起冗余在这一列里（expires_at，ISO 时间），所以「到期了就不算装备着」是读的时候现场判断的，
     不依赖定时清扫，也不用查 shop_purchases。空的、解析不了的、形状不对的一律给 {}。
@@ -50,15 +51,26 @@ def load_cosmetics(value: Any, now: datetime | None = None) -> dict[str, Any]:
         loaded[slot] = {"sku": entry["sku"], "style": entry["style"]}
         if isinstance(entry.get("expires_at"), str) and entry["expires_at"]:
             loaded[slot]["expires_at"] = entry["expires_at"]
+        # 本人在装备时关掉了这件气泡的专属字体（docs/shop.md 2.6）
+        if entry.get("font_off") is True:
+            loaded[slot]["font_off"] = True
     return loaded
 
 
 def parse_cosmetics(value: Any) -> dict[str, Any]:
-    """users.cosmetics 那一列（JSON 文本）-> { 槽位: { sku, style } }。空的、解析不了的、形状不对的一律给 {}。
+    """users.cosmetics 那一列（JSON 文本）-> { 槽位: { sku, style[, font] } }。空的、解析不了的、形状不对的一律给 {}。
 
     只解析这一列本身，不查库：用户对象在消息发送等热路径上。已经到期的限时商品不出现（见 load_cosmetics）。
+    气泡样式里的 font 不能留在 style 里（老客户端会整件作废），拿出来放在旁边；本人关掉了专属字体就不给（docs/shop.md 2.6）。
     """
-    return {slot: {"sku": entry["sku"], "style": entry["style"]} for slot, entry in load_cosmetics(value).items()}
+    parsed: dict[str, Any] = {}
+    for slot, entry in load_cosmetics(value).items():
+        style, font = split_font(entry["style"])
+        parsed[slot] = {"sku": entry["sku"], "style": style}
+        view = None if entry.get("font_off") else font_view(font)
+        if view is not None:
+            parsed[slot]["font"] = view
+    return parsed
 
 
 class UserBirthday(BaseModel):
@@ -114,7 +126,7 @@ class UserPublic(BaseModel):
     account_level: int = 0
     # 公开展示的风纪委员层级：trainee / regular / senior；不是在任委员或本人没选择公开时为 null
     jury_badge: str | None = None
-    # 装备着的商店装饰（docs/shop.md 2.3）：{ 槽位: { sku, style } }，没装备时是 {}
+    # 装备着的商店装饰（docs/shop.md 2.3）：{ 槽位: { sku, style[, font] } }，没装备时是 {}
     cosmetics: dict[str, Any] = Field(default_factory=dict)
     # 资料累计收到的赞，见 docs/chat-features.md 第 6 节。直接读 users.profile_like_count 这一列
     profile_like_count: int = 0

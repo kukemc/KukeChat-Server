@@ -67,6 +67,8 @@ class GiftItemRef(BaseModel):
     name: str
     category: str
     style: dict[str, Any] = Field(default_factory=dict)
+    # 气泡的专属字体（docs/shop.md 2.6），见 ShopItemBase.font
+    font: dict[str, str] | None = None
     duration_days: int | None = None
 
 

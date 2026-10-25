@@ -59,7 +59,9 @@ KukeChat 自己不发币、不存币。余额是算出来的：
   "owned": false,
   "equipped": false,
   "obtainable": "buy",               // 我现在能怎么得到它：buy 可以买 / level 等级够了可以免费领 / locked 等级不够且不卖 / owned 已拥有 / renew 我拥有的是限时的，可以再买来续期
-  "expires_at": null                 // 我拥有的这一件什么时候到期；永久或者没拥有为 null
+  "expires_at": null,                // 我拥有的这一件什么时候到期；永久或者没拥有为 null
+  "font": null,                      // 气泡的专属字体 { key, name, woff2, ttf }，没有为 null。见 2.6
+  "font_enabled": true               // 我装备着这件、而且关掉了它的专属字体时为 false。见 2.6
 }
 ```
 
@@ -87,7 +89,7 @@ KukeChat 自己不发币、不存币。余额是算出来的：
   "border": { "color": "#ffffff33", "width": 1 },        // 可空；width 0–3
   "radius": 14,                       // 4–22，可空（空则用主题默认）
   "shadow": "0 2px 8px #7F7FD566",    // 可空
-  "animation": "flow",                // none / flow（渐变缓慢流动）/ shimmer（扫光）/ breathe（光晕呼吸），可空
+  "animation": "flow",                // none / flow（渐变缓慢流动）/ shimmer（扫光）/ breathe（光晕呼吸）/ scan（一道扫描线从上往下扫，2.0.10 起），可空
   // 叠在底色上的纹样，可空。key 是客户端内置的图案
   "pattern": { "key": "stars", "color": "#ffffff", "opacity": 0.18, "scale": 1 },
   // 贴在气泡角上的小装饰，可空，最多 2 个。key 是客户端内置的矢量图形
@@ -99,10 +101,11 @@ KukeChat 自己不发币、不存币。余额是算出来的：
 }
 ```
 
-- `pattern.key` ∈ `dots` 圆点 / `grid` 细格 / `stripes` 斜纹 / `waves` 波浪 / `stars` 星点 / `hearts` 小爱心 / `pixels` 像素块 / `clouds` 云朵 / `petals` 花瓣 / `noise` 细颗粒。`opacity` 0–0.6，`scale` 0.5–2。
-- `ornaments[].key` ∈ `sparkle` 闪光 / `star` 星星 / `moon` 月亮 / `sun` 太阳 / `heart` 爱心 / `petal` 花瓣 / `cloud` 云 / `paw` 猫爪 / `leaf` 叶子 / `crown` 皇冠 / `pixel_heart` 像素爱心 / `bolt` 闪电 / `snow` 雪花。`corner` ∈ `tl` / `tr` / `bl` / `br`（装饰骑在气泡的角上，略微探出去一点）；`size` 10–28；`animated` 为 true 时轻微地闪 / 晃（同样受「减少动态效果」约束）。
+- `pattern.key` ∈ `dots` 圆点 / `grid` 细格 / `stripes` 斜纹 / `waves` 波浪 / `stars` 星点 / `hearts` 小爱心 / `pixels` 像素块 / `clouds` 云朵 / `petals` 花瓣 / `noise` 细颗粒；**2.0.10 起**另有 `scanlines` 扫描线 / `circuit` 电路 / `fizz` 汽水泡 / `ruled` 信纸横线 / `confetti` 彩纸屑。`opacity` 0–0.6，`scale` 0.5–2。
+- `ornaments[].key` ∈ `sparkle` 闪光 / `star` 星星 / `moon` 月亮 / `sun` 太阳 / `heart` 爱心 / `petal` 花瓣 / `cloud` 云 / `paw` 猫爪 / `leaf` 叶子 / `crown` 皇冠 / `pixel_heart` 像素爱心 / `bolt` 闪电 / `snow` 雪花；**2.0.10 起**另有 `cursor` 光标 / `stamp` 邮票 / `cherry` 樱桃 / `note` 音符 / `koi` 锦鲤 / `planet` 行星。`corner` ∈ `tl` / `tr` / `bl` / `br`（装饰骑在气泡的角上，略微探出去一点）；`size` 10–28；`animated` 为 true 时轻微地闪 / 晃（同样受「减少动态效果」约束）。
 - `dark` 里只能出现 `background` / `text` / `link` / `border` / `shadow` / `pattern`，没写的沿用浅色的值；圆角、动效、角饰两种配色共用。
-- 图案和装饰都是**客户端内置**的，样式里只给名字和颜色，不能带图片地址。客户端遇到不认识的 `key` 就跳过那一项，其余照常画——所以以后加新图案要发版，但用已有图案组合出新皮肤不用。
+- 图案和装饰都是**客户端内置**的，样式里只给名字和颜色，不能带图片地址。客户端遇到不认识的 `key` 就跳过那一项，其余照常画——所以以后加新图案要发版，但用已有图案组合出新皮肤不用。标着「2.0.10 起」的那几个，更早的客户端不认识：纹样、角饰跳过那一项，`scan` 动效当作 `none`。
+- 库里的气泡样式还可以有 `font`（专属字体的 key），但它**不会**出现在发给客户端的 `style` 里，见 2.6。
 
 - 颜色只接受 `#rgb` / `#rrggbb` / `#rrggbbaa`；`background` 只接受一个颜色或一个 `linear-gradient(...)` / `radial-gradient(...)`（里面只能有角度、颜色和百分比）；`shadow` 只接受「偏移 模糊 [扩散] 颜色」的形式，最多两层。
 - 客户端必须尊重「减少动态效果」的系统设置（此时 `animation` 当作 `none`）。
@@ -136,7 +139,7 @@ KukeChat 自己不发币、不存币。余额是算出来的：
     "gap": 1           // 环和头像之间的留白 0–3，可空（默认 0）
   },
   "glow": { "color": "#7F7FD588", "blur": 8 },   // 外发光，可空；blur 0–16
-  "animation": "spin",   // none / spin（环的渐变缓慢旋转）/ pulse（发光呼吸）/ shimmer（环上扫光），可空
+  "animation": "spin",   // none / spin（环的渐变缓慢旋转）/ pulse（发光呼吸）/ shimmer（环上扫光）/ flicker（霓虹灯管那样不规则地闪，2.0.10 起），可空
   // 贴在环上的装饰，可空，最多 3 个。key 是客户端内置的矢量图形
   "ornaments": [
     { "key": "crown", "position": "top", "color": "#ffd76a", "size": 18, "animated": false }
@@ -147,12 +150,14 @@ KukeChat 自己不发币、不存币。余额是算出来的：
 
 - `ring` 必填，其中 `background` 和 `width` 必填。`glow` 写了的话 `color` 和 `blur` 都要有。
 - `ring.background` 接受一个颜色，或者一个 `linear-gradient(...)` / `radial-gradient(...)` / `conic-gradient(...)`。前两种的规则和气泡的 `background` 完全一样；`conic-gradient(...)` 里只能有开头可选的 `from <角度>deg`（-360 到 360）、颜色和百分比，2–8 个颜色——不能写 `at <位置>`、不能用角度当色标、不能用 `turn` / `rad`。**只有这里放开了 conic**，气泡的 `background` 仍然不接受。要让 `spin` 转起来没有接缝，首尾写同一个颜色。
-- `ornaments[].key` ∈ 气泡的全部角饰（见 2.2），再加头像框专用的：`cat_ears` 猫耳 / `halo` 光环 / `horns` 小恶魔角 / `laurel` 月桂 / `wings` 翅膀 / `bow` 蝴蝶结。这几个专用的不能用在气泡上。
+- `ornaments[].key` ∈ 气泡的全部角饰（见 2.2），再加头像框专用的：`cat_ears` 猫耳 / `halo` 光环 / `horns` 小恶魔角 / `laurel` 月桂 / `wings` 翅膀 / `bow` 蝴蝶结，**2.0.10 起**另有 `headphones` 头戴耳机 / `flame` 火苗。这几个专用的不能用在气泡上。更早的客户端不认识 2.0.10 的装饰就跳过那一项，`flicker` 当作 `none`。
 - `ornaments[].position` ∈ `top` / `tr` / `right` / `br` / `bottom` / `bl` / `left` / `tl`（环上的八个方位），同一个位置只能放一个；`size` 10–28；`animated` 同气泡。注意位置字段叫 `position`，不是气泡的 `corner`。
 - `dark` 里只能出现 `ring.background` 和 `glow`（`glow` 要写就写完整的 `color` + `blur`），没写的沿用浅色的值；环的粗细、留白、动效、装饰两种配色共用。装饰没有深色覆盖，颜色要选在浅色和深色背景上都看得见的。
 - 颜色格式、「减少动态效果」（此时 `animation` 当作 `none`、`animated` 当作 false）、不认识的 `version` / 字段 / `key` 的处理，都和气泡一致（见 2.2）。
-- 服务端首次启动时播种 11 件默认头像框（只在 sku 不存在时插入，后台改过的不动）：`frame.mint` 薄荷 10 / `frame.sakura` 樱花 30 / `frame.ocean` 海盐 60 / `frame.neko` 猫耳 60 / `frame.galaxy` 星环 100 / `frame.aurora` 极光 200 / `frame.halo` 光环（4 级解锁）/ `frame.crown` 加冕（16 级解锁）/ `frame.bow` 蝴蝶结 30 / `frame.devil` 小恶魔 **50 币 / 30 天** / `frame.angel` 天使 **120 币 / 30 天**（这两件是限时的，见 2.5；其余永久）。它们的样式和客户端 `dev/mocks/shop.ts` 的 `FRAMES` 是同一套，要调先在客户端看效果，再两边一起改。
-- 后台编辑器需要的几张表在 `GET /admin/shop/settings` 里：`frame_animations`、`frame_ornaments`、`frame_positions`。
+- 服务端首次启动时播种 11 件默认头像框（只在 sku 不存在时插入，后台改过的不动）：`frame.mint` 薄荷 / `frame.sakura` 樱花 / `frame.ocean` 海盐 / `frame.neko` 猫耳 / `frame.galaxy` 星环 / `frame.aurora` 极光 / `frame.halo` 光环（4 级解锁）/ `frame.crown` 加冕（16 级解锁）/ `frame.bow` 蝴蝶结 / `frame.devil` 小恶魔 / `frame.angel` 天使。它们的样式和客户端 `dev/mocks/shop.ts` 的 `FRAMES` 是同一套，要调先在客户端看效果，再两边一起改。
+- **2.0.10 起最早那一批的付费商品都改成买一次 31 天（限时，见 2.5），价格跟着降了**；等级奖励的四件（`bubble.moonlight` / `bubble.corona` / `frame.halo` / `frame.crown`）仍然免费、永久。新价格：气泡 `bubble.mint` 8 / `bubble.peach` 18 / `bubble.ocean` 30 / `bubble.pixel` 35 / `bubble.galaxy` 50 / `bubble.aurora` 88；头像框 `frame.mint` 8 / `frame.sakura` 18 / `frame.ocean` 30 / `frame.neko` 35 / `frame.galaxy` 50 / `frame.aurora` 88 / `frame.bow` 20 / `frame.devil` 40 / `frame.angel` 66。种子只管不存在的 sku，线上已有的这 15 件用 `scripts/shop_reprice_2_0_10.py` 改一次（默认只预览，`--apply` 才写库；只改商品，不动拥有记录——已经永久拥有的人照样永久，见 2.5 最后几条）。
+- **2.0.10 的新一批**（同样只在 sku 不存在时插入），**都是 31 天限时**：气泡 `bubble.soda` 汽水 38 / `bubble.letter` 信笺 45 / `bubble.koi` 锦鲤 52 / `bubble.party` 派对 58 / `bubble.terminal` 终端 68 / `bubble.neon` 霓虹 78；头像框 `frame.koi` 锦鲤 38 / `frame.flame` 烈焰 58 / `frame.headphones` 耳机 52 / `frame.planet` 行星 66 / `frame.terminal` 终端 30 / `frame.neon` 霓虹 78。用到了上面标「2.0.10 起」的纹样、角饰、装饰和动效；其中汽水、信笺、终端、霓虹四件气泡带专属字体（站酷快乐体 / 霞鹜文楷 / 缝合像素体 / 得意黑，见 2.6）。更早的客户端上它们照样能用，只是少了新图形和字体。
+- 后台编辑器需要的几张表在 `GET /admin/shop/settings` 里：`frame_animations`、`frame_ornaments`、`frame_positions`，以及气泡能用的字体 `fonts`（见 2.6）。
 
 ### 2.5 限时商品
 
@@ -168,6 +173,30 @@ KukeChat 自己不发币、不存币。余额是算出来的：
 - 别人送的商品（[`gifts.md`](gifts.md)）走同一套规则：对方没有就给 N 天，已有限时的就续期，已经永久拥有则送不出去。
 - **修改商品的 `duration_days` 只影响之后的购买 / 赠送**，不动已有的拥有记录。把限时商品改成永久之后，已经拥有限时版的人再买一次会换成永久的。
 - 购买记录（3.5）每续一次各有一条；被后台收回时收回的是当前的那一条——选了退币也只退最后一次的钱。
+
+### 2.6 气泡的专属字体（2.0.10 起）
+
+一件气泡可以带一种专属字体：装备着它的人发的消息，别人看到时气泡里的字用这种字体画。
+
+- 库里和后台的气泡样式多一个可空的 `font`，值是下表里的 key（不在表里的 422 `invalid_style`，`field = "font"`；深色覆盖里没有它，头像框也没有）。**`style.font` 只存在于库里和后台的接口里**：2.0.10 之前的客户端遇到 `style` 里不认识的字段会把整件皮肤作废（2.2 最后一条），所以服务端发给客户端的 `style` 一律先把 `font` 拿掉。
+- 客户端拿到的是放在 `style` **旁边**的 `font`：`{ "key": "pixel", "name": "缝合像素体", "woff2": "https://…/fusion-pixel-12px-zh-v1.woff2", "ttf": "https://…/fusion-pixel-12px-zh-v1.ttf" }`，没有专属字体时为 null 或者不出现。出现在三个地方：
+  - 商店的商品对象（`GET /shop` 的 `items[]`、购买接口返回的 `item`）：`font` 为 null 或上面的对象；
+  - 礼物记录里的商品（[`gifts.md`](gifts.md) 的 `item: { sku, name, category, style, font, duration_days }`，包括礼物消息的 `metadata.gift.item`）；
+  - `cosmetics.<槽>`（2.3，用户对象和 `user.cosmetics.updated` 里）：`{ "sku": "bubble.terminal", "style": { … }, "font": { … } }`，没有字体、或者本人关掉了字体时**不出现** `font` 这个键。
+- 字体文件放在 `SHOP_FONT_BASE_URL` 下面（例如对象存储主桶的 `https://…/fonts`），文件名是 `<文件名>.woff2`（电脑端）和 `<文件名>.ttf`（安卓）。**没配置 `SHOP_FONT_BASE_URL` 时服务端一律不下发字体**（上面的 `font` 都是 null / 不出现），气泡照常显示、只是用系统字体。换字体文件时换文件名（客户端按地址缓存）。
+
+| key | 名字 | 文件名 | 授权 |
+| --- | --- | --- | --- |
+| `pixel` | 缝合像素体 | `fusion-pixel-12px-zh-v1` | OFL-1.1 |
+| `wenkai` | 霞鹜文楷 | `lxgw-wenkai-gb-v1` | OFL-1.1 |
+| `kuaile` | 站酷快乐体 | `zcool-kuaile-v1` | OFL-1.1（Google Fonts 上的版本） |
+| `smiley` | 得意黑 | `smiley-sans-v1` | OFL-1.1 |
+
+- 客户端：用到时才下载（懒加载），下载过的按地址缓存；下载中、下载失败都先用系统字体画，不要挡住消息显示。只加载 `https://` 的地址，别的一律当作没有字体。
+- **本人可以关掉**：`PUT /shop/equipped` 多一个可选的 `use_font`。`false` = 装备这件但不用它的字体（别人看到的 `cosmetics` 里没有 `font`）；`true` = 用；不传 = 还是原来那一件就保持原来的选择，换了一件（或者卸下之后再装）就是用。只改 `use_font` 就再装一次同一件。没有专属字体的商品传什么都一样。
+- 商品对象多一个 `font_enabled`：我正装备着这件、它有专属字体、而且我关掉了字体时为 false，其余情况恒为 true。客户端的开关按它显示。
+- 看的人关掉了「显示别人的气泡皮肤」时，别人的专属字体也不显示（字体是皮肤的一部分）。
+- 后台：`GET /admin/shop/items` 等返回的 `style` 是原样的（带着 `font`），旁边同样有 `font` 对象；`GET /admin/shop/settings` 的 `fonts` 是 `[{ key, name, license, available }]`，`available` 为 false 表示服务端没配 `SHOP_FONT_BASE_URL`、客户端拿不到文件。
 
 ## 3. 接口
 
@@ -224,7 +253,7 @@ KukeChat 自己不发币、不存币。余额是算出来的：
 
 ### 3.4 `PUT /shop/equipped`
 
-body `{ "slot": "bubble", "sku": "bubble.aurora" }`，`sku` 传 null 表示卸下。→ `{ "equipped": { … } }`（所有槽的状态）。只能装备自己拥有的（403 `not_owned`）。头像框是 `{ "slot": "frame", "sku": "frame.galaxy" }`；一次只动一个槽，别的槽不变。
+body `{ "slot": "bubble", "sku": "bubble.aurora" }`，`sku` 传 null 表示卸下；可选的 `use_font`（true / false）决定用不用这件气泡的专属字体，见 2.6。→ `{ "equipped": { … } }`（所有槽的状态）。只能装备自己拥有的（403 `not_owned`）。头像框是 `{ "slot": "frame", "sku": "frame.galaxy" }`；一次只动一个槽，别的槽不变。
 
 ### 3.5 `GET /shop/purchases?limit&offset`
 
@@ -268,7 +297,7 @@ body `{ "slot": "bubble", "sku": "bubble.aurora" }`，`sku` 传 null 表示卸�
 | `POST /admin/shop/grants` | `{ user_id, amount, reason }` 给用户加（正数）/ 扣（负数）金币。见 5.2 |
 | `POST /admin/shop/users/{user_id}/grant` | `{ item_id, note, duration_days }` 赠送。`duration_days` 不传 = 按商品的设置；正整数（≤ 3650）= 这一份只给这么多天；`0` = 送成永久。给已经拥有这件**限时**商品的人再送 = 续期（在原到期时间上加）；已经永久拥有是 409 `already_owned`。范围不对是 422 `invalid_duration` |
 | `POST /admin/shop/users/{user_id}/revoke` | `{ item_id, note, refund }` 收回（同时卸下）。收回的是当前的那一条记录；`refund` 为 true 时只退那一条的钱 |
-| `GET /admin/shop/settings` | 官方作品、各项阈值，以及样式里能用的名字：`categories`、`tags`、气泡的 `animations` / `patterns` / `ornaments`、头像框的 `frame_animations` / `frame_ornaments` / `frame_positions`，还有 `price_max`、`unlock_level_max`、`duration_max`（只读） |
+| `GET /admin/shop/settings` | 官方作品、各项阈值，以及样式里能用的名字：`categories`、`tags`、气泡的 `animations` / `patterns` / `ornaments`、头像框的 `frame_animations` / `frame_ornaments` / `frame_positions`、气泡能用的字体 `fonts`（2.6），还有 `price_max`、`unlock_level_max`、`duration_max`（只读） |
 
 审计日志：赠送仍是 `shop.grant`（`details` 多了 `duration_days`：这一份给了多少天，永久为 null），改商品仍是 `shop.item.update`。限时商品到期是系统行为，不写审计日志。
 赠送 / 扣除金币是 `shop.coins.grant`（`target_type = "user"`，`details`：`{ grant_id, amount, reason, balance_before, balance_after }`）。

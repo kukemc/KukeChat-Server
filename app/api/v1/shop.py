@@ -48,7 +48,7 @@ async def set_shop_equipped(
     current_user: Annotated[User, Depends(get_current_user)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> ShopEquipResult:
-    return ShopEquipResult(**await shop_service.set_equipped(db, current_user, payload.slot, payload.sku))
+    return ShopEquipResult(**await shop_service.set_equipped(db, current_user, payload.slot, payload.sku, payload.use_font))
 
 
 @router.get("/purchases", response_model=ShopPurchasePage)

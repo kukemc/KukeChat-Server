@@ -169,6 +169,7 @@ python -m pytest tests/ -q
 | `STORAGE_BACKEND` | `local` 或 `s3`；选 `s3` 时填写 `S3_*`，`S3_PRIVATE_BUCKET` 用于群文件 |
 | `CONTENT_MODERATION_ENABLED` | 默认关闭。本项目不自带审核服务，开启时必须提供 `CONTENT_MODERATION_URL` |
 | `VOICE_ASR_URL` | 语音识别服务地址，留空则语音转文字和语音口令红包不可用 |
+| `SHOP_FONT_BASE_URL` | 商店气泡专属字体文件所在的目录（https），留空则不下发字体，见 [`docs/shop.md`](docs/shop.md) 2.6 |
 | `CCW_BIND_*` | CCW 账号绑定，留空则功能不可用；另需接入 CCW 网关，见[集成点](#集成点) |
 | `SMTP_*` | 邮件发送，默认关闭 |
 | `INVITE_BASE_URL` | 邀请链接的落地页，通常指向你部署的客户端 |

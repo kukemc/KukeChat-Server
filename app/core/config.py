@@ -141,6 +141,8 @@ class Settings(BaseSettings):
     ccw_shop_creation_oid: str | None = None
     # 每人多少秒内最多向 CCW 核实一次余额；购买时在这段时间内核实成功过就直接用
     shop_refresh_interval_seconds: int = Field(default=20, ge=1, le=3600)
+    # 气泡专属字体文件所在的目录（docs/shop.md 2.6），例如对象存储主桶的 https://…/fonts；不配置时不下发字体
+    shop_font_base_url: str | None = None
     # 给余额来源的实现用的两个参数：核实时先看「最近投过币的前 N 人」，不在里面再取全量；全量结果在进程内缓存多少秒
     shop_ranking_recent_limit: int = Field(default=200, ge=1, le=1000)
     shop_ranking_cache_seconds: int = Field(default=60, ge=0, le=3600)
