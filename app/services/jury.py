@@ -980,6 +980,25 @@ async def next_case(db: AsyncSession, user: User) -> dict[str, Any] | None:
     return await juror_case_view(db, case, assignment)
 
 
+def _evidence_text(item: dict[str, Any], metadata: dict[str, Any]) -> Any:
+    """委员看到的正文。红包消息的正文是给旧客户端的兜底文字，看不到接龙 / 语音口令，这里换成发的人写的全部文字；
+    领接龙红包时自动发出的那句话，标明不是领取人自己打的。"""
+    content = item.get("content")
+    packet = metadata.get("red_packet")
+    if item.get("type") == "red_packet" and isinstance(packet, dict):
+        chain, voice = packet.get("chain_text"), packet.get("voice_text")
+        play = "语音" if isinstance(voice, str) else "接龙" if isinstance(chain, str) else ""
+        parts = [f"[{'专属' if packet.get('target_user_id') is not None else ''}{play}红包] {packet.get('greeting') or ''}".strip()]
+        if isinstance(chain, str):
+            parts.append(f"接龙口令：{chain}")
+        if isinstance(voice, str):
+            parts.append(f"语音口令：{voice}")
+        return "；".join(parts)
+    if isinstance(content, str) and isinstance(metadata.get("red_packet_chain"), dict):
+        return f"{content}（领取接龙红包时自动发出，口令是发红包的人定的）"
+    return content
+
+
 def _anonymize_messages(snapshot: dict[str, Any], disguise: tuple[datetime, tuple[Any, ...]] | None = None) -> list[dict[str, Any]]:
     """快照里的全部上下文（前后最多各 10 条），每条带相对被举报消息的位置。
 
@@ -1012,7 +1031,7 @@ def _anonymize_messages(snapshot: dict[str, Any], disguise: tuple[datetime, tupl
                 "is_target": bool(item.get("is_target")),
                 "type": item.get("type") or "text",
                 # 已撤回的上下文消息不展示内容；被举报的那条始终展示，否则没法评审。
-                "content": item.get("content") if (item.get("is_target") or not item.get("recalled_at")) else None,
+                "content": _evidence_text(item, metadata) if (item.get("is_target") or not item.get("recalled_at")) else None,
                 "images": images,
                 "created_at": snapshot_time(item.get("created_at"), shift),
                 "offset": index - target_index,
