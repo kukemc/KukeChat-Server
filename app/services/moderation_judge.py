@@ -277,6 +277,23 @@ def view_context(items: list[dict[str, Any]], *, after: int = REPORT_AFTER_MESSA
     return text, [value for value in map(line, earlier) if value], [value for value in map(line, later) if value]
 
 
+def author_contexts(items: list[dict[str, Any]], *, after: int = REPORT_AFTER_MESSAGES) -> list[tuple[str, list[str], list[str]]]:
+    """被举报人在委员视图里说的每一句文字各自的 (正文, 上文, 下文)，被举报的那条排第一（不是文字就没有它）。
+
+    判一道题要看被举报人在上下文里的全部言行（docs/jury-v2.md 2.1）：被举报的那句没问题，前面骂过人也是违规。"""
+    target = next((item for item in items if item.get("is_target")), None)
+    if target is None:
+        return []
+    speaker = target.get("speaker")
+    order = [target] + [item for item in items if item is not target and item.get("speaker") == speaker]
+    inputs: list[tuple[str, list[str], list[str]]] = []
+    for chosen in order:
+        text, context, later = view_context([{**item, "is_target": item is chosen} for item in items], after=after)
+        if text is not None:
+            inputs.append((text, context, later))
+    return inputs
+
+
 async def message_context(
     db: AsyncSession, message: Message, *, after: int = 0, author_label: str = AUTHOR_LABEL
 ) -> tuple[list[str], list[str]]:

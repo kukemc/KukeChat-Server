@@ -2,7 +2,8 @@
 
 管理员在后台「风纪 › 题库」点一下开始，由接到请求的那个进程在后台一道一道地问二审（最低一档 PRIORITY_AUDIT，
 只在没有实时的活时才问，和空闲复查同一个判断）。证据就是委员看到的那份：案件快照里的匿名消息，被举报的那条之前的
-上文、之后的下文，被举报人 = 那条消息的作者（moderation_judge.view_context）。
+上文、之后的下文，被举报人 = 那条消息的作者（moderation_judge.view_context）。题目要按被举报人在上下文里的全部言行判，
+所以被举报人说的每一句文字都问一遍（moderation_judge.author_contexts），取最高的那个概率；结论已经定了就不再往下问。
 
 二审概率和标准答案对不上的标「疑似答案有误」（suspect）：标准答案「不违规」但 p ≥ 0.8，或标准答案「违规」但 p ≤ 0.1。
 **从不自动改答案**，只给管理员一个筛选和标记，改不改由管理员决定。
@@ -141,17 +142,22 @@ async def start_audit(db: AsyncSession, admin_id: int, session_factory: Any = No
     return await audit_status(db)
 
 
-async def _question_input(db: AsyncSession, case: ReportCase) -> tuple[str | None, list[str], list[str]]:
-    """一道题送给二审的 (正文, 上文, 下文)：就是委员看到的那份匿名证据。没法判（被举报的不是文字、内容没了）正文为 None。"""
+def _settled(upheld: bool, p: float) -> bool:
+    """取最高概率时，问到这里结论就不会再变了：标准答案违规的只要有一句不低就是 ok，不违规的有一句够高就是 suspect。"""
+    return p > SUSPECT_VIOLATION_P if upheld else p >= SUSPECT_CLEAN_P
+
+
+async def _question_inputs(db: AsyncSession, case: ReportCase) -> list[tuple[str, list[str], list[str]]]:
+    """一道题送给二审的 (正文, 上文, 下文)，被举报人的每句文字一份：就是委员看到的那份匿名证据。没有能判的文字返回 []。"""
     from app.services import jury as jury_service
 
     view = await jury_service.juror_case_view(db, case)
     if case.target_type == "message":
-        return moderation_judge.view_context(view.get("messages") or [])
+        return moderation_judge.author_contexts(view.get("messages") or [])
     if case.target_type == "post" and isinstance(view.get("post"), dict):
         text = moderation_judge.clean_text(view["post"].get("content"), moderation_judge.TEXT_CHARS)
-        return (text or None), [], []
-    return None, [], []
+        return [(text, [], [])] if text else []
+    return []
 
 
 async def _still_mine(db: AsyncSession, run_id: str) -> dict[str, Any] | None:
@@ -188,9 +194,10 @@ async def run_audit(run_id: str, session_factory: Any = None) -> None:
                 if case is None or not case.is_golden:
                     index += 1
                     continue
-                text, context, after = await _question_input(db, case)
+                inputs = await _question_inputs(db, case)
+                upheld = bank_service.question_upheld(case)
                 now = datetime.now(UTC)
-                if text is None:
+                if not inputs:
                     case.bank_audit_flag = FLAG_SKIPPED
                     case.bank_audit_at = now
                     state["done"] = int(state.get("done") or 0) + 1
@@ -200,8 +207,16 @@ async def run_audit(run_id: str, session_factory: Any = None) -> None:
                     index += 1
                     continue
                 await release_connection(db)
-                verdict = await moderation_judge.judge(text, context, after, priority=moderation_judge.PRIORITY_AUDIT)
-                if verdict is None:
+                best: float | None = None
+                for text, context, after in inputs:
+                    verdict = await moderation_judge.judge(text, context, after, priority=moderation_judge.PRIORITY_AUDIT)
+                    if verdict is None:
+                        best = None
+                        break
+                    best = verdict.p if best is None else max(best, verdict.p)
+                    if _settled(upheld, best):
+                        break
+                if best is None:
                     failures += 1
                     if failures >= MAX_FAILURES:
                         state["status"] = "failed"
@@ -217,8 +232,8 @@ async def run_audit(run_id: str, session_factory: Any = None) -> None:
                     continue
                 failures = 0
                 await db.refresh(case)
-                p = round(verdict.p, 4)
-                flag = audit_flag(bank_service.question_upheld(case), p)
+                p = round(best, 4)
+                flag = audit_flag(upheld, p)
                 case.judge_p = p
                 case.bank_audit_flag = flag
                 case.bank_audit_at = datetime.now(UTC)

@@ -540,6 +540,29 @@ class BankAuditTests(IdleTestCase):
             self.assertEqual((total, sorted(item["case_id"] for item in items)), (2, sorted([missed.id, harsh.id])))
             self.assertEqual({item["case_id"]: item["audit_flag"] for item in items}, {missed.id: "suspect", harsh.id: "suspect"})
 
+    async def test_judges_everything_the_reported_user_said(self) -> None:
+        # 被举报的那句没问题，但同一个人前面骂过人：标准答案「不违规」是错的
+        async with self.sessions() as db:
+            clean = await self._question(
+                db, upheld=False,
+                snapshot=_snapshot(("2", "text", "你们长脑子了吗", False), ("1", "text", "初一", False), ("2", "text", "小弟弟", True), ("2", "text", "初三", False)),
+            )
+            # 标准答案「违规」，被举报的那句概率很低，但前面那句够高：不算疑似有误，也不用再问后面的
+            upheld = await self._question(
+                db, upheld=True, snapshot=_snapshot(("2", "text", "滚", False), ("2", "text", "哈哈", True), ("2", "text", "嗯", False)),
+            )
+        with patch.object(moderation_judge, "is_active", lambda: True), patch.object(moderation_judge, "judge", FakeJudge(0.05, 0.9, 0.02, 0.6)) as fake:
+            async with self.sessions() as db:
+                await audit_service.start_audit(db, self.ids["admin"], self.sessions)
+            await asyncio.gather(*list(audit_service._tasks))
+        self.assertEqual([call["text"] for call in fake.calls], ["小弟弟", "你们长脑子了吗", "哈哈", "滚"])
+        self.assertEqual((fake.calls[1]["context"], fake.calls[1]["after"]), ([], ["成员A：初一", "被举报人：小弟弟", "被举报人：初三"]))
+        async with self.sessions() as db:
+            for case, flag, p in ((clean, "suspect", 0.9), (upheld, "ok", 0.6)):
+                row = await db.get(ReportCase, case.id)
+                await db.refresh(row)
+                self.assertEqual((row.bank_audit_flag, row.judge_p), (flag, p))
+
     async def test_stale_run_is_interrupted_and_judge_off_refuses(self) -> None:
         async with self.sessions() as db:
             self.assertEqual((await audit_service.audit_status(db))["status"], "idle")
