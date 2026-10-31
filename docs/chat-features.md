@@ -545,3 +545,7 @@
 - 次数按 `voice_transcripts.requested_by_id`（第一个点、真正花了一次识别的人）+ `created_at` 数，几个进程共用一个口径。
 - 等对象存储和识别服务之前把数据库连接还回去（`release_connection`）。两个人同时点同一条：后存的撞唯一约束，直接用先存的那份。
 - 新表 `voice_transcripts`（`message_id` 唯一、外键 CASCADE —— 消息被修剪时跟着删；索引 `(requested_by_id, created_at)`）由启动时的 `create_all` 建，不用手动迁移。
+
+## 13. 群禁言不随退群失效
+
+退群、被移出时还没到期的群禁言存进 `group_mute_carryovers`，重新进群（任何路径：链接、邀请、审批、官方群……）时恢复，到期时间不变；永久禁言恢复后还是永久。不在群里的这段时间到期的就不再恢复。重新进群后群主、管理员照常可以解除。接口和字段没有变化，客户端不用改。

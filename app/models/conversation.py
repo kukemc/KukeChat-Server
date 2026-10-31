@@ -4,7 +4,7 @@ from datetime import date, datetime, timezone
 
 UTC = timezone.utc
 
-from sqlalchemy import Boolean, Date, DateTime, Enum as SAEnum, ForeignKey, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, Date, DateTime, Enum as SAEnum, ForeignKey, Index, Integer, String, Text, UniqueConstraint, delete, event, insert, select
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -125,6 +125,46 @@ class ConversationMember(Base):
     @property
     def next_level_exp(self) -> int:
         return next_level_remaining_exp(self.level_exp)
+
+
+class GroupMuteCarryover(Base):
+    """退群 / 被移出时还没到期的群禁言。成员行退群就删了，禁言不能跟着没：重新进群时恢复，见下面两个监听。"""
+
+    __tablename__ = "group_mute_carryovers"
+    __table_args__ = (UniqueConstraint("conversation_id", "user_id", name="uq_group_mute_carryover"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    conversation_id: Mapped[int] = mapped_column(ForeignKey("conversations.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    # 空 = 永久禁言
+    muted_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+def _aware(value: datetime) -> datetime:
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
+# 进群的路径很多（链接、邀请、审批、官方群、游戏模式……），挂在成员行的增删上，以后加新路径也绕不过去。
+@event.listens_for(ConversationMember, "before_delete")
+def _keep_mute_on_leave(_mapper, connection, member: ConversationMember) -> None:
+    if not member.muted or (member.muted_until is not None and _aware(member.muted_until) <= utc_now()):
+        return
+    table = GroupMuteCarryover.__table__
+    connection.execute(delete(table).where(table.c.conversation_id == member.conversation_id, table.c.user_id == member.user_id))
+    connection.execute(insert(table).values(conversation_id=member.conversation_id, user_id=member.user_id, muted_until=member.muted_until))
+
+
+@event.listens_for(ConversationMember, "before_insert")
+def _restore_mute_on_join(_mapper, connection, member: ConversationMember) -> None:
+    table = GroupMuteCarryover.__table__
+    where = (table.c.conversation_id == member.conversation_id, table.c.user_id == member.user_id)
+    kept = connection.execute(select(table.c.muted_until).where(*where)).first()
+    if kept is None:
+        return
+    connection.execute(delete(table).where(*where))
+    if kept.muted_until is None or _aware(kept.muted_until) > utc_now():
+        member.muted = True
+        member.muted_until = kept.muted_until
 
 
 class TemporaryConversationBlock(Base):
