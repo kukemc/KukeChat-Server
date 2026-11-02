@@ -150,6 +150,12 @@ async def release_connection(db: AsyncSession) -> bool:
 # 加索引：在 _ADDED_INDEXES 末尾追加，一律写 IF NOT EXISTS。
 
 _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("users", "public_id", "public_id VARCHAR(40)"),
+    ("users", "email_verified_at", "email_verified_at DATETIME"),
+    ("users", "account_banned_at", "account_banned_at DATETIME"),
+    ("users", "account_banned_until", "account_banned_until DATETIME"),
+    ("users", "account_ban_reason", "account_ban_reason TEXT"),
+    ("users", "official_group_pending", "official_group_pending BOOLEAN NOT NULL DEFAULT 0"),
     ("users", "registration_ip", "registration_ip VARCHAR(45)"),
     ("users", "ip_login_expires_at", "ip_login_expires_at DATETIME"),
     ("users", "platform_role", "platform_role VARCHAR(5) NOT NULL DEFAULT 'USER'"),
@@ -374,6 +380,7 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
 )
 
 _ADDED_INDEXES: tuple[tuple[str, str], ...] = (
+    ("users", "CREATE UNIQUE INDEX IF NOT EXISTS ix_users_public_id ON users (public_id)"),
     ("users", "CREATE UNIQUE INDEX IF NOT EXISTS ix_users_registration_ip ON users (registration_ip)"),
     ("users", "CREATE UNIQUE INDEX IF NOT EXISTS ix_users_ccw_student_oid ON users (ccw_student_oid)"),
     ("user_reports", "CREATE INDEX IF NOT EXISTS ix_user_reports_case_id ON user_reports (case_id)"),

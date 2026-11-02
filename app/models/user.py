@@ -42,6 +42,16 @@ class User(Base):
     profile_cover_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
     profile_cover_pending_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
     profile_cover_moderation_status: Mapped[str] = mapped_column(String(20), default=ModerationStatus.APPROVED.value, server_default=ModerationStatus.APPROVED.value)
+    # KukeAuth（docs/kukeauth.md）。public_id 是对外的 sub，老账号第一次走 OAuth 时才生成
+    public_id: Mapped[str | None] = mapped_column(String(40), unique=True, index=True, nullable=True)
+    # 老账号的 email 没验证过：这一列为空就不能当成这个人的邮箱对外给
+    email_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 账号级封禁：只有它才拦 OAuth 登录。聊天处罚（status / banned_until）不影响其他服务。banned_at 有值、until 为空 = 永久
+    account_banned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    account_banned_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    account_ban_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 账号站注册的号第一次登录 KukeChat 时才进官方群
+    official_group_pending: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
     ccw_student_oid: Mapped[str | None] = mapped_column(String(24), unique=True, index=True, nullable=True)
     ccw_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
     ccw_avatar_url: Mapped[str | None] = mapped_column(String(500), nullable=True)

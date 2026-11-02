@@ -104,3 +104,7 @@ api_router.include_router(admin_devices.router, prefix="/admin", tags=["admin"])
 from app.api.v1 import self_chat  # noqa: E402
 
 api_router.include_router(self_chat.router, prefix="/conversations", tags=["self-chat"])
+
+from app.api.v1 import admin_kukeauth  # noqa: E402
+
+api_router.include_router(admin_kukeauth.router, prefix="/admin", tags=["admin"])

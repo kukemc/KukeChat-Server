@@ -58,6 +58,7 @@ async def cookie_login_user(
     await device_bans.on_login(db, user, device)
     await ensure_user_not_disabled(db, user, issue_appeal_token=True)
     await device_bans.guard(db, device, user)
+    await join_pending_official_group(db, user)
     mark_user_seen(user, client_ip, login=True)
     raw_token, session = await create_cookie_session(db, user, client_ip, user_agent, days)
     return raw_token, CookieSessionRead(access_token=create_access_token(user.id), user=user, expires_at=session.expires_at)
@@ -172,7 +173,7 @@ async def get_user_by_registration_ip(db: AsyncSession, client_ip: str) -> User 
     return result.scalar_one_or_none()
 
 
-async def register_user(db: AsyncSession, payload: UserRegister, client_ip: str, device: DeviceContext | None = None) -> Token:
+async def create_user_account(db: AsyncSession, payload: UserRegister, client_ip: str, device: DeviceContext | None = None, *, official_group_pending: bool = False) -> User:
     email = str(payload.email) if payload.email is not None else None
     checks = [User.username == payload.username]
     if email is not None:
@@ -198,6 +199,7 @@ async def register_user(db: AsyncSession, payload: UserRegister, client_ip: str,
         last_login_at=datetime.now(UTC),
         last_seen_ip=client_ip,
         last_seen_at=datetime.now(UTC),
+        official_group_pending=official_group_pending,
     )
     db.add(user)
     if device is not None:
@@ -205,8 +207,22 @@ async def register_user(db: AsyncSession, payload: UserRegister, client_ip: str,
         await device_signals.record_now(db, user.id, device, registered=True)
     await db.commit()
     await db.refresh(user)
+    return user
+
+
+async def register_user(db: AsyncSession, payload: UserRegister, client_ip: str, device: DeviceContext | None = None) -> Token:
+    user = await create_user_account(db, payload, client_ip, device)
     await add_user_to_official_group(db, user.id)
     return Token(access_token=create_access_token(user.id), user=user)
+
+
+async def join_pending_official_group(db: AsyncSession, user: User) -> None:
+    """账号站注册的号第一次登录 KukeChat：这时才进官方群。"""
+    if not user.official_group_pending:
+        return
+    user.official_group_pending = False
+    await db.commit()
+    await add_user_to_official_group(db, user.id)
 
 
 async def add_user_to_official_group(db: AsyncSession, user_id: int) -> None:
@@ -235,6 +251,7 @@ async def login_user(db: AsyncSession, payload: UserLogin, client_ip: str, devic
     await device_bans.on_login(db, user, device)
     await ensure_user_not_disabled(db, user, issue_appeal_token=True)
     await device_bans.guard(db, device, user)
+    await join_pending_official_group(db, user)
     mark_user_seen(user, client_ip, login=True)
     await db.commit()
     await db.refresh(user)

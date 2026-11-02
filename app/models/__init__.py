@@ -41,6 +41,7 @@ from app.models.system import SystemSetting
 from app.models.task import Task, TaskActivity, TaskAssignee, TaskComment, TaskGroup, TaskGroupItem, TaskList, TaskWatcher
 from app.models.teamup import TeamupComment, TeamupCommentLike, TeamupEvent, TeamupProfile
 from app.models.user import AuthSession, CcwBindingChallenge, User
+from app.models.kukeauth import AccountSession, EmailVerification, OAuthClient, OAuthCode, OAuthGrant, OAuthRefreshToken, OAuthRequest
 
 __all__ = [
     "SelfTransfer",
@@ -149,4 +150,11 @@ __all__ = [
     "ReleaseApiToken",
     "DeviceSignal",
     "DeviceBan",
+    "AccountSession",
+    "EmailVerification",
+    "OAuthClient",
+    "OAuthCode",
+    "OAuthGrant",
+    "OAuthRefreshToken",
+    "OAuthRequest",
 ]

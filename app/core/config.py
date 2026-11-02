@@ -344,6 +344,13 @@ class Settings(BaseSettings):
     profile_like_event_merge_seconds: float = Field(default=3.0, ge=0, le=60)
     task_reminder_check_interval_seconds: int = Field(default=60, ge=10, le=3600)
     task_reminder_advance_hours: int = Field(default=24, ge=1, le=168)
+    # KukeAuth（docs/kukeauth.md）。issuer 或签名密钥没配时，/oauth 和 /account/api 一律 503
+    kukeauth_issuer: str | None = None
+    # ES256（P-256）私钥 PEM，换行可以写成 \n。和 JWT_SECRET_KEY 无关，OAuth 令牌因此不能调聊天接口
+    kukeauth_signing_key: str | None = None
+    # 换密钥时留着的旧公钥 PEM（JSON 数组），已发出去的令牌过期前还能验证
+    kukeauth_retired_public_keys: list[str] = Field(default_factory=list)
+    kukeauth_session_days: int = Field(default=30, ge=1, le=365)
     smtp_enabled: bool = False
     smtp_host: str | None = None
     smtp_port: int = Field(default=465, ge=1, le=65535)
