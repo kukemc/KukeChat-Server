@@ -23,7 +23,7 @@ KukeChat 的账号升级成的统一账号系统。其他服务通过标准 OAut
 
 - 未知路径回退到 `index.html`（页面路径有 `/login`、`/register`、`/forgot`、`/verify`、`/continue`、`/account`）；
 - `/oauth/`、`/account/api/`、`/.well-known/` 反代到后端，保留 `Host`，用 `proxy_set_header X-Real-IP $remote_addr` 覆盖客户端自带的值。限速和「一个 IP 一个号」靠它；
-- 页面响应加 `Content-Security-Policy: default-src 'self'; img-src 'self' https: data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'sha256-<index.html 内联脚本的哈希>'; frame-ancestors 'none'; base-uri 'none'`。
+- 页面响应加 `Content-Security-Policy: default-src 'self'; img-src 'self' https: data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'sha256-<index.html 内联脚本的哈希>'; frame-ancestors 'none'; base-uri 'none'`。浏览器把 CRLF 当 LF 算哈希，算之前先把换行统一成 LF。
 
 ## 2. 接入一个服务
 
