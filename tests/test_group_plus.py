@@ -707,6 +707,80 @@ class FileTests(PlusCase):
         self.assertTrue(long.endswith(".pdf") and len(long) <= 120)
 
 
+class BotFileTests(PlusCase):
+    """机器人发群文件（/bot-api/conversations/{cid}/files）：和人走同一套，权限按机器人这个群成员算。"""
+
+    async def asyncSetUp(self) -> None:
+        await super().asyncSetUp()
+        from app.core.dependencies import get_current_bot
+        from app.models.bot import Bot, BotInstallation
+        from app.services.bots import BotContext
+
+        async with self.sessions() as db:
+            bot_user = User(username="helper_bot", hashed_password="x", is_bot=True)
+            db.add(bot_user)
+            await db.flush()
+            bot = Bot(user_id=bot_user.id, owner_id=self.ids["alice"], name="助手", key_hash="x", key_prefix="kb_test")
+            db.add(bot)
+            await db.flush()
+            db.add(ConversationMember(conversation_id=self.group_id, user_id=bot_user.id, role=MemberRole.MEMBER))
+            self.installation = BotInstallation(bot_id=bot.id, conversation_id=self.group_id, installed_by_id=self.ids["alice"])
+            db.add(self.installation)
+            await db.commit()
+            self.bot_id, self.bot_user_id = bot.id, bot_user.id
+
+        async def acting_bot(db: Annotated[AsyncSession, Depends(get_db)]) -> BotContext:
+            return BotContext(bot=await db.get(Bot, self.bot_id), user=await db.get(User, self.bot_user_id))
+
+        self.client._transport.app.dependency_overrides[get_current_bot] = acting_bot
+
+    def upload(self, name: str = "song.mp3", data: bytes = b"ID3fake", **form: Any) -> dict[str, Any]:
+        return {"files": {"file": (name, data, "audio/mpeg")}, "data": {k: str(v).lower() for k, v in form.items()}}
+
+    async def test_bot_sends_group_file(self) -> None:
+        path = f"/bot-api/conversations/{self.group_id}/files"
+        locked = await self.code("POST", path, 403, **self.upload())
+        self.assertEqual(locked["code"], "files_locked")
+        await self.grant("pro_plus", 30)
+        uploaded = await self.json("POST", path, expected=201, **self.upload())
+        file, message = uploaded["file"], uploaded["message"]
+        self.assertEqual((file["name"], file["content_type"], file["uploader"]["username"]), ("song.mp3", "audio/mpeg", "helper_bot"))
+        # 成员 permanent 不管用
+        self.assertEqual(file["permanent"], False)
+        self.assertEqual((message["sender_id"], message["metadata"]["file"]["id"]), (self.bot_user_id, file["id"]))
+        download = await self.call("GET", file["download_path"].removeprefix("/api/v1"), as_="dave", expected=200)
+        self.assertEqual(download.content, b"ID3fake")
+        # 群里停用了机器人：不能传
+        async with self.sessions() as db:
+            from app.models.bot import BotInstallation
+
+            row = await db.get(BotInstallation, self.installation.id)
+            row.enabled = False
+            await db.commit()
+        await self.call("POST", path, expected=404, **self.upload())
+        # 私聊没有群文件
+        await self.call("POST", f"/bot-api/conversations/{self.direct_id}/files", expected=404, **self.upload())
+
+    async def test_bot_direct_upload(self) -> None:
+        from app.services import storage
+
+        puts: list[str] = []
+
+        def fake_put(key: str, size: int, expires_in: int = 900) -> tuple[str, dict[str, str]]:
+            puts.append(key)
+            return f"https://bucket.test/{key}?sig=put", {"Content-Type": "application/octet-stream"}
+
+        await self.grant("pro_plus", 30)
+        base = f"/bot-api/conversations/{self.group_id}/files/uploads"
+        with patch.object(storage, "direct_transfer_enabled", lambda: True), patch.object(storage, "presign_put", fake_put):
+            ticket = await self.json("POST", base, expected=201, json={"name": "big.mp3", "size": 6, "content_type": "audio/mpeg"})
+            target = Path(settings.upload_dir) / puts[-1]
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"x" * 6)
+            done = await self.json("POST", f"{base}/{ticket['upload_id']}/complete", expected=201, json={"announce": True})
+        self.assertEqual((done["file"]["name"], done["file"]["uploader_id"], done["message"]["sender_id"]), ("big.mp3", self.bot_user_id, self.bot_user_id))
+
+
 class DirectFileTests(PlusCase):
     """直传（预签名 URL）：storage 的开关和预签名打桩，对象用本地存储模拟「客户端已经传到桶里」。"""
 

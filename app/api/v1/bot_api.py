@@ -9,12 +9,13 @@ from datetime import UTC, datetime, timedelta
 from urllib.parse import urlparse
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
 from app.api.v1.conversations import display_name, emit_system_message, mute_duration_label, online_conversation_member_ids, schedule_realtime_task, send_admin_message_signal, send_bot_conversation_event, send_conversation_updates, send_message_updates, send_reaction_updates
+from app.api.v1.group_plus import _file_uploaded as group_file_uploaded
 from app.api.v1.uploads import UploadRead, save_audio_upload, save_image_upload
 from app.core.database import get_db, release_connection
 from app.core.dependencies import get_current_bot
@@ -35,10 +36,12 @@ from app.schemas.bot import (
 )
 from app.schemas.common import MessageResponse
 from app.schemas.conversation import ConversationMemberRead, ConversationRead, GroupJoinRequestDecision, GroupJoinRequestRead
+from app.schemas.group_plus import GroupFileUploadCompleteRequest, GroupFileUploadRequest, GroupFileUploadResult, GroupFileUploadTicket
 from app.schemas.message import MessageReactionCreate, MessageReactionSummary, MessageRead
 from app.schemas.user import OnlineUsersRead, UserPublic
 from app.services import bots as bot_service
 from app.services import conversations as conversation_service
+from app.services import group_files as file_service
 from app.services import messages as message_service
 from app.services import moderation as moderation_service
 from app.services import response_cache
@@ -844,6 +847,73 @@ async def bot_upload_voice(
 ) -> UploadRead:
     await release_connection(db)
     return await save_audio_upload(file, "messages", request)
+
+
+# ---------------------------------------------------------------------------
+# 群文件
+#
+# 和人发群文件走同一套（docs/group-plus.md 第 5 节）：群要升级到 Pro 及以上、机器人被禁言时不能传、
+# 大小和空间按群的档位算；announce 为真时在群里落一条文件消息。机器人不额外享受什么，
+# 「永久保存」照旧只对群主 / 管理员生效。大文件建议走直传（先开单拿预签名 PUT，传完再 complete）。
+# ---------------------------------------------------------------------------
+
+
+@router.post("/conversations/{conversation_id}/files", response_model=GroupFileUploadResult, status_code=status.HTTP_201_CREATED)
+async def bot_upload_group_file(
+    conversation_id: int,
+    file: Annotated[UploadFile, File()],
+    context: Annotated[BotContext, Depends(get_current_bot)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    announce: Annotated[bool, Form()] = True,
+    permanent: Annotated[bool, Form()] = False,
+    folder_id: Annotated[int | None, Form()] = None,
+) -> GroupFileUploadResult:
+    await bot_service.validate_bot_can_use_conversation(db, context, conversation_id)
+    user = context.user
+    user_id, whitelisted = user.id, user.content_moderation_whitelisted
+    view, message = await file_service.upload_file(db, user, conversation_id, file, announce=announce, permanent=permanent, folder_id=folder_id)
+    return await group_file_uploaded(db, conversation_id, user, user_id, whitelisted, view, message)
+
+
+@router.post("/conversations/{conversation_id}/files/uploads", response_model=GroupFileUploadTicket, status_code=status.HTTP_201_CREATED)
+async def bot_create_group_file_upload(
+    conversation_id: int,
+    payload: GroupFileUploadRequest,
+    context: Annotated[BotContext, Depends(get_current_bot)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> GroupFileUploadTicket:
+    await bot_service.validate_bot_can_use_conversation(db, context, conversation_id)
+    ticket = await file_service.create_upload(
+        db,
+        context.user,
+        conversation_id,
+        name=payload.name,
+        size=payload.size,
+        content_type=payload.content_type,
+        permanent=payload.permanent,
+        folder_id=payload.folder_id,
+    )
+    return GroupFileUploadTicket(**ticket)
+
+
+@router.post(
+    "/conversations/{conversation_id}/files/uploads/{upload_id}/complete",
+    response_model=GroupFileUploadResult,
+    status_code=status.HTTP_201_CREATED,
+)
+async def bot_complete_group_file_upload(
+    conversation_id: int,
+    upload_id: str,
+    context: Annotated[BotContext, Depends(get_current_bot)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    payload: GroupFileUploadCompleteRequest | None = None,
+) -> GroupFileUploadResult:
+    await bot_service.validate_bot_can_use_conversation(db, context, conversation_id)
+    user = context.user
+    user_id, whitelisted = user.id, user.content_moderation_whitelisted
+    announce = payload.announce if payload is not None else True
+    view, message = await file_service.complete_upload(db, user, conversation_id, upload_id, announce=announce)
+    return await group_file_uploaded(db, conversation_id, user, user_id, whitelisted, view, message)
 
 
 # ---------------------------------------------------------------------------
