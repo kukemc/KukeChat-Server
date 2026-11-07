@@ -113,9 +113,12 @@ class GroupInviteTests(ChatExtrasBase):
 
     async def test_forged_or_tampered_suffix_is_rejected(self) -> None:
         token = await self._link("alice")
-        base = token.split(".")[0]
+        base, _inviter, signature = token.split("-")
+        self.assertRegex(token, r"^[A-Za-z0-9_-]{6,80}$")  # 2.0.10 客户端的校验
         owner_id = self.ids["owner"]
-        for forged in (f"{base}.{owner_id}.000000000000", f"{base}.{owner_id}", f"{base}.x.y"):
+        # 点号分隔也认
+        self.assertEqual((await self._resolve(token.replace("-", "."))).inviter_id, self.ids["alice"])
+        for forged in (f"{base}-{owner_id}-{signature}", f"{base}-{owner_id}-000000000000", f"{base}-{owner_id}", f"{base}-x-y"):
             with self.assertRaises(HTTPException) as raised:
                 await self._resolve(forged)
             self.assertEqual(raised.exception.status_code, 404)

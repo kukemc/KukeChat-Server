@@ -25,7 +25,9 @@ def invite_url(token: str) -> str:
     return f"{settings.invite_base_url.rstrip('/')}?invite={token}"
 
 
-# 群邀请链接 = 群的公共 token + 「谁邀请的」：<token>.<邀请人 id>.<签名>
+# 群邀请链接 = 群的公共 token + 「谁邀请的」：<token>-<邀请人 id>-<签名>
+# 公共 token 里没有 - 和 _（_new_token 去掉了），所以 - 不会和它混；2.0.10 客户端只认 [A-Za-z0-9_-]，用点号老版本会打不开。
+# 也认点号分隔（2.0.11 客户端曾按点号写过校验）。
 # 每个群只有一行 invite_links（老链接都是这个公共 token），邀请人身份放在签名后缀里，不用改表。
 # 邀请人是群主 / 管理员 → 直接进群；普通成员 → 按群的入群方式走（docs/chat-features.md「邀请链接」）。
 # 没有后缀的老链接，邀请人按这一行的创建者算。
@@ -39,12 +41,12 @@ def _signature(base_token: str, inviter_id: int) -> str:
 
 
 def signed_group_token(base_token: str, inviter_id: int) -> str:
-    return f"{base_token}.{inviter_id}.{_signature(base_token, inviter_id)}"
+    return f"{base_token}-{inviter_id}-{_signature(base_token, inviter_id)}"
 
 
 def _split_token(token: str) -> tuple[str, int | None]:
     """返回（公共 token，签名里的邀请人 id）。签名不对的当链接不存在。"""
-    parts = token.split(".")
+    parts = token.replace(".", "-").split("-")
     if len(parts) == 1:
         return token, None
     if len(parts) != 3 or not parts[1].isdigit():

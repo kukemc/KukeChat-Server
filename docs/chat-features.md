@@ -552,7 +552,7 @@
 
 ## 14. 群邀请链接、入群申请（2026-11-07）
 
-`POST /invites/group/{id}` 返回的 token 是 `<群的公共 token>.<邀请人 id>.<签名>`。每个群在 `invite_links` 里仍只有一行；邀请人身份放在签名后缀里（HMAC，密钥是 `JWT_SECRET_KEY`），改了后缀就是 404。没有后缀的老链接，邀请人按这一行的 `created_by_id` 算。
+`POST /invites/group/{id}` 返回的 token 是 `<群的公共 token>-<邀请人 id>-<签名>`（公共 token 里没有 `-`；2.0.10 客户端只认 `[A-Za-z0-9_-]`，所以不用点号。解析时点号分隔也认）。每个群在 `invite_links` 里仍只有一行；邀请人身份放在签名后缀里（HMAC，密钥是 `JWT_SECRET_KEY`），改了后缀就是 404。没有后缀的老链接，邀请人按这一行的 `created_by_id` 算。
 
 点「加入」会怎样，看邀请人**此刻**在群里的身份（`GET /invites/{token}` 返回 `join_action`）：
 
