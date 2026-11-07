@@ -129,6 +129,8 @@ async def _group_join_notifications(db: AsyncSession, user_id: int) -> list[Unif
             body_parts.append(f"附言：{request.message}")
         if request.answer:
             body_parts.append(f"回答：{request.answer}")
+        if request.status == GroupJoinRequestStatus.REJECTED and request.decision_note:
+            body_parts.append(f"拒绝理由：{request.decision_note}")
         items.append(
             UnifiedNotificationRead(
                 id=f"group_request:{request.id}",
@@ -149,6 +151,7 @@ async def _group_join_notifications(db: AsyncSession, user_id: int) -> list[Unif
                     "status": request.status.value,
                     "incoming": incoming,
                     "self_handled": incoming and not pending and request.reviewer_id == user_id,
+                    "decision_note": request.decision_note,
                 },
             )
         )
