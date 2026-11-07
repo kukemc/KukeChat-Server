@@ -75,8 +75,9 @@ REASON_MAX = 500
 STAFF_ROLES = {MemberRole.OWNER, MemberRole.ADMIN}
 
 UPDATED_EVENT = "red_packet.updated"
-# 同一个红包的 red_packet.updated 合并推送：这段时间里不管被领了几份只推一次最新的状态。结束（到期、撤销）立刻推
-UPDATE_EVENT_DELAY_SECONDS = 0.3
+# 同一个红包的 red_packet.updated 合并推送：这段时间里不管被领了几份只推一次最新的状态。结束（到期、撤销）立刻推。
+# 大群抢红包时每推一次就是几十上百份，1 秒内的合成一次（2026-11-07 从 0.3 放宽）
+UPDATE_EVENT_DELAY_SECONDS = 1.0
 # 定时清扫一轮最多处理多少个，剩下的下一轮接着来
 SWEEP_BATCH = 500
 # 领取那条语句抢不到行、但红包明明还有剩时重试几次（SQLite 的写事务串行，走不到这里；留给以后换数据库）

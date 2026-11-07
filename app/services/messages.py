@@ -755,6 +755,9 @@ async def send_message(
     )
     db.add(message)
     await db.flush()
+    # 先清旧消息，再动会话行：会话行（大群那一行）是所有发消息的人都要改的热点，清理要走几条查询、删 25 行，
+    # 放在改 updated_at 之后的话，这一行的锁要一直拿到清理做完，同群的发消息只能排队（2026-11-07 线上单行 UPDATE 300–500ms）
+    await _prune_conversation_messages(db, conversation_id, conversation)
     message.sender = sender
     if self_chat:
         # 接口层据此跳过机器审核、后台刷新信号（docs/self-chat.md 第 4 节）
@@ -771,10 +774,10 @@ async def send_message(
     setattr(message, "_level_current", current_level)
     if message_type != MessageType.SYSTEM:
         await _record_mentions(db, conversation, message, metadata)
-    conversation.updated_at = now
     membership.last_read_message_id = message.id
     membership.last_read_at = now
-    await _prune_conversation_messages(db, conversation_id, conversation)
+    # 最后才改会话行，后面紧接着提交：热点行的锁只拿一瞬间
+    conversation.updated_at = now
     if commit:
         await db.commit()
     return message
@@ -805,7 +808,8 @@ async def create_system_message(
     if isinstance(sender, User):
         message.sender = sender
 
-    conversation.updated_at = now
+    # 先清旧消息、查成员，最后才改会话行（热点行，见 send_message）
+    await _prune_conversation_messages(db, conversation_id, conversation)
     membership_result = await db.execute(
         select(ConversationMember).where(
             ConversationMember.conversation_id == conversation_id,
@@ -817,7 +821,7 @@ async def create_system_message(
         membership.last_read_message_id = message.id
         membership.last_read_at = now
 
-    await _prune_conversation_messages(db, conversation_id, conversation)
+    conversation.updated_at = now
     await db.commit()
     return message
 

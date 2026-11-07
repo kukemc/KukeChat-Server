@@ -12,11 +12,11 @@ from typing import Annotated
 UTC = timezone.utc
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, Response, status
-from fastapi.encoders import jsonable_encoder
+from pydantic import TypeAdapter
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.database import get_db
+from app.core.database import get_db, release_connection
 from app.core.dependencies import get_current_user
 from app.models.conversation import Conversation, ConversationMember
 from app.models.enums import ConversationType
@@ -77,6 +77,10 @@ from app.websocket.manager import FEATURE_SELF_CHAT, admin_manager, bot_manager,
 
 
 router = APIRouter()
+
+# 大列表直接用 pydantic 出 JSON 字节，见 response_cache.build_json_bytes
+_CONVERSATION_LIST = TypeAdapter(list[ConversationRead])
+_MEMBER_LIST = TypeAdapter(list[ConversationMemberRead])
 logger = logging.getLogger(__name__)
 # Probe one extra member so small conversations never enumerate global presence.
 DIRECT_PRESENCE_MEMBER_LIMIT = 128
@@ -469,8 +473,9 @@ async def conversations(
         return cached_json_response(cached, request, 5)
 
     items = await conversation_service.list_user_conversations(db, current_user.id, include_self=include_self)
-    data = jsonable_encoder(await conversation_service.build_conversation_reads(db, items, current_user.id))
-    payload = response_cache.build_json(data)
+    reads = await conversation_service.build_conversation_reads(db, items, current_user.id)
+    await release_connection(db)
+    payload = response_cache.build_json_bytes(_CONVERSATION_LIST.dump_json(reads))
     response_cache.set_user_conversations(current_user.id, payload, include_self=include_self)
     return cached_json_response(payload, request, 5)
 
@@ -693,7 +698,8 @@ async def members(
 
     if limit is None:
         members = await conversation_service.list_members(db, conversation_id, current_user.id)
-        data = jsonable_encoder([ConversationMemberRead.model_validate(member) for member in members])
+        await release_connection(db)
+        payload = response_cache.build_json_bytes(_MEMBER_LIST.dump_json([ConversationMemberRead.model_validate(member) for member in members]))
     else:
         members, total = await conversation_service.list_members_page(
             db,
@@ -703,16 +709,16 @@ async def members(
             offset=offset,
             search=normalized_search,
         )
-        data = jsonable_encoder(
+        await release_connection(db)
+        payload = response_cache.build_json_bytes(
             ConversationMemberPage(
                 items=[ConversationMemberRead.model_validate(member) for member in members],
                 total=total,
                 limit=limit,
                 offset=offset,
                 has_more=offset + len(members) < total,
-            )
+            ).model_dump_json().encode("utf-8")
         )
-    payload = response_cache.build_json(data)
     response_cache.set_conversation_members(conversation_id, payload, limit=limit, offset=offset, search=normalized_search)
     return cached_json_response(payload, request, 0)
 
@@ -1234,6 +1240,9 @@ async def send_message(
         setattr(message, "_client_nonce", payload.client_nonce)
     message_data = message_service.build_new_message_read(message, current_user.id)
     member_ids = await online_conversation_member_ids(db, conversation_id)
+    # 消息已经提交了：先把连接还回池子再推送。推送要等 Redis、在事件循环里排队，CPU 紧的时候能拖好几秒，
+    # 期间一直占着连接（2026-11-07 线上几十个 idle in transaction，连接池被占满，发消息排队到 5 秒）
+    await release_connection(db)
     response_cache.invalidate_user_conversations(set(member_ids) | {current_user.id})
     try:
         await send_message_updates(db, "message.created", message, member_ids)
@@ -1285,6 +1294,7 @@ async def forward_bundle(
     self_chat = getattr(message, "_self_chat", False)
     message_data = message_service.build_new_message_read(message, current_user.id)
     member_ids = await online_conversation_member_ids(db, target_conversation_id)
+    await release_connection(db)  # 同 send_message：消息已提交，推送前先还连接
     response_cache.invalidate_user_conversations(set(member_ids) | {current_user.id})
     try:
         await send_message_updates(db, "message.created", message, member_ids)
@@ -1460,11 +1470,12 @@ async def read_conversation(
     )
     # 只推给读的人自己（多设备同步未读数）。PC / 安卓都只处理 user_id 是自己的已读事件；
     # 以前广播给全会话，大群里每次已读要推几百份，抢红包时把 CPU 吃满（2026-10-17）。
-    # mention_pending 只放在返回里、和发给本人的 conversation.updated 里
-    await send_to_members(
-        {current_user.id}, "conversation.read", receipt.model_dump(exclude={"mention_pending"}), await realtime_feature(db, conversation_id)
-    )
-    await send_conversation_patch(db, conversation_id, {current_user.id}, {"mention_pending": receipt.mention_pending})
+    # mention_pending 跟着 conversation.read 一起走。以前另外再推一次 conversation.updated，
+    # 安卓 2.0.10 收到 conversation.* 就整份重拉会话列表：PC 上每读一次，挂在后台的手机就重拉一次（2026-11-07）。
+    feature = await realtime_feature(db, conversation_id)
+    await release_connection(db)
+    response_cache.invalidate_user_conversations({current_user.id})
+    await send_to_members({current_user.id}, "conversation.read", receipt.model_dump(mode="json"), feature)
     return receipt
 
 
@@ -1489,6 +1500,9 @@ async def poke_member(
     )
     message_data = await message_service.build_message_read(db, message, current_user.id)
     member_ids = await online_conversation_member_ids(db, conversation_id)
+    # 消息已经提交了：先把连接还回池子再推送。推送要等 Redis、在事件循环里排队，CPU 紧的时候能拖好几秒，
+    # 期间一直占着连接（2026-11-07 线上几十个 idle in transaction，连接池被占满，发消息排队到 5 秒）
+    await release_connection(db)
     response_cache.invalidate_user_conversations(set(member_ids) | {current_user.id})
     try:
         await send_message_updates(db, "message.created", message, member_ids)

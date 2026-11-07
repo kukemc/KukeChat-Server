@@ -110,6 +110,15 @@ def _fetch(cache: OrderedDict, key: Any) -> Any | None:
 
 def build_json(value: Any) -> CachedJson:
     plain = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return build_json_bytes(plain)
+
+
+def build_json_bytes(plain: bytes) -> CachedJson:
+    """已经序列化好的 JSON（比如 pydantic 的 dump_json）直接包起来。
+
+    大列表（会话列表、群成员）别走 jsonable_encoder + json.dumps：jsonable_encoder 先 model_dump，再在 Python 里把整棵树
+    递归走一遍，线上会话列表接口一半的 CPU 花在这里（2026-11-07 采样）。TypeAdapter.dump_json 在 Rust 里一步出字节，结果一样。
+    """
     return CachedJson(plain=plain, gzip=gzip.compress(plain, compresslevel=1))
 
 

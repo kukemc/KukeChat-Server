@@ -406,7 +406,7 @@
 实时：没有新事件。
 
 - 置上：`message.created` 里带着消息的 `metadata`，客户端看到点名了自己 / @全体（且不是自己发的、会话不在前台）就在本地置上。
-- 清掉：标记已读之后清。`POST /conversations/{id}/read` 的返回（`ReadReceipt`）新增 `mention_pending`，就是读到这里之后这个会话的值（一般是 `null`；只读到一半时可能还是 `"me"` / `"all"`）。同一个人的其它设备会收到 `conversation.updated`，其中带 `mention_pending`。广播给全会话的 `conversation.read` 事件里**不带**这一项。
+- 清掉：标记已读之后清。`POST /conversations/{id}/read` 的返回（`ReadReceipt`）新增 `mention_pending`，就是读到这里之后这个会话的值（一般是 `null`；只读到一半时可能还是 `"me"` / `"all"`）。同一个人的所有设备会收到 `conversation.read`，其中也带 `mention_pending`（`null` 表示清掉）。以前另外推一次 `conversation.updated`，2026-11 起不再推：安卓 2.0.10 收到 `conversation.*` 会整份重拉会话列表，PC 上每读一次，手机就重拉一次。
 - 撤回：被撤回的消息不再触发提示（用户撤回、群管理撤回、后台按消息撤回、机器审核、案件结案都一样）。没有专门的事件，客户端收到 `message.recalled` 时如果那条正是本地记着的提及，就重拉这个会话（或者整个列表）。
 
 实现上的细节：

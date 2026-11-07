@@ -209,6 +209,6 @@ class ReadReceipt(BaseModel):
     user_id: int
     last_read_message_id: int | None
     last_read_at: datetime
-    # 只在「标记已读」接口的返回里有：读到这里之后，这个会话的 mention_pending 是什么（一般是 null）。
-    # 广播给会话成员的 conversation.read 事件里不带这一项
+    # 读到这里之后，这个会话的 mention_pending 是什么（一般是 null）。
+    # 「标记已读」接口的返回里有，推给本人各设备的 conversation.read 事件里也有
     mention_pending: Literal["me", "all"] | None = None

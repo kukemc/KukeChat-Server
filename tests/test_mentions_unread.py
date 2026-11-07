@@ -144,3 +144,67 @@ class UnreadMentionsTests(ChatExtrasBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReadReceiptRealtimeTests(UnreadMentionsTests):
+    """POST /read 只推 conversation.read（带 mention_pending），不再推 conversation.updated（2026-11-07）。"""
+
+    async def test_read_pushes_only_conversation_read_with_mention_pending(self) -> None:
+        before = await self._send("alice", "before")
+        mention = await self._send("alice", "@bob", mentions=self._at("bob"))
+        later = await self._send("alice", "later")
+        sent: list[tuple[set[int], str, dict]] = []
+
+        async def capture(user_ids, event_type, data, *args, **kwargs):
+            sent.append((set(user_ids), event_type, data))
+
+        with patch.object(api.manager, "send_to_users", side_effect=capture), patch.object(
+            api.manager, "online_user_ids_global", return_value={self.ids["bob"]}
+        ):
+            # 读到 @ 之前：提及还挂着
+            response = await self.client.post(f"/api/v1/conversations/{self.group_id}/read", json={"last_read_message_id": before})
+            self.assertEqual(response.status_code, 200, response.text)
+            response = await self.client.post(f"/api/v1/conversations/{self.group_id}/read", json={"last_read_message_id": later})
+            self.assertEqual(response.status_code, 200, response.text)
+
+        self.assertEqual([event for _, event, _ in sent], ["conversation.read", "conversation.read"])
+        self.assertTrue(all(users == {self.ids["bob"]} for users, _, _ in sent))
+        self.assertEqual(sent[0][2]["mention_pending"], "me")
+        self.assertIsNone(sent[1][2]["mention_pending"])
+        self.assertEqual(sent[1][2]["last_read_message_id"], later)
+
+
+class ReadCoalescerFlushTests(ChatExtrasBase):
+    async def test_flush_writes_in_chunks_and_never_moves_backwards(self) -> None:
+        from app.services import read_coalescer
+
+        first = second = 0
+        async with self.sessions() as db:
+            for _ in range(3):
+                message = await message_service.send_message(db, self.group_id, await self._user(db, "alice"), "hi", MessageType.TEXT, None)
+                first, second = second, message.id
+        async with self.sessions() as db:
+            bob = (
+                await db.execute(
+                    select(ConversationMember).where(
+                        ConversationMember.conversation_id == self.group_id, ConversationMember.user_id == self.ids["bob"]
+                    )
+                )
+            ).scalar_one()
+            bob.last_read_message_id = second
+            await db.commit()
+
+        read_coalescer._pending.clear()
+        read_coalescer.defer(self.group_id, self.ids["bob"], first)  # 比库里旧：不能往回拉
+        read_coalescer.defer(self.group_id, self.ids["owner"], second)
+        with patch.object(read_coalescer, "AsyncSessionLocal", self.sessions), patch.object(read_coalescer, "FLUSH_CHUNK", 1):
+            await read_coalescer.flush()
+
+        async with self.sessions() as db:
+            rows = {
+                member.user_id: member.last_read_message_id
+                for member in (await db.execute(select(ConversationMember).where(ConversationMember.conversation_id == self.group_id))).scalars()
+            }
+        self.assertEqual(rows[self.ids["bob"]], second)
+        self.assertEqual(rows[self.ids["owner"]], second)
+        self.assertEqual(read_coalescer._pending, {})
