@@ -1051,7 +1051,8 @@ async def list_incoming_group_join_requests(db: AsyncSession, user_id: int) -> l
             ConversationMember.role.in_(STAFF_ROLES),
         )
         .order_by(
-            GroupJoinRequest.status == GroupJoinRequestStatus.PENDING,
+            # 待审核的排最前（布尔升序是 false 在前，以前写反了，待审核的全沉到列表最底下）
+            (GroupJoinRequest.status == GroupJoinRequestStatus.PENDING).desc(),
             GroupJoinRequest.created_at.desc(),
             GroupJoinRequest.id.desc(),
         )

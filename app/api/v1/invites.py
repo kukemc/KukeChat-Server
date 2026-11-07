@@ -2,14 +2,14 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Path
+from fastapi import APIRouter, Body, Depends, Path
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.dependencies import get_current_user
 from app.models.enums import InviteTargetType
 from app.models.user import User
-from app.schemas.invite import InviteAcceptRead, InviteLinkRead, InviteResolveRead
+from app.schemas.invite import InviteAcceptRead, InviteAcceptRequest, InviteLinkRead, InviteResolveRead
 from app.services import invites as invite_service
 from app.services import conversations as conversation_service
 from app.services import messages as message_service
@@ -49,6 +49,35 @@ async def _send_conversation_updates(db: AsyncSession, conversation_id: int, mem
         await manager.send_to_users(online_ids, "conversation.updated", {"conversation_id": conversation_id, "reason": "invite.accepted"})
 
 
+async def _announce_join_request(db: AsyncSession, request_id: int, current_user: User) -> None:
+    """普通成员的邀请落成了入群申请：和 POST /conversations/{id}/join-requests 发一样的通知（审核人、申请人、机器人）。"""
+    from app.api.v1.conversations import send_bot_conversation_event, send_conversation_updates
+    from app.models.conversation import GroupJoinRequest
+
+    join_request = await db.get(GroupJoinRequest, request_id)
+    if join_request is None:
+        return
+    conversation_id = join_request.conversation_id
+    response = await conversation_service.build_group_join_request_read(db, join_request, current_user.id)
+    reviewer_ids = await conversation_service.pending_join_request_reviewer_ids(db, conversation_id)
+    await manager.send_to_users(reviewer_ids, "group.join_request.created", response)
+    await manager.send_to_user(current_user.id, "group.join_request.created", response)
+    await send_bot_conversation_event(
+        db,
+        "group.join_request.created",
+        conversation_id,
+        {
+            "conversation_id": conversation_id,
+            "request_id": join_request.id,
+            "user_id": join_request.requester_id,
+            "message": join_request.message,
+            "answer": join_request.answer,
+            "source": "invite",
+        },
+    )
+    await send_conversation_updates(db, conversation_id, reviewer_ids)
+
+
 @router.post("/group/{conversation_id}", response_model=InviteLinkRead)
 async def create_group_invite(
     conversation_id: Annotated[int, Path(gt=0)],
@@ -81,9 +110,12 @@ async def accept_invite(
     token: Annotated[str, Path(min_length=6, max_length=80)],
     current_user: Annotated[User, Depends(get_current_user)],
     db: Annotated[AsyncSession, Depends(get_db)],
+    payload: InviteAcceptRequest | None = Body(default=None),
 ) -> InviteAcceptRead:
-    result = await invite_service.accept_invite(db, token, current_user)
-    if result.target_type == InviteTargetType.GROUP and result.conversation_id is not None:
+    result = await invite_service.accept_invite(db, token, current_user, payload)
+    if result.target_type == InviteTargetType.GROUP and result.join_request_id is not None:
+        await _announce_join_request(db, result.join_request_id, current_user)
+    elif result.target_type == InviteTargetType.GROUP and result.conversation_id is not None:
         member_ids = await conversation_service.conversation_member_ids(db, result.conversation_id)
         if result.joined_now:
             await _send_invite_join_system_message(db, result.conversation_id, current_user, member_ids)

@@ -549,3 +549,21 @@
 ## 13. 群禁言不随退群失效
 
 退群、被移出时还没到期的群禁言存进 `group_mute_carryovers`，重新进群（任何路径：链接、邀请、审批、官方群……）时恢复，到期时间不变；永久禁言恢复后还是永久。不在群里的这段时间到期的就不再恢复。重新进群后群主、管理员照常可以解除。接口和字段没有变化，客户端不用改。
+
+## 14. 群邀请链接、入群申请（2026-11-07）
+
+`POST /invites/group/{id}` 返回的 token 是 `<群的公共 token>.<邀请人 id>.<签名>`。每个群在 `invite_links` 里仍只有一行；邀请人身份放在签名后缀里（HMAC，密钥是 `JWT_SECRET_KEY`），改了后缀就是 404。没有后缀的老链接，邀请人按这一行的 `created_by_id` 算。
+
+点「加入」会怎样，看邀请人**此刻**在群里的身份（`GET /invites/{token}` 返回 `join_action`）：
+
+| 邀请人 | 群的入群方式 | `join_action` | `POST /invites/{token}/accept` |
+| --- | --- | --- | --- |
+| 群主 / 管理员 | 任意 | `join` | 直接进群，`status: "joined"` |
+| 普通成员 | `open`，或开了 `auto_approve` | `join` | 直接进群 |
+| 普通成员 | `approval` | `request` | 提交入群申请，`status: "pending"`、`join_request_id`；通知和自己申请一样 |
+| 普通成员 | `question` | `answer` | 请求体要带 `{"answer": "..."}`（可选 `message`），不带返回 422；之后同上 |
+| 普通成员 | `invite_only` | `forbidden` | 403；普通成员在仅邀请的群里也生成不了链接（403） |
+
+以前任何成员拿到的都是公共链接，点开直接进群，入群方式全被绕过。老客户端接受邀请不带请求体：要审核的群照样能提交申请，要答题的群会收到 422。
+
+`GET /conversations/join-requests/incoming` 待审核的排在最前（以前写反了，待审核的沉在最底下）。拒绝时可以带 `{"decision_note": "..."}`（最多 200 字，可以不填），申请人在 `group.join_request.rejected` 和自己的申请列表里看得到。
