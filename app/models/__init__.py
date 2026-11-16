@@ -21,6 +21,7 @@ from app.models.conversation import Conversation, ConversationMember, GroupAnnou
 from app.models.friend import FriendRequest, Friendship
 from app.models.gift import Gift, GiftRecord
 from app.models.group_plus import GroupFile, GroupFileFolder, GroupFileUpload, GroupPlusRecord, GroupTodo
+from app.models.image_upload import ImageUpload
 from app.models.group_activity import GroupCheckin, GroupMemberDailyActivity, GroupMemberExpLog
 from app.models.intimacy import FriendBadge, FriendBond, FriendBondDay
 from app.models.invite import InviteLink
@@ -77,6 +78,7 @@ __all__ = [
     "GroupFile",
     "GroupFileFolder",
     "GroupFileUpload",
+    "ImageUpload",
     "GroupPlusRecord",
     "GroupTodo",
     "MentionAllUsage",

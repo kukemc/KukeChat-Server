@@ -51,6 +51,9 @@ class Settings(BaseSettings):
     # 「我的设备」会话的临时文件（docs/self-chat.md 第 5 节）：单个文件的上限，和每人同时存着的（没过期的）文件总量上限
     self_transfer_max_bytes: int = Field(default=1024 * 1024 * 1024, ge=1024 * 1024, le=8 * 1024 * 1024 * 1024)
     self_transfer_quota_bytes: int = Field(default=5 * 1024 * 1024 * 1024, ge=1024 * 1024, le=64 * 1024 * 1024 * 1024)
+    # 聊天图片直传（docs/chat-features.md「图片直传」）：S3 存储时客户端用预签名 URL 把压缩好的图和缩略图直接传进主桶，
+    # 后端只读开头一小段校验。生产机到对象存储的带宽很小，图片经后端转一道时常超时。设成 false 就只能走 multipart 上传。
+    direct_image_uploads: bool = True
     image_quality: int = Field(default=82, ge=1, le=95)
     image_max_dimension: int = Field(default=2048, ge=128, le=8192)
     image_thumbnail_max_dimension: int = Field(default=360, ge=64, le=2048)

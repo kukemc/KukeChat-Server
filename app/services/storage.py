@@ -86,7 +86,10 @@ _IMAGE_UPLOAD_FOLDER_LIMITS: dict[str, Callable[[], ImageUploadLimits]] = {
 # remain counted if their awaiting request is cancelled.
 IMAGE_WORKERS = asyncio.Semaphore(2)
 JPEG_CONTENT_TYPE = "image/jpeg"
-S3_CONFIG = Config(connect_timeout=3, read_timeout=10, retries={"max_attempts": 2, "mode": "standard"})
+# read_timeout 也管发送：botocore 把它设成 socket 超时，上传时每次 send 都受它约束。生产机到对象存储
+# 只有 3–6 Mbit/s 且时快时慢，10 秒时 1–2 MB 的消息图片经常超时（客户端显示「发送失败」），所以放宽到 45 秒；
+# 连同 1 次重试最坏约 90 秒，仍在 gunicorn --timeout 120 之内。
+S3_CONFIG = Config(connect_timeout=3, read_timeout=45, retries={"max_attempts": 2, "mode": "standard"})
 # Match the local /uploads cache policy; never cache unrelated or private objects.
 _PUBLIC_IMAGE_FOLDERS = frozenset({"avatars", "profile-covers", "messages", "posts", "teamup", "announcements", "stickers"})
 _PUBLIC_IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".png", ".webp", ".gif"})
@@ -303,19 +306,55 @@ def _presign_client_for(bucket: str | None):
     return _S3_PRIVATE_PRESIGN_CLIENT
 
 
-def presign_put(key: str, size: int, expires_in: int = 900) -> tuple[str, dict[str, str]]:
+def presign_put(key: str, size: int, expires_in: int = 900, content_type: str = OCTET_STREAM) -> tuple[str, dict[str, str]]:
     """直传用的预签名 PUT。签名里带 Content-Type 和 Content-Length，长度不对的请求桶会拒（取决于服务商，见 scripts/check_s3_direct.py）。
-    返回 (url, 客户端必须带上的请求头)；Content-Length 由客户端的 HTTP 库按请求体自己填。"""
+    公开读的媒体 key（聊天图等）还签进 Cache-Control，和后端自己 put_object 时一样。
+    返回 (url, 客户端必须原样带上的请求头)；Content-Length 由客户端的 HTTP 库按请求体自己填。"""
     normalized = _normalize_key(key)
+    params: dict[str, Any] = {"Bucket": _bucket_for(normalized), "Key": normalized, "ContentType": content_type, "ContentLength": int(size)}
+    headers = {"Content-Type": content_type}
+    if _is_public_media_key(normalized):
+        params["CacheControl"] = _PUBLIC_CACHE_CONTROL
+        headers["Cache-Control"] = _PUBLIC_CACHE_CONTROL
     try:
-        url = _presign_client_for(_bucket_for(normalized)).generate_presigned_url(
-            "put_object",
-            Params={"Bucket": _bucket_for(normalized), "Key": normalized, "ContentType": OCTET_STREAM, "ContentLength": int(size)},
-            ExpiresIn=expires_in,
-        )
+        url = _presign_client_for(params["Bucket"]).generate_presigned_url("put_object", Params=params, ExpiresIn=expires_in)
     except (BotoCoreError, ClientError) as exc:
         raise _storage_error() from exc
-    return url, {"Content-Type": OCTET_STREAM}
+    return url, headers
+
+
+def direct_image_upload_enabled() -> bool:
+    """聊天图片直传：S3 存储且没关 DIRECT_IMAGE_UPLOADS。图片放主桶（公开读），和私有桶无关。"""
+    return settings.storage_backend == "s3" and settings.direct_image_uploads
+
+
+def read_object_prefix(key: str, limit: int) -> bytes:
+    """对象开头最多 limit 个字节（S3 走 Range 请求，不把整个对象拉回来）。不存在抛 404。在线程里调用。"""
+    normalized = _normalize_key(key)
+    if limit <= 0:
+        return b""
+    if settings.storage_backend == "s3":
+        bucket = _bucket_for(normalized)
+        try:
+            response = _client_for(bucket).get_object(Bucket=bucket, Key=normalized, Range=f"bytes=0-{limit - 1}")
+        except ClientError as exc:
+            code = str(exc.response.get("Error", {}).get("Code", ""))
+            if code in {"404", "NoSuchKey", "NotFound"}:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Stored object was not found") from exc
+            raise _storage_error() from exc
+        except BotoCoreError as exc:
+            raise _storage_error() from exc
+        stream = response["Body"]
+        try:
+            # 服务商不认 Range 时会回整个对象：只读 limit 个字节就停
+            return stream.read(limit)
+        finally:
+            stream.close()
+    path = local_path_for_key(normalized)
+    if path is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Stored object was not found")
+    with path.open("rb") as handle:
+        return handle.read(limit)
 
 
 def presign_get(key: str, expires_in: int = 300, content_disposition: str | None = None) -> str:
@@ -751,6 +790,71 @@ def process_legacy_image(content: bytes, folder: str, object_id: str) -> Process
 def store_processed_image(image: ProcessedImageUpload) -> None:
     put_object(image.key, image.data, image.content_type)
     put_object(image.thumbnail_key, image.thumbnail_data, image.thumbnail_content_type)
+
+
+# ---------------------------------------------------------------- 图片直传的校验（docs/chat-features.md「图片直传」）
+# 直传的图只能是后端自己也会产出的两种：静态图 JPEG、动图 GIF；缩略图一律 JPEG。
+DIRECT_IMAGE_TYPES = {JPEG_CONTENT_TYPE: ("JPEG", "jpg"), "image/gif": ("GIF", "gif")}
+DIRECT_THUMBNAIL_MAX_BYTES = 256 * 1024
+# 只读开头这么多字节就能拿到格式、尺寸和全部元数据段（EXIF 等都在扫描数据之前）
+DIRECT_IMAGE_PROBE_BYTES = 256 * 1024
+# JPEG 里允许留着的段：JFIF 头、ICC 色彩配置、Adobe 色彩变换标记。别的（EXIF / XMP / IPTC / 注释……）可能带定位、
+# 设备、拍摄时间，后端自己处理时都会去掉，直传的也不能留，有就退回后端重新编码。
+_DIRECT_JPEG_SEGMENTS = (("APP0", b"JFIF\x00"), ("APP2", b"ICC_PROFILE\x00"), ("APP14", b"Adobe"))
+
+
+def _jpeg_segments_clean(image: Image.Image) -> bool:
+    for marker, data in getattr(image, "applist", []) or []:
+        if not any(marker == name and data.startswith(prefix) for name, prefix in _DIRECT_JPEG_SEGMENTS):
+            return False
+    return True
+
+
+def direct_image_problem(head: bytes, content_type: str, limits: ImageUploadLimits) -> str | None:
+    """直传的主图能不能原样用：只看开头 head 这一段。None = 能用；否则是要后端整张拉回来重新处理的原因。
+    这里不判定「不是图片」：读不出头的也只算要重新处理，由 process_image_upload 给出最终结论。"""
+    expected_format, _ = DIRECT_IMAGE_TYPES[content_type]
+    max_dimension = limits.max_dimension if limits.max_dimension is not None else settings.image_max_dimension
+    try:
+        with Image.open(BytesIO(head)) as image:
+            image_format = (image.format or "").upper()
+            width, height = image.size
+            mode = image.mode
+            clean = _jpeg_segments_clean(image) if image_format == "JPEG" else True
+    except Exception:
+        return "unreadable_header"
+    if image_format != expected_format:
+        return "format_mismatch"
+    if width * height > limits.max_pixels:
+        return "too_many_pixels"
+    if image_format == "JPEG":
+        if width > max_dimension or height > max_dimension:
+            return "too_large"
+        if mode not in {"RGB", "L"}:
+            return "color_mode"
+        if not clean:
+            return "metadata"
+    return None
+
+
+def direct_thumbnail_problem(data: bytes) -> str | None:
+    """直传的缩略图（整张，至多 DIRECT_THUMBNAIL_MAX_BYTES）：JPEG、能完整解码、不超过缩略图尺寸、不带元数据。"""
+    max_dimension = settings.image_thumbnail_max_dimension
+    try:
+        with Image.open(BytesIO(data)) as image:
+            if (image.format or "").upper() != "JPEG":
+                return "format_mismatch"
+            width, height = image.size
+            if width > max_dimension or height > max_dimension:
+                return "too_large"
+            if image.mode not in {"RGB", "L"}:
+                return "color_mode"
+            if not _jpeg_segments_clean(image):
+                return "metadata"
+            image.load()
+    except Exception:
+        return "undecodable"
+    return None
 
 
 def process_audio_upload(content: bytes, folder: str, object_id: str, content_type: str | None) -> ProcessedAudioUpload:

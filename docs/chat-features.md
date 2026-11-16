@@ -1,4 +1,4 @@
-# 投票、正在输入、群表情、戳一戳、公告回应、资料点赞、会话列表上的提及提示、乐观发送
+# 投票、正在输入、群表情、戳一戳、公告回应、资料点赞、会话列表上的提及提示、乐观发送、图片直传
 
 路径前缀 `/api/v1`。带 `code` 的错误，`detail` 是 `{ code, message }`，`message` 是可直接展示的中文。
 
@@ -567,3 +567,56 @@
 以前任何成员拿到的都是公共链接，点开直接进群，入群方式全被绕过。老客户端接受邀请不带请求体：要审核的群照样能提交申请，要答题的群会收到 422。
 
 `GET /conversations/join-requests/incoming` 待审核的排在最前（以前写反了，待审核的沉在最底下）。拒绝时可以带 `{"decision_note": "..."}`（最多 200 字，可以不填），申请人在 `group.join_request.rejected` 和自己的申请列表里看得到。
+
+## 15. 图片直传（2026-11-16）
+
+生产机到对象存储的带宽很小、时快时慢。`POST /uploads/message-image` 要后端收下整张图、压缩、再把主图和缩略图传进桶，1–2 MB 的图常常超时，客户端显示「发送失败」。直传时客户端自己压缩、生成缩略图，用预签名 URL 直接传到桶里，后端只做校验。只对聊天图片（`messages/` 目录，`/uploads/message-image` 的用法：消息图片、群表情、公告配图）开放；头像、动态图等仍走 multipart。
+
+开关：`STORAGE_BACKEND=s3` 且 `DIRECT_IMAGE_UPLOADS` 没关（默认开）。本地存储时开单返回 409。
+
+**1. 开单** `POST /uploads/message-image/direct`
+
+```jsonc
+{ "content_type": "image/jpeg",   // 静态图一律 image/jpeg；动图（GIF，含转成 GIF 的）image/gif。别的 422 unsupported_image_type
+  "size": 523144,                 // 主图字节数，不能超过普通上传的上限（3 MB），超了 413 image_too_large
+  "thumbnail_size": 18311 }       // 缩略图字节数，JPEG，最多 256 KB，超了 413 thumbnail_too_large
+```
+
+201：
+
+```jsonc
+{ "upload_id": "…",
+  "image":     { "method": "PUT", "url": "https://…", "headers": { "Content-Type": "image/jpeg", "Cache-Control": "public, max-age=3600" } },
+  "thumbnail": { "method": "PUT", "url": "https://…", "headers": { "Content-Type": "image/jpeg", "Cache-Control": "public, max-age=3600" } },
+  "expires_at": "…" }             // 两条 URL 的过期时间（15 分钟）
+```
+
+**2. 上传**：两条都 `PUT url`，请求体就是文件本身，`headers` 必须原样带上，不能多也不能改（签名里固定了 Content-Type、Cache-Control 和 Content-Length）。
+
+**3. 完成** `POST /uploads/message-image/direct/{upload_id}/complete`（无请求体，只有开单的人能调）。201，返回和 `/uploads/message-image` 一样的 `{ url, thumbnail_url, filename, content_type }`，之后照旧把 `url` / `thumbnail_url` 放进消息。
+
+后端 head 两个对象核对大小，主图只读开头 256 KB、缩略图整张读，检查：
+
+- 主图：格式和开单时的 `content_type` 一致；JPEG 的最长边不超过 `IMAGE_MAX_DIMENSION`（2048）、是 RGB / 灰度、除了 JFIF / ICC / Adobe 段外**没有任何元数据段**（EXIF、XMP、IPTC、注释……）。客户端用 canvas 重新编码出来的 JPEG 天然满足。
+- 缩略图：JPEG、最长边不超过 `IMAGE_THUMBNAIL_MAX_DIMENSION`（360）、能完整解码、同样没有元数据段。
+
+都合格就原样使用，后端不上传任何东西。不合格的（带 EXIF 定位的原图、尺寸超了、缩略图不对……）后端把主图整张拉回来，按 multipart 上传那条路重新处理、写回同一个 key，结果和 multipart 上传一样，只是慢一些；只是缩略图不对时只重做缩略图。
+
+| 状态 | code | 说明 |
+| --- | --- | --- |
+| 409 | `direct_upload_unavailable` | 开单：服务器没开直传，改用 `/uploads/message-image` |
+| 422 | `unsupported_image_type` | 开单：`content_type` 不是 `image/jpeg` / `image/gif` |
+| 413 | `image_too_large` / `thumbnail_too_large` | 开单：大小超限，带 `max_bytes` |
+| 400 | `empty_file` | 开单：大小是 0 |
+| 429 | `too_many_pending_uploads` | 开单：同时开着、还没完成的上传单超过 30 个 |
+| 409 | `upload_incomplete` | 完成：有对象还没传上去。上传单保留，传完可以再调 |
+| 422 | `upload_size_mismatch` | 完成：大小和开单时不一致。对象删掉、上传单作废 |
+| 400 | （`detail` 是字符串） | 完成：不是能用的图片。对象删掉、上传单作废 |
+| 404 | `upload_not_found` | 完成：上传单不存在、已经用过，或不是自己开的 |
+| 410 | `upload_expired` | 完成：开单超过 1 小时 |
+
+- 客户端的兜底：开单 409 / 404（老后端），或者 PUT 失败（网络、跨域），就退回 `/uploads/message-image`。
+- 开单 1 小时内没完成的上传单，后台 worker 每 10 分钟清理一次，连同桶里可能已经传上去的对象。
+- 对象直接传到最终的 key（主桶公开读）：完成之前它们已经能按地址读到，但 key 是随机的，没完成的会被清理。
+- 新表 `image_uploads`（索引 `expires_at`、`user_id`）由启动时的 `create_all` 建，不用手动迁移。
+- 主桶要允许浏览器跨域 PUT：雨云默认对所有来源放行；别的服务商要给主桶配和私有桶一样的 CORS（`docs/group-plus.md` 5.4）。

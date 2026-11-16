@@ -4,11 +4,16 @@ import asyncio
 from typing import Annotated
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
-from pydantic import BaseModel
+from datetime import datetime
 
-from app.core.dependencies import get_current_user_then_release
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
+from pydantic import BaseModel, Field
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.database import get_db
+from app.core.dependencies import get_current_user, get_current_user_then_release
 from app.models.user import User
+from app.services import image_uploads
 from app.services.storage import MAX_AUDIO_UPLOAD_BYTES, image_upload_limits, process_audio_upload, process_image_upload, public_url_for_key, run_image_worker, store_processed_audio, store_processed_image
 
 
@@ -91,6 +96,48 @@ async def upload_message_image(
     _current_user: Annotated[User, Depends(get_current_user_then_release)],
 ) -> UploadRead:
     return await save_image_upload(file, "messages", request)
+
+
+class DirectImageUploadRequest(BaseModel):
+    # 主图：image/jpeg（静态图）或 image/gif（动图），字节数；缩略图一律 JPEG
+    content_type: str = Field(..., max_length=40)
+    size: int = Field(..., ge=0)
+    thumbnail_size: int = Field(..., ge=0)
+
+
+class DirectUploadTarget(BaseModel):
+    method: str
+    url: str
+    # 必须原样带上，不能多也不能改（签名里固定了这几个头）
+    headers: dict[str, str]
+
+
+class DirectImageUploadTicket(BaseModel):
+    upload_id: str
+    image: DirectUploadTarget
+    thumbnail: DirectUploadTarget
+    expires_at: datetime
+
+
+@router.post("/message-image/direct", response_model=DirectImageUploadTicket, status_code=201)
+async def open_direct_message_image(
+    payload: DirectImageUploadRequest,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> dict:
+    """聊天图片直传开单（docs/chat-features.md「图片直传」）。服务器没开直传 → 409 direct_upload_unavailable，改用 /message-image。"""
+    return await image_uploads.open_upload(db, current_user, "messages", payload.content_type, payload.size, payload.thumbnail_size)
+
+
+@router.post("/message-image/direct/{upload_id}/complete", response_model=UploadRead, status_code=201)
+async def complete_direct_message_image(
+    upload_id: str,
+    request: Request,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> dict:
+    """两个 PUT 都成功之后调。返回和 /message-image 一样的 UploadRead。"""
+    return await image_uploads.complete_upload(db, current_user, upload_id, request)
 
 
 @router.post("/post-image", response_model=UploadRead, status_code=201)
