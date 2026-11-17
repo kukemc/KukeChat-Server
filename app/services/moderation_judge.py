@@ -24,7 +24,7 @@ import unicodedata
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -32,6 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.models.enums import MessageType
 from app.models.message import Message
+from app.services.internal_http import urlopen
 
 logger = logging.getLogger(__name__)
 

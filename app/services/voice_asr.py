@@ -13,9 +13,10 @@ import logging
 import uuid
 from dataclasses import dataclass
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
 from app.core.config import settings
+from app.services.internal_http import urlopen
 
 logger = logging.getLogger(__name__)
 

@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from numbers import Real
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
 from fastapi import HTTPException, status
 from sqlalchemy import delete, select, update
@@ -25,8 +25,8 @@ from app.core.database import AsyncSessionLocal, release_connection
 from app.models.conversation import Conversation
 from app.models.enums import ConversationType, MessageType, ModerationAction, ModerationSource, ModerationStatus, UserStatus
 from app.models.message import Message
-from app.models.post import Post, PostComment, PostTopic
 from app.models.penalty import UserViolation
+from app.models.post import Post, PostComment, PostTopic
 from app.models.report import AdminAuditLog, ContentModerationRecord
 from app.models.teamup import TeamupComment, TeamupProfile
 from app.models.user import User
@@ -34,6 +34,7 @@ from app.services import jury_settings
 from app.services import moderation_judge
 from app.services import penalties as penalty_service
 from app.services.email import send_email_internal
+from app.services.internal_http import urlopen
 from app.services.storage import get_object, storage_key_from_url
 from app.websocket.manager import admin_manager, manager
 
