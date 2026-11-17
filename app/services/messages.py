@@ -400,9 +400,44 @@ async def _message_sender_titles(
     return titles
 
 
+# 合并转发里再套合并转发，每套一层 metadata 深三层（metadata → items → [i] → metadata）。
+# 线上有人把聊天记录反复转发套了 80 多层，超过 pydantic 序列化的深度上限（约 255），
+# 含这条消息的会话列表 / 历史接口整个 500。超过这么多层的聊天记录，里面那层只留标题、不带内容。
+FORWARD_NESTING_LIMIT = 6
+
+
+def _cap_forward_nesting(metadata: dict[str, Any] | None, level: int = 1) -> dict[str, Any] | None:
+    """把套得太深的合并转发截断：第 FORWARD_NESTING_LIMIT 层以下的 items 清空，标 truncated。没超的原样返回同一个对象。"""
+    if not isinstance(metadata, dict):
+        return metadata
+    items = metadata.get("items")
+    if not isinstance(items, list):
+        return metadata
+    if level >= FORWARD_NESTING_LIMIT:
+        if not any(isinstance(item, dict) and isinstance(item.get("metadata"), dict) and isinstance(item["metadata"].get("items"), list) for item in items):
+            return metadata
+        capped_items = []
+        for item in items:
+            if isinstance(item, dict) and isinstance(item.get("metadata"), dict) and isinstance(item["metadata"].get("items"), list):
+                inner = {key: value for key, value in item["metadata"].items() if key != "items"}
+                item = {**item, "metadata": {**inner, "items": [], "truncated": True}}
+            capped_items.append(item)
+        return {**metadata, "items": capped_items}
+    changed = False
+    new_items = []
+    for item in items:
+        if isinstance(item, dict) and isinstance(item.get("metadata"), dict):
+            capped = _cap_forward_nesting(item["metadata"], level + 1)
+            if capped is not item["metadata"]:
+                item = {**item, "metadata": capped}
+                changed = True
+        new_items.append(item)
+    return {**metadata, "items": new_items} if changed else metadata
+
+
 def _read_metadata(metadata_json: str | None) -> dict[str, Any] | None:
     """返回给客户端的 metadata。「我的设备」的临时文件（metadata.transfer）现场补上 expired（docs/self-chat.md 5.3）。"""
-    metadata = _metadata_from_json(metadata_json)
+    metadata = _cap_forward_nesting(_metadata_from_json(metadata_json))
     if metadata is not None and isinstance(metadata.get("transfer"), dict):
         from app.services import self_chat
 
@@ -1666,7 +1701,8 @@ async def create_forward_bundle(
                 "sender_avatar_url": message.sender.avatar_url,
                 "type": message.type.value,
                 "content": message.content,
-                "metadata": _metadata_from_json(message.metadata_json),
+                # 被转发的若本身是聊天记录，它算第 2 层
+                "metadata": _cap_forward_nesting(_metadata_from_json(message.metadata_json), 2),
                 "created_at": message.created_at.isoformat(),
             }
             for message in visible_messages
