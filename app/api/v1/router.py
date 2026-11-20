@@ -26,6 +26,10 @@ from app.api.v1 import jury_senior  # noqa: E402
 
 api_router.include_router(jury_senior.router, prefix="/jury", tags=["jury"])
 api_router.include_router(ccw.router, prefix="/ccw", tags=["ccw"])
+# 油猴脚本 KukeChat for CCW 用的接口（docs/ccw-social.md）
+from app.api.v1 import ccw_social  # noqa: E402
+
+api_router.include_router(ccw_social.router, prefix="/ccw", tags=["ccw"])
 api_router.include_router(link_preview.router, prefix="/link-preview", tags=["link-preview"])
 api_router.include_router(teamup.router, prefix="/teamup", tags=["teamup"])
 api_router.include_router(task.router, prefix="/tasks", tags=["tasks"])

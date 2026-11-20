@@ -11,7 +11,8 @@ from starlette.responses import Response
 
 PROOF_WINDOW_SECONDS = 5 * 60
 PROOF_SALT = "KukeChat"
-ALLOWED_CLIENT_PREFIXES = ("kukechat-web/", "kukechat-admin/", "kukechat-bot/")
+# kukechat-ccw/：油猴脚本 KukeChat for CCW（docs/ccw-social.md）
+ALLOWED_CLIENT_PREFIXES = ("kukechat-web/", "kukechat-admin/", "kukechat-bot/", "kukechat-ccw/")
 
 
 class ClientProofMiddleware(BaseHTTPMiddleware):

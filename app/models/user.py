@@ -83,6 +83,9 @@ class User(Base):
     mute_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     # 是否让别人看到「对方正在输入」
     share_typing: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1")
+    # 在共创世界上（docs/ccw-social.md）：是否公开「正在玩 / 正在创作」，以及别人能不能从 CCW 主页查到我的 KukeChat
+    share_ccw_activity: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1")
+    ccw_discoverable: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1")
     # 别人戳我时用的动作（预设里的一个字）和接在我名字后面的文案
     poke_action: Mapped[str] = mapped_column(String(4), default="戳", server_default="戳")
     poke_suffix: Mapped[str] = mapped_column(String(32), default="", server_default="")

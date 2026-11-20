@@ -60,8 +60,10 @@ async def update_profile(db: AsyncSession, user: User, payload: UserUpdate) -> U
             user.profile_cover_url = None
             user.profile_cover_pending_url = None
             user.profile_cover_moderation_status = ModerationStatus.APPROVED.value
-    if updates.get("share_typing") is None:
-        updates.pop("share_typing", None)
+    for flag in ("share_typing", "share_ccw_activity", "ccw_discoverable"):
+        if updates.get(flag) is None:
+            updates.pop(flag, None)
+    stop_sharing_activity = updates.get("share_ccw_activity") is False
     # 这两个字段不可为空，传 null 或空串表示恢复默认
     if "poke_action" in updates:
         user.poke_action = poke_service.normalize_action(updates.pop("poke_action"))
@@ -73,6 +75,11 @@ async def update_profile(db: AsyncSession, user: User, payload: UserUpdate) -> U
         setattr(user, key, value)
     await db.commit()
     await db.refresh(user)
+    if stop_sharing_activity:
+        # 关掉公开后，已经存着的「正在玩」立刻作废，不等它自己过期
+        from app.services import ccw_activity
+
+        await ccw_activity.clear_activity(user.id)
     if user.profile_cover_pending_url and user.profile_cover_moderation_status == ModerationStatus.PENDING.value:
         from app.services.moderation import schedule_profile_cover_moderation
 

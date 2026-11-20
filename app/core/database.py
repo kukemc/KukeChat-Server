@@ -377,6 +377,9 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("user_violations", "appeal_judge_p", "appeal_judge_p FLOAT"),
     # 「我的设备」会话的主人（docs/self-chat.md）
     ("conversations", "self_owner_id", "self_owner_id INTEGER"),
+    # 在共创世界上的隐私开关（docs/ccw-social.md）
+    ("users", "share_ccw_activity", "share_ccw_activity BOOLEAN NOT NULL DEFAULT 1"),
+    ("users", "ccw_discoverable", "ccw_discoverable BOOLEAN NOT NULL DEFAULT 1"),
 )
 
 _ADDED_INDEXES: tuple[tuple[str, str], ...] = (

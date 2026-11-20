@@ -147,6 +147,8 @@ class UserPublic(BaseModel):
 class UserRead(UserPublic):
     email: EmailStr | None = None
     share_typing: bool = True
+    share_ccw_activity: bool = True
+    ccw_discoverable: bool = True
     profile_cover_pending_url: str | None = None
     profile_cover_moderation_status: str = "approved"
     updated_at: datetime
@@ -167,6 +169,9 @@ class UserUpdate(BaseModel):
     profile_cover_url: str | None = Field(default=None, max_length=500)
     # 关掉后别人看不到「我正在输入」
     share_typing: bool | None = None
+    # 在共创世界上：公开「正在玩 / 正在创作」；能从 CCW 主页查到我（docs/ccw-social.md）
+    share_ccw_activity: bool | None = None
+    ccw_discoverable: bool | None = None
     # 长度和取值在服务层校验，这样能返回带 code 的错误
     poke_action: str | None = Field(default=None, max_length=16)
     poke_suffix: str | None = Field(default=None, max_length=200)
