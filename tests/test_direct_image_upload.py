@@ -137,6 +137,61 @@ class DirectImageUploadCase(unittest.IsolatedAsyncioTestCase):
 
     # ------------------------------------------------------------ 用例
 
+    # ------------------------------------------------------------ 中转直传（/message-image/relay）
+
+    async def relay(self, image: bytes, thumb: bytes, content_type: str = "image/jpeg", expected: int = 201) -> dict:
+        return await self.call(
+            "POST", "/uploads/message-image/relay", expected,
+            files={"image": ("i", image, content_type), "thumbnail": ("t", thumb, "image/jpeg")},
+        )
+
+    def stored_bytes(self, url: str) -> bytes:
+        key = storage.storage_key_from_url(url)
+        self.assertIsNotNone(key, url)
+        return self.stored(key).read_bytes()
+
+    async def test_relay_clean_jpeg_stored_as_is(self) -> None:
+        image, thumb = jpeg((800, 600)), jpeg((200, 150))
+        body = await self.relay(image, thumb)
+        self.assertEqual(body["content_type"], "image/jpeg")
+        self.assertEqual(self.stored_bytes(body["url"]), image, "合格的主图原样写进去，不重新编码")
+        self.assertEqual(self.stored_bytes(body["thumbnail_url"]), thumb)
+        self.assertEqual(self.presigned, [], "中转不签预签名 URL")
+        self.assertEqual(await self.pending_count(), 0, "中转不开上传单")
+
+    async def test_relay_strips_exif(self) -> None:
+        body = await self.relay(jpeg((300, 200), exif=True), jpeg((100, 66)))
+        with Image.open(BytesIO(self.stored_bytes(body["url"]))) as stored:
+            self.assertNotIn("exif", stored.info)
+
+    async def test_relay_gif_kept(self) -> None:
+        image = gif()
+        body = await self.relay(image, jpeg((40, 30)), "image/gif")
+        self.assertEqual(body["content_type"], "image/gif")
+        self.assertEqual(self.stored_bytes(body["url"]), image)
+
+    async def test_relay_wrong_type_is_reprocessed(self) -> None:
+        # 声称是 JPEG 实际是 PNG：按普通上传处理，转成 JPEG
+        body = await self.relay(png((64, 64)), jpeg((32, 32)))
+        self.assertEqual(body["content_type"], "image/jpeg")
+        with Image.open(BytesIO(self.stored_bytes(body["url"]))) as stored:
+            self.assertEqual(stored.format, "JPEG")
+
+    async def test_relay_truncated_jpeg_is_not_stored_as_is(self) -> None:
+        full = jpeg((400, 300), color=(10, 200, 90))
+        half = full[: len(full) // 2]
+        self.acting = "alice"
+        response = await self.client.post(
+            "/api/v1/uploads/message-image/relay",
+            files={"image": ("i", half, "image/jpeg"), "thumbnail": ("t", jpeg((100, 75)), "image/jpeg")},
+        )
+        self.assertIn(response.status_code, (201, 400), response.text)
+        if response.status_code == 201:
+            self.assertNotEqual(self.stored_bytes(response.json()["url"]), half, "截断的图不能原样存")
+
+    async def test_relay_rejects_non_image(self) -> None:
+        await self.relay(b"not an image at all", jpeg((10, 10)), expected=400)
+
     async def test_clean_jpeg_is_used_as_is(self) -> None:
         image, thumb = jpeg((1200, 900)), jpeg((360, 270))
         ticket = await self.open(image, thumb)

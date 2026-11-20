@@ -837,6 +837,22 @@ def direct_image_problem(head: bytes, content_type: str, limits: ImageUploadLimi
     return None
 
 
+def relay_image_body_problem(data: bytes, content_type: str) -> str | None:
+    """中转直传时整张图都在内存里：再确认能完整解码（直传只看开头，截断或损坏的要到显示时才发现）。"""
+    try:
+        with Image.open(BytesIO(data)) as image:
+            if content_type == JPEG_CONTENT_TYPE:
+                image.load()
+            else:
+                # GIF：逐帧走一遍，坏帧会抛错；帧数上限交给后端处理那条路去判断
+                for frame in range(getattr(image, "n_frames", 1)):
+                    image.seek(frame)
+                    image.load()
+    except Exception:
+        return "undecodable"
+    return None
+
+
 def direct_thumbnail_problem(data: bytes) -> str | None:
     """直传的缩略图（整张，至多 DIRECT_THUMBNAIL_MAX_BYTES）：JPEG、能完整解码、不超过缩略图尺寸、不带元数据。"""
     max_dimension = settings.image_thumbnail_max_dimension

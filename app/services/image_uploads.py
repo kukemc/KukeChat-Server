@@ -242,3 +242,39 @@ async def stop_image_upload_worker() -> None:
         await task
     except asyncio.CancelledError:
         pass
+
+
+# ---------------------------------------------------------------- 中转直传（docs/chat-features.md「图片直传」的「中转」）
+# 有的网页（共创世界）用 CSP 限制了能连的域名，客户端连不上对象存储，预签名 PUT 会被浏览器直接拦下。
+# 这时客户端照样在本地压缩好主图和缩略图，一个请求交给后端；后端在内存里按直传同一套规则校验，
+# 合格就原样写进桶 —— 不重新编码、不回读对象存储，经服务器的流量就是压缩好的那点字节。
+# 不合格的退回普通上传的处理（process_image_upload），结果和 /uploads/message-image 一样。
+
+
+def relay_and_store(image: bytes, content_type: str, thumbnail: bytes, folder: str) -> tuple[str, str, str, str | None]:
+    """在线程里跑。返回 (主图 key, 缩略图 key, content_type, 重新处理的原因或 None)。"""
+    limits = storage.image_upload_limits(folder)
+    object_id = uuid4().hex
+    content_type = (content_type or "").strip().lower()
+    problem: str | None
+    if content_type not in storage.DIRECT_IMAGE_TYPES:
+        problem = "unsupported_type"
+    elif len(thumbnail) == 0 or len(thumbnail) > storage.DIRECT_THUMBNAIL_MAX_BYTES:
+        problem = "thumbnail_size"
+    else:
+        problem = storage.direct_image_problem(image[: storage.DIRECT_IMAGE_PROBE_BYTES], content_type, limits)
+        if problem is None:
+            problem = storage.relay_image_body_problem(image, content_type)
+        if problem is None:
+            thumb_problem = storage.direct_thumbnail_problem(thumbnail)
+            problem = f"thumbnail_{thumb_problem}" if thumb_problem else None
+    if problem is None:
+        _, extension = storage.DIRECT_IMAGE_TYPES[content_type]
+        key = f"{folder}/{object_id}.{extension}"
+        thumbnail_key = storage.thumbnail_key_for_key(key)
+        storage.put_object(key, image, content_type)
+        storage.put_object(thumbnail_key, thumbnail, storage.JPEG_CONTENT_TYPE)
+        return key, thumbnail_key, content_type, None
+    processed = storage.process_image_upload(image, folder, object_id, limits)
+    storage.store_processed_image(processed)
+    return processed.key, processed.thumbnail_key, processed.content_type, problem

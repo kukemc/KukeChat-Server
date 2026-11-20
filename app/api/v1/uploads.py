@@ -14,7 +14,7 @@ from app.core.database import get_db
 from app.core.dependencies import get_current_user, get_current_user_then_release
 from app.models.user import User
 from app.services import image_uploads
-from app.services.storage import MAX_AUDIO_UPLOAD_BYTES, image_upload_limits, process_audio_upload, process_image_upload, public_url_for_key, run_image_worker, store_processed_audio, store_processed_image
+from app.services.storage import DIRECT_THUMBNAIL_MAX_BYTES, MAX_AUDIO_UPLOAD_BYTES, image_upload_limits, process_audio_upload, process_image_upload, public_url_for_key, run_image_worker, store_processed_audio, store_processed_image
 
 
 router = APIRouter()
@@ -117,6 +117,36 @@ class DirectImageUploadTicket(BaseModel):
     image: DirectUploadTarget
     thumbnail: DirectUploadTarget
     expires_at: datetime
+
+
+@router.post("/message-image/relay", response_model=UploadRead, status_code=201)
+async def relay_message_image(
+    request: Request,
+    image: Annotated[UploadFile, File()],
+    thumbnail: Annotated[UploadFile, File()],
+    _current_user: Annotated[User, Depends(get_current_user_then_release)],
+) -> UploadRead:
+    """中转直传（docs/chat-features.md「图片直传」的「中转」）：客户端连不上对象存储时，把本地压缩好的主图（JPEG / GIF）
+    和缩略图（JPEG）一起交给后端；合格的原样写进桶，不合格的按 /message-image 处理。返回和 /message-image 一样。"""
+    limits = image_upload_limits("messages")
+    async with _IMAGE_READ_SLOTS:
+        content = await image.read(limits.max_bytes + 1)
+        if len(content) > limits.max_bytes:
+            raise HTTPException(status_code=413, detail=f"Image size must not exceed {limits.max_bytes // (1024 * 1024)}MB")
+        if not content:
+            raise HTTPException(status_code=400, detail="Image is empty")
+        thumb = await thumbnail.read(DIRECT_THUMBNAIL_MAX_BYTES + 1)
+        try:
+            key, thumbnail_key, content_type, reprocessed = await run_image_worker(
+                image_uploads.relay_and_store, content, image.content_type or "", thumb, "messages"
+            )
+        except HTTPException:
+            raise
+        except OSError as exc:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Image could not be saved") from exc
+    if reprocessed:
+        image_uploads.logger.info("Relayed image upload reprocessed by the server: %s", reprocessed)
+    return UploadRead(**image_uploads.upload_view(key, thumbnail_key, content_type, request))
 
 
 @router.post("/message-image/direct", response_model=DirectImageUploadTicket, status_code=201)
