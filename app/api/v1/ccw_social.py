@@ -8,19 +8,21 @@
 - POST   /ccw/feed               CCW 动态页里并进来的 KukeChat 动态
 - POST   /ccw/mutuals            CCW 互关里有 KukeChat 还不是好友的人，可顺手发申请
 - GET    /ccw/works/{oid}        作品页：作品群、正在玩的好友
+- GET    /ccw/works/{oid}/chat   作品页「聊天」标签：作品群的最近消息，不用登录也能看
 """
 
 from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.encoders import jsonable_encoder
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import rate_limit
 from app.core.database import get_db
-from app.core.dependencies import get_current_user
+from app.api.v1.auth import get_client_ip
+from app.core.dependencies import get_current_user, get_current_user_from_token
 from app.models.user import User
 from app.schemas.ccw_social import (
     CCW_OID,
@@ -32,6 +34,7 @@ from app.schemas.ccw_social import (
     CcwUserBatchRequest,
     CcwUserBrief,
     CcwUserCard,
+    CcwWorkChat,
     CcwWorkRead,
     UserActivityRead,
 )
@@ -148,3 +151,28 @@ async def ccw_work(
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid CCW work id")
     await rate_limit.hit(f"ccw-work:{current_user.id}", 120, 60)
     return await ccw_social.work_info(db, current_user, oid)
+
+
+
+@router.get("/works/{oid}/chat", response_model=CcwWorkChat)
+async def ccw_work_chat(
+    oid: str,
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    after_id: Annotated[int | None, Query(gt=0)] = None,
+    limit: Annotated[int, Query(ge=1, le=50)] = 30,
+) -> CcwWorkChat:
+    """不要求登录：没装 KukeChat 的人在作品页上也能看作品群在聊什么。带了令牌就顺便告诉他是不是群成员。"""
+    oid = oid.strip().lower()
+    if not CCW_OID.match(oid):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid CCW work id")
+    # 脚本每 5 秒轮询一次；按 IP 限，同一个网络里开几个标签页也够用
+    await rate_limit.hit(f"ccw-work-chat:{get_client_ip(request)}", 120, 60)
+    viewer_id = None
+    auth = request.headers.get("authorization") or ""
+    if auth.lower().startswith("bearer "):
+        try:
+            viewer_id = (await get_current_user_from_token(db, auth[7:].strip())).id
+        except Exception:
+            viewer_id = None
+    return await ccw_social.work_chat(db, oid, viewer_id, after_id, limit)

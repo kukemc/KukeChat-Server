@@ -126,6 +126,19 @@ GET /api/v1/ccw/works/{作品 oid}
   加入走现有的 `POST /conversations/{id}/join`。
 - `playing`：我的好友里此刻在玩这个作品的人，按开始时间排。
 
+## 作品页的「聊天」标签
+
+```http
+GET /api/v1/ccw/works/{作品 oid}/chat?after_id=&limit=30
+→ { "group": CcwWorkGroup | null, "messages": [{ "id", "sender_id", "nickname", "avatar_url", "ccw_oid", "account_level", "type", "content", "created_at" }] }
+```
+
+- **不要求登录**：作品群是群主自己开了游戏模式、公开（`join_mode = open`）绑定到作品上的，没装 KukeChat 的人在作品页上也能看。
+  带了令牌时 `group.is_member` 才有意义。按 IP 限速每分钟 120 次（脚本每 4 秒轮询一次）。
+- 不带 `after_id` 取最近 `limit` 条；带了取比它新的。都按 id 正序。撤回的消息不返回。
+- `content`：文字是正文、图片是地址、系统消息是文案，其他类型是「[语音]」这样的摘要。不返回消息元数据。
+- 发言走现有的 `POST /conversations/{id}/messages`（要先 `POST /conversations/{id}/join`）。群成员另有 WebSocket 的 `message.created`。
+
 ## 发布脚本和界面包
 
 后端提供三个静态地址，文件放在 `app/static/ccw/`（不进仓库，部署时从 KukeChat-Client 的构建产物复制）：

@@ -17,15 +17,18 @@ from fastapi import HTTPException
 from sqlalchemy.orm import aliased, joinedload
 
 from app.models.conversation import Conversation, ConversationMember
-from app.models.enums import ConversationType, FriendRequestStatus, UserStatus
+from app.models.message import Message
+from app.models.enums import ConversationType, FriendRequestStatus, MessageType, UserStatus
 from app.models.friend import FriendRequest, Friendship
 from app.models.user import User
 from app.schemas.ccw_social import (
+    CcwChatMessage,
     CcwMutualsRead,
     CcwPlayingFriend,
     CcwUserBrief,
     CcwUserCard,
     CcwWorkGroup,
+    CcwWorkChat,
     CcwWorkRead,
     Friendship as FriendshipKind,
 )
@@ -210,9 +213,9 @@ async def mutuals_to_invite(db: AsyncSession, viewer: User, ccw_oids: list[str],
     return CcwMutualsRead(users=briefs, sent=sent)
 
 
-async def work_info(db: AsyncSession, viewer: User, oid: str) -> CcwWorkRead:
-    group = None
-    row = (
+async def _work_group_row(db: AsyncSession, oid: str) -> Conversation | None:
+    """作品群：群主开了游戏模式、绑定了这个作品的公开群。有多个时取最早建的。"""
+    return (
         await db.execute(
             select(Conversation)
             .where(
@@ -225,12 +228,23 @@ async def work_info(db: AsyncSession, viewer: User, oid: str) -> CcwWorkRead:
             .limit(1)
         )
     ).scalar_one_or_none()
-    if row is not None:
-        count = (await db.execute(select(func.count()).select_from(ConversationMember).where(ConversationMember.conversation_id == row.id))).scalar_one()
+
+
+async def _work_group(db: AsyncSession, row: Conversation, viewer_id: int | None) -> CcwWorkGroup:
+    count = (await db.execute(select(func.count()).select_from(ConversationMember).where(ConversationMember.conversation_id == row.id))).scalar_one()
+    member = None
+    if viewer_id is not None:
         member = (
-            await db.execute(select(ConversationMember.id).where(ConversationMember.conversation_id == row.id, ConversationMember.user_id == viewer.id))
+            await db.execute(select(ConversationMember.id).where(ConversationMember.conversation_id == row.id, ConversationMember.user_id == viewer_id))
         ).scalar_one_or_none()
-        group = CcwWorkGroup(conversation_id=row.id, title=row.title or "作品群", avatar_url=row.avatar_url, member_count=int(count or 0), is_member=member is not None)
+    return CcwWorkGroup(conversation_id=row.id, title=row.title or "作品群", avatar_url=row.avatar_url, member_count=int(count or 0), is_member=member is not None)
+
+
+async def work_info(db: AsyncSession, viewer: User, oid: str) -> CcwWorkRead:
+    group = None
+    row = await _work_group_row(db, oid)
+    if row is not None:
+        group = await _work_group(db, row, viewer.id)
     playing: list[CcwPlayingFriend] = []
     activities = {uid: a for uid, a in (await friend_activities(db, viewer.id)).items() if a.ccw_oid == oid and a.kind == "play"}
     if activities:
@@ -240,3 +254,50 @@ async def work_info(db: AsyncSession, viewer: User, oid: str) -> CcwWorkRead:
             for u in sorted(users, key=lambda u: activities[u.id].started_at)
         ]
     return CcwWorkRead(ccw_oid=oid, group=group, playing=playing)
+
+
+_SUMMARY = {
+    MessageType.VOICE: "[语音]",
+    MessageType.FORWARD_BUNDLE: "[聊天记录]",
+    MessageType.POLL: "[投票]",
+    MessageType.RED_PACKET: "[红包]",
+    MessageType.GIFT: "[礼物]",
+}
+
+
+def _chat_message(m: Message) -> CcwChatMessage:
+    u = m.sender
+    content = m.content if m.type in (MessageType.TEXT, MessageType.IMAGE, MessageType.SYSTEM) else _SUMMARY.get(m.type, "[消息]")
+    return CcwChatMessage(
+        id=m.id,
+        sender_id=m.sender_id,
+        nickname=(u.nickname or u.username) if u else "KukeChat 用户",
+        avatar_url=u.avatar_url if u else None,
+        ccw_oid=u.ccw_student_oid if u else None,
+        account_level=int(getattr(u, "account_level", 0) or 0) if u else 0,
+        type=m.type.value if hasattr(m.type, "value") else str(m.type),
+        content=content,
+        created_at=m.created_at,
+    )
+
+
+async def work_chat(db: AsyncSession, oid: str, viewer_id: int | None, after_id: int | None, limit: int) -> CcwWorkChat:
+    """作品页「聊天」标签：作品群最近的消息，任何人都能看（群是群主公开绑定到作品上的）。
+
+    after_id 为空时取最近 limit 条；否则取比它新的（轮询用）。按 id 正序返回。撤回的不返回。
+    """
+    row = await _work_group_row(db, oid)
+    if row is None:
+        return CcwWorkChat()
+    query = (
+        select(Message)
+        .options(joinedload(Message.sender))
+        .where(Message.conversation_id == row.id, Message.recalled_at.is_(None))
+    )
+    if after_id:
+        query = query.where(Message.id > after_id).order_by(Message.id).limit(limit)
+        messages = list((await db.execute(query)).scalars().all())
+    else:
+        messages = list((await db.execute(query.order_by(Message.id.desc()).limit(limit))).scalars().all())
+        messages.reverse()
+    return CcwWorkChat(group=await _work_group(db, row, viewer_id), messages=[_chat_message(m) for m in messages])

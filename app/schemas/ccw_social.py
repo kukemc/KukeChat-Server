@@ -165,3 +165,23 @@ class CcwWorkRead(BaseModel):
     ccw_oid: str
     group: CcwWorkGroup | None = None
     playing: list[CcwPlayingFriend] = Field(default_factory=list)
+
+
+class CcwChatMessage(BaseModel):
+    """作品页「聊天」标签里的一条群消息。只给展示用的字段，不含消息元数据。"""
+
+    id: int
+    sender_id: int
+    nickname: str
+    avatar_url: str | None = None
+    ccw_oid: str | None = None
+    account_level: int = 0
+    type: str
+    # 文字消息是正文；图片是图片地址；其他类型是「[语音]」这样的摘要
+    content: str
+    created_at: datetime
+
+
+class CcwWorkChat(BaseModel):
+    group: CcwWorkGroup | None = None
+    messages: list[CcwChatMessage] = Field(default_factory=list)

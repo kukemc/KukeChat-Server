@@ -11,8 +11,9 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 import app.models  # noqa: F401
 from app.core.database import Base
 from app.models.conversation import Conversation, ConversationMember
-from app.models.enums import ConversationType, FriendRequestStatus, MemberRole, PostVisibility, UserStatus
+from app.models.enums import ConversationType, FriendRequestStatus, MemberRole, MessageType, PostVisibility, UserStatus
 from app.models.post import Post
+from app.models.message import Message
 from app.models.friend import FriendRequest, Friendship
 from app.models.user import User
 from app.schemas.ccw_social import ActivityUpdate, CcwUserBatchRequest
@@ -263,6 +264,31 @@ class SecondPhaseTests(_Fixture):
         self.assertIsNone(other.group, "审批制的群不算作品群")
         self.assertEqual([p.user_id for p in other.playing], [self.ids["carol"]])
 
+
+    async def test_work_chat_public_read(self) -> None:
+        async with self.sessions() as db:
+            group = Conversation(type=ConversationType.GROUP, title="作品群", join_mode="open", game_mode_enabled=True, game_creation_oid=WORK)
+            closed = Conversation(type=ConversationType.GROUP, title="审批群", join_mode="approval", game_mode_enabled=True, game_creation_oid=OTHER_WORK)
+            db.add_all([group, closed])
+            await db.flush()
+            db.add(ConversationMember(conversation_id=group.id, user_id=self.ids["alice"], role=MemberRole.OWNER))
+            msgs = [
+                Message(conversation_id=group.id, sender_id=self.ids["alice"], type=MessageType.TEXT, content="第一条"),
+                Message(conversation_id=group.id, sender_id=self.ids["alice"], type=MessageType.TEXT, content="撤回了", recalled_at=datetime.now(UTC)),
+                Message(conversation_id=group.id, sender_id=self.ids["alice"], type=MessageType.VOICE, content="https://x/voice.mp3"),
+                Message(conversation_id=closed.id, sender_id=self.ids["alice"], type=MessageType.TEXT, content="审批群的"),
+            ]
+            db.add_all(msgs)
+            await db.commit()
+            anon = await ccw_social.work_chat(db, WORK, None, None, 30)
+            newer = await ccw_social.work_chat(db, WORK, self.ids["alice"], msgs[0].id, 30)
+            other = await ccw_social.work_chat(db, OTHER_WORK, None, None, 30)
+        self.assertEqual([m.content for m in anon.messages], ["第一条", "[语音]"])
+        self.assertFalse(anon.group.is_member)
+        self.assertEqual([m.content for m in newer.messages], ["[语音]"])
+        self.assertTrue(newer.group.is_member)
+        self.assertIsNone(other.group)
+        self.assertEqual(other.messages, [])
 
 if __name__ == "__main__":
     unittest.main()
