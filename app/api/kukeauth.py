@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import base64
+import json
 from typing import Annotated, Any
 from urllib.parse import unquote, urlsplit
 
@@ -23,7 +24,8 @@ from app.core.database import get_db, release_connection
 from app.core.device import context_for_request, ip_prefix, normalize_ip
 from app.core.security import verify_password
 from app.integrations import CcwUnavailable
-from app.models.kukeauth import AccountSession
+from app.models.kukeauth import AccountSession, OAuthClient
+from app.models.report import AdminAuditLog
 from app.models.user import User
 from app.schemas.auth import UserRegister
 from app.schemas.user import UserUpdate
@@ -181,8 +183,16 @@ async def read_request(request_id: str, request: Request, db: Db) -> dict[str, A
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"code": "request_expired", "message": "这次登录已过期，请回到原来的页面重新发起"})
     found = await service.session_user(db, request.cookies.get(_cookie_name()))
     fresh = found is not None and (not item.force_login or ensure_aware_utc(found[0].created_at) >= ensure_aware_utc(item.created_at))
+    developer = await service.client_developer(db, client)
     return {
-        "client": {"name": client.name, "icon_url": client.icon_url},
+        "client": {
+            "name": client.name,
+            "icon_url": client.icon_url,
+            "homepage_url": client.homepage_url,
+            # 第三方应用标出开发者，官方应用（后台建的）没有这一项
+            "official": client.owner_id is None,
+            "developer": {"username": developer.username, "nickname": developer.nickname or developer.username} if developer else None,
+        },
         "scopes": item.scope.split(),
         "needs_login": not fresh,
         "needs_verification": fresh and not service.is_verified(found[1]),  # type: ignore[index]
@@ -284,6 +294,9 @@ async def userinfo(request: Request, db: Db) -> Response:
         return unauthorized
     claims = service.verify_access_token(header[7:].strip())
     if claims is None:
+        return unauthorized
+    # 应用被删或被停用后，它手里还没过期的 access token 也不再能读资料
+    if await service.get_client(db, claims.get("aud")) is None:
         return unauthorized
     user = await service.user_by_public_id(db, claims["sub"])
     if user is None or service.account_ban_state(user) is not None:
@@ -432,7 +445,14 @@ async def my_grants(current: Current, db: Db) -> dict[str, Any]:
     rows = await service.list_grants(db, current[1].id)
     return {
         "items": [
-            {"client_id": grant.client_id, "name": client.name if client else grant.client_id, "icon_url": client.icon_url if client else None, "scopes": grant.scope.split(), "created_at": grant.created_at}
+            {
+                "client_id": grant.client_id,
+                "name": client.name if client else grant.client_id,
+                "icon_url": client.icon_url if client else None,
+                "official": client is not None and client.owner_id is None,
+                "scopes": grant.scope.split(),
+                "created_at": grant.created_at,
+            }
             for grant, client in rows
         ]
     }
@@ -595,3 +615,172 @@ async def unbind_connection(provider: str, body: UnbindBody, current: Current, d
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail={"code": "last_method", "message": "请先验证邮箱，再解绑这个账号"})
     user = await ccw_service.unbind_student(db, user)
     return {"items": service.connections(user), "me": _me(user)}
+
+
+# ---------------------------------------------------------------- 开发者：自助创建和管理应用
+#
+# 验证过的账号都能建，每人最多 MAX_DEVELOPER_CLIENTS 个。建出来的是第三方应用（owner_id 有值），
+# 授权页会标出开发者；后台随时可以停用（disabled），开发者自己不能重新启用。
+
+RedirectUri = Annotated[str, Field(max_length=500)]
+
+
+class AppBody(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    homepage_url: str | None = Field(default=None, max_length=500)
+    icon_url: str | None = Field(default=None, max_length=500)
+    redirect_uris: list[RedirectUri] = Field(min_length=1, max_length=service.MAX_REDIRECT_URIS)
+    post_logout_redirect_uris: list[RedirectUri] = Field(default_factory=list, max_length=service.MAX_REDIRECT_URIS)
+    allowed_scopes: list[str] = Field(default_factory=lambda: ["openid", "profile"], max_length=len(service.SCOPES))
+
+
+class AppCreate(AppBody):
+    # 桌面端、纯前端没法保管 secret，只靠 PKCE。建好后不能改
+    public: bool = False
+
+
+class AppPatch(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=80)
+    homepage_url: str | None = Field(default=None, max_length=500)
+    icon_url: str | None = Field(default=None, max_length=500)
+    redirect_uris: list[RedirectUri] | None = Field(default=None, min_length=1, max_length=service.MAX_REDIRECT_URIS)
+    post_logout_redirect_uris: list[RedirectUri] | None = Field(default=None, max_length=service.MAX_REDIRECT_URIS)
+    allowed_scopes: list[str] | None = Field(default=None, max_length=len(service.SCOPES))
+
+
+def _invalid(message: str) -> HTTPException:
+    return HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail={"code": "invalid_app", "message": message})
+
+
+def _clean_app(values: dict[str, Any]) -> dict[str, Any]:
+    """校验并整理开发者填的应用信息，返回可以直接写进 OAuthClient 的字段。"""
+    out: dict[str, Any] = {}
+    if values.get("name") is not None:
+        name = values["name"].strip()
+        if not name:
+            raise _invalid("应用名称不能为空")
+        lowered = name.lower()
+        if any(word in lowered for word in service.RESERVED_NAME_WORDS):
+            raise _invalid("应用名称不能包含 KukeAuth、KukeChat")
+        out["name"] = name
+    for field, label in (("homepage_url", "应用主页"), ("icon_url", "图标地址")):
+        if field in values:
+            url = (values[field] or "").strip() or None
+            if url:
+                problem = service.https_url_problem(url, label)
+                if problem:
+                    raise _invalid(problem)
+            out[field] = url
+    for field in ("redirect_uris", "post_logout_redirect_uris"):
+        if values.get(field) is not None:
+            uris = list(dict.fromkeys(uri.strip() for uri in values[field] if uri.strip()))
+            if field == "redirect_uris" and not uris:
+                raise _invalid("至少要填一个回调地址")
+            for uri in uris:
+                problem = service.redirect_uri_problem(uri)
+                if problem:
+                    raise _invalid(problem)
+            out[field] = json.dumps(uris)
+    if values.get("allowed_scopes") is not None:
+        scopes = list(dict.fromkeys(values["allowed_scopes"]))
+        problem = service.scope_problem(scopes)
+        if problem:
+            raise _invalid(problem)
+        out["allowed_scopes"] = json.dumps(scopes)
+    return out
+
+
+def _app(client: OAuthClient) -> dict[str, Any]:
+    return {
+        "client_id": client.client_id,
+        "name": client.name,
+        "homepage_url": client.homepage_url,
+        "icon_url": client.icon_url,
+        "redirect_uris": service.json_list(client.redirect_uris),
+        "post_logout_redirect_uris": service.json_list(client.post_logout_redirect_uris),
+        "allowed_scopes": service.json_list(client.allowed_scopes),
+        "public": client.secret_hash is None,
+        "disabled": client.disabled,
+        "created_at": client.created_at,
+    }
+
+
+async def _developer(current: Current) -> User:
+    user = current[1]
+    if not service.is_verified(user):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail={"code": "verification_required", "message": "请先验证邮箱或绑定 CCW，再创建应用"})
+    return user
+
+
+Developer = Annotated[User, Depends(_developer)]
+
+
+async def _owned(db: AsyncSession, user: User, client_id: str) -> OAuthClient:
+    client = await service.owned_client(db, user.id, client_id)
+    if client is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"code": "app_not_found", "message": "没有这个应用"})
+    return client
+
+
+def _audit(db: AsyncSession, user: User, action: str, client_id: str) -> None:
+    db.add(AdminAuditLog(actor_id=user.id, action=f"kukeauth.developer_{action}", target_type="oauth_client", details=client_id))
+
+
+@router.get("/account/api/developer/apps")
+async def list_apps(current: Current, db: Db, response: Response) -> dict[str, Any]:
+    _no_store(response)
+    user = current[1]
+    items = await service.developer_clients(db, user.id)
+    return {"items": [_app(client) for client in items], "limit": service.MAX_DEVELOPER_CLIENTS, "can_create": service.is_verified(user)}
+
+
+@router.post("/account/api/developer/apps", status_code=201, dependencies=[SameOrigin])
+async def create_app(body: AppCreate, user: Developer, db: Db, response: Response) -> dict[str, Any]:
+    _no_store(response)
+    # 先校验和数个数，填错了不占限速次数；限速只防反复建删
+    fields = _clean_app(body.model_dump())
+    if len(await service.developer_clients(db, user.id)) >= service.MAX_DEVELOPER_CLIENTS:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail={"code": "app_limit", "message": f"每个账号最多创建 {service.MAX_DEVELOPER_CLIENTS} 个应用"})
+    await rate_limit.hit(f"account-app-create:{user.id}", 20, 86400)
+    secret, secret_hash = (None, None) if body.public else service.new_client_secret()
+    client = OAuthClient(client_id=service.new_developer_client_id(), secret_hash=secret_hash, owner_id=user.id, **fields)
+    db.add(client)
+    _audit(db, user, "create", client.client_id)
+    await db.commit()
+    await db.refresh(client)
+    # secret 只在这里出现一次，库里只有哈希
+    return {**_app(client), "client_secret": secret}
+
+
+@router.patch("/account/api/developer/apps/{client_id}", dependencies=[SameOrigin])
+async def update_app(client_id: str, body: AppPatch, user: Developer, db: Db) -> dict[str, Any]:
+    client = await _owned(db, user, client_id)
+    for field, value in _clean_app(body.model_dump(exclude_unset=True)).items():
+        setattr(client, field, value)
+    _audit(db, user, "update", client.client_id)
+    await db.commit()
+    await db.refresh(client)
+    return _app(client)
+
+
+@router.post("/account/api/developer/apps/{client_id}/rotate-secret", dependencies=[SameOrigin])
+async def rotate_app_secret(client_id: str, user: Developer, db: Db, response: Response) -> dict[str, Any]:
+    _no_store(response)
+    await rate_limit.hit(f"account-app-rotate:{user.id}", 10, 3600)
+    client = await _owned(db, user, client_id)
+    if client.secret_hash is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail={"code": "public_client", "message": "公开应用没有 client secret"})
+    secret, client.secret_hash = service.new_client_secret()
+    _audit(db, user, "rotate_secret", client.client_id)
+    await db.commit()
+    return {"client_secret": secret}
+
+
+@router.delete("/account/api/developer/apps/{client_id}", dependencies=[SameOrigin])
+async def delete_app(client_id: str, current: Current, db: Db) -> dict[str, bool]:
+    # 删除不要求账号仍是已验证状态：解绑了验证方式的人也要能收拾自己的应用
+    user = current[1]
+    client = await _owned(db, user, client_id)
+    _audit(db, user, "delete", client.client_id)
+    await service.delete_client(db, client)
+    return {"ok": True}

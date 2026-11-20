@@ -1,12 +1,16 @@
 import {useEffect, useRef, useState, type ChangeEvent} from 'react';
 import {ApiError, api, type CcwChallenge, type Connection, type Grant, type Me, type OAuthRequestInfo} from './api';
+import {DeveloperTab} from './developer';
+import {Docs} from './docs';
 import {AuthShell, Avatar, Field, Notice, ThemeToggle, Wordmark, useSubmit} from './ui';
 
 const query = new URLSearchParams(location.search);
 const requestId = query.get('request');
 const withRequest = (path: string): string => (requestId ? `${path}?request=${encodeURIComponent(requestId)}` : path);
 const go = (path: string): void => location.assign(path);
-const afterLogin = (): void => go(requestId ? withRequest('/continue') : '/account');
+// 登录后回到原来的账号页标签；只认站内的 /account，免得被拿来做开放跳转
+const next = query.get('next');
+const afterLogin = (): void => go(requestId ? withRequest('/continue') : next && /^\/account(\?|$)/.test(next) ? next : '/account');
 
 const SCOPE_LABELS: Record<string, string> = {
     profile: '用户名、昵称、头像和简介',
@@ -301,6 +305,12 @@ const Continue = () => {
         <AuthShell>
             <h1>登录 {info.client.name}</h1>
             <p className="lead">{info.client.name} 想使用你的 KukeAuth 账号登录。</p>
+            {info.client.official ? null : (
+                <p className="third-party">
+                    第三方应用{info.client.developer ? `，由 @${info.client.developer.username} 开发` : ''}，不是 KukeAuth 官方服务。
+                    {info.client.homepage_url ? <> <a className="link" href={info.client.homepage_url} target="_blank" rel="noreferrer">应用主页</a></> : null}
+                </p>
+            )}
             <div className="identity">
                 <Avatar url={me.avatar_url} name={me.nickname} size={44} />
                 <div className="identity-text"><b>{me.nickname}</b><span>@{me.username}</span></div>
@@ -530,7 +540,7 @@ const AppsTab = () => {
                 {items?.map(item => (
                     <div className="row" key={item.client_id}>
                         <div>
-                            <b>{item.name}</b>
+                            <b>{item.name}{item.official ? null : <em className="tag">第三方</em>}</b>
                             <span>{scopeList(item.scopes).join('、') || '仅确认身份'}</span>
                         </div>
                         <button
@@ -549,17 +559,18 @@ const AppsTab = () => {
     );
 };
 
-type Tab = 'profile' | 'security' | 'connections' | 'apps';
-const TABS: [Tab, string][] = [['profile', '资料'], ['security', '安全'], ['connections', '账号绑定'], ['apps', '已授权应用']];
+type Tab = 'profile' | 'security' | 'connections' | 'apps' | 'developer';
+const TABS: [Tab, string][] = [['profile', '资料'], ['security', '安全'], ['connections', '账号绑定'], ['apps', '已授权应用'], ['developer', '开发者']];
+const initialTab = (): Tab => (TABS.find(([key]) => key === query.get('tab'))?.[0] ?? 'profile');
 
 const Account = () => {
     const [me, setMe] = useState<Me | null>(null);
-    const [tab, setTab] = useState<Tab>('profile');
+    const [tab, setTab] = useState<Tab>(initialTab);
     const [failed, setFailed] = useState('');
 
     useEffect(() => {
         api.me().then(setMe).catch((caught: unknown) => {
-            if (caught instanceof ApiError && caught.status === 401) go('/login');
+            if (caught instanceof ApiError && caught.status === 401) go(tab === 'profile' ? '/login' : `/login?next=${encodeURIComponent(`/account?tab=${tab}`)}`);
             else setFailed(caught instanceof Error ? caught.message : '读取失败');
         });
     }, []);
@@ -572,6 +583,7 @@ const Account = () => {
             <header className="topbar">
                 <Wordmark href="/account" />
                 <div className="topbar-side">
+                    <a className="top-link" href="/docs">开发者文档</a>
                     <ThemeToggle />
                     <button type="button" className="button is-quiet" onClick={() => void api.logout().then(() => go('/login'))}>退出登录</button>
                 </div>
@@ -590,7 +602,10 @@ const Account = () => {
             <div className="account-body">
                 <nav className="tabs" role="tablist">
                     {TABS.map(([key, label]) => (
-                        <button key={key} type="button" role="tab" aria-selected={tab === key} onClick={() => setTab(key)}>{label}</button>
+                        <button key={key} type="button" role="tab" aria-selected={tab === key} onClick={() => {
+                            setTab(key);
+                            history.replaceState(null, '', key === 'profile' ? '/account' : `/account?tab=${key}`);
+                        }}>{label}</button>
                     ))}
                 </nav>
                 <div className="tab-body">
@@ -598,6 +613,7 @@ const Account = () => {
                     {tab === 'security' ? <SecurityTab me={me} onChange={setMe} /> : null}
                     {tab === 'connections' ? <ConnectionsTab onChange={setMe} /> : null}
                     {tab === 'apps' ? <AppsTab /> : null}
+                    {tab === 'developer' ? <DeveloperTab /> : null}
                 </div>
             </div>
         </div>
@@ -619,6 +635,7 @@ export const App = () => {
     case '/verify': return <Verify />;
     case '/continue': return <Continue />;
     case '/account': return <Account />;
+    case '/docs': return <Docs />;
     default: return <Home />;
     }
 };

@@ -628,3 +628,171 @@ class AccountTests(Base_):
         self.assertEqual(doc["code_challenge_methods_supported"], ["S256"])
         with patch.object(settings, "kukeauth_signing_key", None):
             self.assertEqual((await self.http.get("/oauth/jwks")).status_code, 503)
+
+
+class DeveloperTests(Base_):
+    """开发者在账号站自助建应用：建出来就能走完整流程，授权页标出开发者，删掉后令牌失效。"""
+
+    APP = {"name": "小工具", "redirect_uris": ["https://tool.test/cb"], "allowed_scopes": ["openid", "profile"]}
+
+    async def asyncSetUp(self) -> None:
+        await super().asyncSetUp()
+        async with self.sessions() as db:
+            db.add(User(username="bobby", hashed_password=hash_password("password-2"), registration_ip="10.0.0.2"))
+            db.add(User(username="carol", hashed_password=hash_password("password-3"), registration_ip="10.0.0.3", email_verified_at=datetime.now(UTC), email="c@example.com"))
+            await db.commit()
+
+    async def create(self, **extra) -> httpx.Response:  # noqa: ANN003
+        return await self.http.post("/account/api/developer/apps", json={**self.APP, **extra}, headers=ORIGIN)
+
+    async def flow(self, client_id: str, secret: str | None) -> dict:
+        verifier, challenge = pkce()
+        params = {**self.params(challenge), "client_id": client_id, "redirect_uri": "https://tool.test/cb", "scope": "openid profile"}
+        location = (await self.http.get("/oauth/authorize", params=params)).headers["location"]
+        info = None
+        if "/continue?" in location:
+            request_id = parse_qs(urlsplit(location).query)["request"][0]
+            info = (await self.http.get(f"/account/api/requests/{request_id}")).json()
+            location = (await self.http.post(f"/account/api/requests/{request_id}/approve", headers=ORIGIN)).json()["redirect_url"]
+        code = parse_qs(urlsplit(location).query)["code"][0]
+        data = {"grant_type": "authorization_code", "code": code, "redirect_uri": "https://tool.test/cb", "code_verifier": verifier, "client_id": client_id}
+        if secret:
+            data["client_secret"] = secret
+        token = await self.http.post("/oauth/token", data=data)
+        return {"info": info, "token": token}
+
+    async def test_create_and_sign_in(self) -> None:
+        await self.login()
+        created = await self.create(homepage_url="https://tool.test")
+        self.assertEqual(created.status_code, 201, created.text)
+        body = created.json()
+        self.assertTrue(body["client_id"].startswith("app-"))
+        self.assertTrue(body["client_secret"].startswith("kcs_"))
+        self.assertFalse(body["public"])
+        listed = (await self.http.get("/account/api/developer/apps")).json()
+        self.assertEqual([item["client_id"] for item in listed["items"]], [body["client_id"]])
+        self.assertNotIn("client_secret", listed["items"][0])
+
+        result = await self.flow(body["client_id"], body["client_secret"])
+        client = result["info"]["client"]
+        self.assertFalse(client["official"])
+        self.assertEqual(client["developer"]["username"], "alice")
+        self.assertEqual(client["homepage_url"], "https://tool.test")
+        self.assertEqual(result["token"].status_code, 200, result["token"].text)
+        access = result["token"].json()["access_token"]
+        self.assertEqual((await self.http.get("/oauth/userinfo", headers={"Authorization": f"Bearer {access}"})).json()["preferred_username"], "alice")
+        grants = (await self.http.get("/account/api/me/grants")).json()["items"]
+        self.assertFalse(next(item for item in grants if item["client_id"] == body["client_id"])["official"])
+
+        # 删掉以后：还没过期的 access token 也读不到资料，授权记录一起没了
+        self.assertEqual((await self.http.delete(f"/account/api/developer/apps/{body['client_id']}", headers=ORIGIN)).status_code, 200)
+        self.assertEqual((await self.http.get("/oauth/userinfo", headers={"Authorization": f"Bearer {access}"})).status_code, 401)
+        self.assertEqual((await self.http.get("/account/api/me/grants")).json()["items"], [])
+        self.assertEqual((await self.http.get("/account/api/developer/apps")).json()["items"], [])
+
+    async def test_official_clients_stay_official(self) -> None:
+        await self.login()
+        _verifier, challenge = pkce()
+        location = (await self.http.get("/oauth/authorize", params=self.params(challenge))).headers["location"]
+        request_id = parse_qs(urlsplit(location).query)["request"][0]
+        client = (await self.http.get(f"/account/api/requests/{request_id}")).json()["client"]
+        self.assertTrue(client["official"])
+        self.assertIsNone(client["developer"])
+
+    async def test_public_app_has_no_secret(self) -> None:
+        await self.login()
+        body = (await self.create(public=True, redirect_uris=["http://127.0.0.1/cb"])).json()
+        self.assertIsNone(body["client_secret"])
+        self.assertTrue(body["public"])
+        self.assertEqual((await self.http.post(f"/account/api/developer/apps/{body['client_id']}/rotate-secret", headers=ORIGIN)).status_code, 400)
+
+    async def test_rotate_secret(self) -> None:
+        await self.login()
+        body = (await self.create()).json()
+        rotated = await self.http.post(f"/account/api/developer/apps/{body['client_id']}/rotate-secret", headers=ORIGIN)
+        self.assertEqual(rotated.status_code, 200)
+        self.assertEqual((await self.flow(body["client_id"], body["client_secret"]))["token"].status_code, 401)
+        self.assertEqual((await self.flow(body["client_id"], rotated.json()["client_secret"]))["token"].status_code, 200)
+
+    async def test_needs_verified_account_and_same_origin(self) -> None:
+        self.assertEqual((await self.http.get("/account/api/developer/apps")).status_code, 401)
+        await self.login("bobby", "password-2")
+        self.assertFalse((await self.http.get("/account/api/developer/apps")).json()["can_create"])
+        refused = await self.create()
+        self.assertEqual(refused.status_code, 403)
+        self.assertEqual(refused.json()["detail"]["code"], "verification_required")
+        self.http.cookies.clear()
+        await self.login()
+        self.assertEqual((await self.http.post("/account/api/developer/apps", json=self.APP)).status_code, 403)
+        self.assertEqual((await self.http.post("/account/api/developer/apps", json=self.APP, headers={"Origin": "https://evil.test"})).status_code, 403)
+
+    async def test_validation(self) -> None:
+        await self.login()
+        for extra in (
+            {"redirect_uris": ["http://tool.test/cb"]},
+            {"redirect_uris": ["https://tool.test/cb#x"]},
+            {"redirect_uris": ["https://user:pw@tool.test/cb"]},
+            {"redirect_uris": ["javascript:alert(1)"]},
+            {"redirect_uris": ["  "]},
+            {"post_logout_redirect_uris": ["http://tool.test/bye"]},
+            {"allowed_scopes": ["openid", "admin"]},
+            {"allowed_scopes": []},
+            {"name": "KukeAuth 官方"},
+            {"name": "   "},
+            {"homepage_url": "http://tool.test"},
+            {"icon_url": "javascript:alert(1)"},
+        ):
+            response = await self.create(**extra)
+            self.assertEqual(response.status_code, 422, (extra, response.text))
+        self.assertEqual((await self.http.get("/account/api/developer/apps")).json()["items"], [])
+
+    async def test_cannot_touch_other_peoples_apps(self) -> None:
+        await self.login()
+        body = (await self.create()).json()
+        self.http.cookies.clear()
+        await self.login("carol", "password-3")
+        path = f"/account/api/developer/apps/{body['client_id']}"
+        self.assertEqual((await self.http.patch(path, json={"name": "抢走"}, headers=ORIGIN)).status_code, 404)
+        self.assertEqual((await self.http.post(f"{path}/rotate-secret", headers=ORIGIN)).status_code, 404)
+        self.assertEqual((await self.http.delete(path, headers=ORIGIN)).status_code, 404)
+        self.assertEqual((await self.http.get("/account/api/developer/apps")).json()["items"], [])
+        # 后台建的官方应用也动不了
+        self.assertEqual((await self.http.delete("/account/api/developer/apps/feedback", headers=ORIGIN)).status_code, 404)
+
+    async def test_update_and_scope_change_applies(self) -> None:
+        await self.login()
+        body = (await self.create(homepage_url="https://tool.test")).json()
+        path = f"/account/api/developer/apps/{body['client_id']}"
+        updated = await self.http.patch(path, json={"name": "新名字", "allowed_scopes": ["openid"], "homepage_url": None}, headers=ORIGIN)
+        self.assertEqual(updated.status_code, 200, updated.text)
+        self.assertEqual(updated.json()["name"], "新名字")
+        self.assertEqual(updated.json()["allowed_scopes"], ["openid"])
+        self.assertIsNone(updated.json()["homepage_url"])
+        self.assertEqual(updated.json()["redirect_uris"], ["https://tool.test/cb"])
+        _verifier, challenge = pkce()
+        params = {**self.params(challenge), "client_id": body["client_id"], "redirect_uri": "https://tool.test/cb", "scope": "openid profile"}
+        location = (await self.http.get("/oauth/authorize", params=params)).headers["location"]
+        self.assertIn("error=invalid_scope", location)
+        # 公开 / 机密在建好后不能改
+        self.assertFalse((await self.http.patch(path, json={"public": True}, headers=ORIGIN)).json()["public"])
+
+    async def test_admin_disable_blocks_and_owner_cannot_reenable(self) -> None:
+        await self.login()
+        body = (await self.create()).json()
+        async with self.sessions() as db:
+            client = (await db.execute(select(OAuthClient).where(OAuthClient.client_id == body["client_id"]))).scalar_one()
+            client.disabled = True
+            await db.commit()
+        _verifier, challenge = pkce()
+        params = {**self.params(challenge), "client_id": body["client_id"], "redirect_uri": "https://tool.test/cb"}
+        self.assertEqual((await self.http.get("/oauth/authorize", params=params)).status_code, 400)
+        path = f"/account/api/developer/apps/{body['client_id']}"
+        self.assertTrue((await self.http.patch(path, json={"disabled": False}, headers=ORIGIN)).json()["disabled"])
+
+    async def test_limit(self) -> None:
+        await self.login()
+        for _ in range(service.MAX_DEVELOPER_CLIENTS):
+            self.assertEqual((await self.create()).status_code, 201)
+        over = await self.create()
+        self.assertEqual(over.status_code, 409)
+        self.assertEqual(over.json()["detail"]["code"], "app_limit")

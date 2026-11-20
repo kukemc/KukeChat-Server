@@ -6,7 +6,6 @@ import json
 import re
 from datetime import datetime
 from typing import Annotated
-from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
@@ -28,16 +27,15 @@ _CLIENT_ID_RE = re.compile(r"[a-z0-9][a-z0-9-]{1,62}")
 
 
 def _check_uri(uri: str) -> None:
-    parts = urlsplit(uri)
-    loopback = parts.scheme == "http" and parts.hostname in ("127.0.0.1", "::1")
-    if parts.fragment or not parts.netloc or not (parts.scheme == "https" or loopback):
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"回调地址必须是 https 或本机回环地址：{uri}")
+    problem = service.redirect_uri_problem(uri)
+    if problem:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=problem)
 
 
 def _check_scopes(scopes: list[str]) -> None:
-    unknown = set(scopes) - set(service.SCOPES)
-    if unknown:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"未知的 scope：{sorted(unknown)}")
+    problem = service.scope_problem(scopes)
+    if problem:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=problem)
 
 
 class ClientCreate(BaseModel):
@@ -76,6 +74,9 @@ def _read(client: OAuthClient) -> dict:
         "allowed_scopes": service.json_list(client.allowed_scopes),
         "public": client.secret_hash is None,
         "disabled": client.disabled,
+        "homepage_url": client.homepage_url,
+        # 空 = 后台建的官方应用；有值 = 开发者自助建的
+        "owner_id": client.owner_id,
         "created_at": client.created_at,
     }
 

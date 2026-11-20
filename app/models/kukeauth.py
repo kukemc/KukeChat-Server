@@ -23,10 +23,14 @@ class OAuthClient(Base):
     secret_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     name: Mapped[str] = mapped_column(String(80))
     icon_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    homepage_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # 空 = 后台建的官方应用；有值 = 开发者在账号站自己建的第三方应用，授权页会标出开发者
+    owner_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     # 下面三列都是 JSON 字符串数组
     redirect_uris: Mapped[str] = mapped_column(Text, default="[]")
     post_logout_redirect_uris: Mapped[str] = mapped_column(Text, default="[]")
     allowed_scopes: Mapped[str] = mapped_column(Text, default="[]")
+    # 只有后台能停用；开发者自己不能重新启用
     disabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)

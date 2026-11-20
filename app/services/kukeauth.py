@@ -612,12 +612,83 @@ def userinfo_claims(user: User, scope: list[str]) -> dict[str, Any]:
     return claims
 
 
-# ---------------------------------------------------------------- 后台
+# ---------------------------------------------------------------- 应用（client）管理：后台和开发者共用
 
 
 def new_client_secret() -> tuple[str, str]:
     raw = f"kcs_{secrets.token_urlsafe(32)}"
     return raw, hash_secret(raw)
+
+
+def new_developer_client_id() -> str:
+    """开发者建的应用用随机 ID，不让人抢占像 gandi-feedback 这样的名字。"""
+    return f"app-{secrets.token_hex(8)}"
+
+
+MAX_DEVELOPER_CLIENTS = 10
+MAX_REDIRECT_URIS = 10
+# 第三方应用不能叫这些名字，免得在授权页上冒充官方
+RESERVED_NAME_WORDS = ("kukeauth", "kukechat", "kuke auth", "kuke chat")
+
+
+def redirect_uri_problem(uri: str) -> str | None:
+    """回调地址不合规时返回原因。只收 https 和本机回环 http（RFC 8252），不收片段。"""
+    try:
+        parts = urlsplit(uri)
+        host = parts.hostname
+    except ValueError:
+        return f"不是有效的地址：{uri}"
+    loopback = parts.scheme == "http" and host in ("127.0.0.1", "::1")
+    if parts.fragment or not parts.netloc or not (parts.scheme == "https" or loopback):
+        return f"回调地址必须是 https 或本机回环地址（http://127.0.0.1），且不能带 #：{uri}"
+    if parts.username or parts.password:
+        return f"回调地址不能带用户名和密码：{uri}"
+    return None
+
+
+def https_url_problem(url: str, label: str) -> str | None:
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return f"{label}不是有效的地址"
+    if parts.scheme != "https" or not parts.netloc or parts.username or parts.password:
+        return f"{label}必须是 https 地址"
+    return None
+
+
+def scope_problem(scopes: list[str]) -> str | None:
+    unknown = sorted(set(scopes) - set(SCOPES))
+    if unknown:
+        return f"未知的 scope：{', '.join(unknown)}"
+    if not scopes:
+        return "至少要选一个 scope"
+    return None
+
+
+async def developer_clients(db: AsyncSession, user_id: int) -> list[OAuthClient]:
+    return list((await db.execute(select(OAuthClient).where(OAuthClient.owner_id == user_id).order_by(OAuthClient.id))).scalars().all())
+
+
+async def owned_client(db: AsyncSession, user_id: int, client_id: str) -> OAuthClient | None:
+    return (await db.execute(select(OAuthClient).where(OAuthClient.client_id == client_id, OAuthClient.owner_id == user_id))).scalar_one_or_none()
+
+
+async def delete_client(db: AsyncSession, client: OAuthClient) -> None:
+    """删应用：授权记录、授权码、等待中的请求一起删，refresh token 吊销。已签出的 access token 由 userinfo 拦（client 不在了就 401）。"""
+    client_id = client.client_id
+    await db.execute(delete(OAuthGrant).where(OAuthGrant.client_id == client_id))
+    await db.execute(delete(OAuthCode).where(OAuthCode.client_id == client_id))
+    await db.execute(delete(OAuthRequest).where(OAuthRequest.client_id == client_id))
+    await db.execute(update(OAuthRefreshToken).where(OAuthRefreshToken.client_id == client_id, OAuthRefreshToken.revoked_at.is_(None)).values(revoked_at=_now()))
+    await db.delete(client)
+    await db.commit()
+
+
+async def client_developer(db: AsyncSession, client: OAuthClient) -> User | None:
+    return await db.get(User, client.owner_id) if client.owner_id is not None else None
+
+
+# ---------------------------------------------------------------- 后台
 
 
 async def ban_account(db: AsyncSession, admin: User, user: User, until: datetime | None, reason: str) -> None:

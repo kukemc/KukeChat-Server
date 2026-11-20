@@ -21,13 +21,36 @@ KukeChat 的账号升级成的统一账号系统。其他服务通过标准 OAut
 
 `account-web/` 是纯静态页面：`npm run build` 后放到服务器。nginx 的要求：
 
-- 未知路径回退到 `index.html`（页面路径有 `/login`、`/register`、`/forgot`、`/verify`、`/continue`、`/account`）；
+- 未知路径回退到 `index.html`（页面路径有 `/login`、`/register`、`/forgot`、`/verify`、`/continue`、`/account`、`/docs`）；
 - `/oauth/`、`/account/api/`、`/.well-known/` 反代到后端，保留 `Host`，用 `proxy_set_header X-Real-IP $remote_addr` 覆盖客户端自带的值。限速和「一个 IP 一个号」靠它；
 - 页面响应加 `Content-Security-Policy: default-src 'self'; img-src 'self' https: data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'sha256-<index.html 内联脚本的哈希>'; frame-ancestors 'none'; base-uri 'none'`。浏览器把 CRLF 当 LF 算哈希，算之前先把换行统一成 LF。
 
 ## 2. 接入一个服务
 
-1. 在后台创建 client（`POST /api/v1/admin/kukeauth/clients`），`client_secret` 只显示这一次，库里只有哈希；
+对外的接入文档是账号站的 `/docs` 页面（`account-web/src/docs.tsx`），改了下面的规则要同步改它。
+
+client 有两种来源：
+
+| 来源 | `owner_id` | 授权页 |
+| --- | --- | --- |
+| 后台建（`POST /api/v1/admin/kukeauth/clients`），自家服务用 | 空 | 不加标注 |
+| 开发者在账号站「我的账号 → 开发者」自助建 | 开发者的用户 ID | 标出「第三方应用，由 @用户名 开发」和应用主页 |
+
+自助建应用的规则（`app/api/kukeauth.py` 的开发者一节）：
+
+- 账号验证过（邮箱或 CCW）才能建、改、重置 secret；删除不要求；
+- 每人最多 10 个（`MAX_DEVELOPER_CLIENTS`），回调地址最多 10 个；创建每人每天 20 次；
+- `client_id` 随机生成（`app-` + 16 位十六进制），不让人抢占名字；名称不能包含 KukeAuth、KukeChat；
+- 主页、图标必须是 https；回调地址规则和后台一样（`services/kukeauth.py::redirect_uri_problem`）；
+- 公开 / 机密在创建时定，之后不能改；
+- `disabled` 只有后台能改，开发者改不了；
+- 删除时授权记录、授权码、等待中的请求一起删，refresh token 吊销。已签出的 access token 由 userinfo 拦：`aud` 对应的 client 不在或已停用就 401（官方 client 同样适用）。
+
+纯网页前端（SPA）的公开 client 目前用不了：令牌接口走全站的 CORS 白名单，不对任意来源开放。
+
+接入步骤：
+
+1. 建 client，`client_secret` 只显示这一次，库里只有哈希；
 2. 读 `{issuer}/.well-known/openid-configuration` 拿到各接口地址；
 3. 走授权码流程：
 
@@ -106,7 +129,9 @@ GET  {issuer}/oauth/userinfo   Authorization: Bearer <access_token>
 | `GET /me`、`PATCH /me` | 读资料；改 `nickname`、`bio`、`avatar_url`，走 `services/users.py::update_profile` |
 | `POST /me/avatar` | 上传头像，返回 `url`，再 `PATCH /me` 保存 |
 | `POST /me/password` | 改密码。其他会话、refresh token、聊天 cookie 会话全部作废 |
-| `GET /me/grants`、`DELETE /me/grants/{client_id}` | 已授权应用、取消授权 |
+| `GET /me/grants`、`DELETE /me/grants/{client_id}` | 已授权应用、取消授权。`official` 为 false 的是第三方应用 |
+| `GET /developer/apps`、`POST /developer/apps` | 自己建的应用；创建时返回唯一一次 `client_secret` |
+| `PATCH /developer/apps/{client_id}`、`DELETE ...`、`POST .../rotate-secret` | 改、删、重置 secret，只能动自己的 |
 | `POST /email/send`、`POST /email/verify` | 验证邮箱 |
 | `POST /ccw/challenge`、`POST /ccw/check` | 绑定 CCW，复用 `services/ccw.py` |
 | `GET /connections`、`POST /connections/{provider}/unbind` | 账号绑定页。解绑要当前密码；没有验证过的邮箱时不能解绑（409 `last_method`） |
@@ -135,3 +160,5 @@ KukeChat 客户端原有的 CCW 解绑接口（`app/api/v1/ccw.py`）不要求�
 ## 5. 后台接口
 
 都要管理员权限，在 `/api/v1/admin/kukeauth` 下：`GET/POST /clients`、`PATCH /clients/{client_id}`、`POST /clients/{client_id}/rotate-secret`、`PUT/DELETE /users/{id}/ban`。
+
+`GET /clients` 列出全部 client，包括开发者自助建的（`owner_id` 有值）。处理违规的第三方应用：`PATCH /clients/{client_id}` 传 `{"disabled": true}`。

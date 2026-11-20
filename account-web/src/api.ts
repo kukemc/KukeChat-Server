@@ -10,7 +10,13 @@ export interface Me {
 }
 
 export interface OAuthRequestInfo {
-    client: {name: string; icon_url: string | null};
+    client: {
+        name: string;
+        icon_url: string | null;
+        homepage_url: string | null;
+        official: boolean;
+        developer: {username: string; nickname: string} | null;
+    };
     scopes: string[];
     needs_login: boolean;
     needs_verification: boolean;
@@ -28,8 +34,31 @@ export interface Grant {
     client_id: string;
     name: string;
     icon_url: string | null;
+    official: boolean;
     scopes: string[];
     created_at: string;
+}
+
+export interface DeveloperApp {
+    client_id: string;
+    name: string;
+    homepage_url: string | null;
+    icon_url: string | null;
+    redirect_uris: string[];
+    post_logout_redirect_uris: string[];
+    allowed_scopes: string[];
+    public: boolean;
+    disabled: boolean;
+    created_at: string;
+}
+
+export interface AppFields {
+    name: string;
+    homepage_url: string | null;
+    icon_url: string | null;
+    redirect_uris: string[];
+    post_logout_redirect_uris: string[];
+    allowed_scopes: string[];
 }
 
 export interface Connection {
@@ -156,6 +185,12 @@ export const api = {
     resetEmailConfirm: (email: string, code: string, new_password: string) => post<{ok: boolean}>('/password-reset/email/confirm', {email, code, new_password}),
     resetCcwChallenge: (username: string) => post<{code: string; comment_url: string | null}>('/password-reset/ccw/challenge', {username}),
     resetCcwConfirm: (username: string, code: string, new_password: string) => post<{ok: boolean}>('/password-reset/ccw/confirm', {username, code, new_password}),
+    apps: () => request<{items: DeveloperApp[]; limit: number; can_create: boolean}>('/developer/apps'),
+    createApp: (fields: AppFields & {public: boolean}) => post<DeveloperApp & {client_secret: string | null}>('/developer/apps', fields),
+    updateApp: (clientId: string, fields: AppFields) =>
+        request<DeveloperApp>(`/developer/apps/${encodeURIComponent(clientId)}`, {method: 'PATCH', body: JSON.stringify(fields)}),
+    rotateAppSecret: (clientId: string) => post<{client_secret: string}>(`/developer/apps/${encodeURIComponent(clientId)}/rotate-secret`),
+    deleteApp: (clientId: string) => request<{ok: boolean}>(`/developer/apps/${encodeURIComponent(clientId)}`, {method: 'DELETE'}),
     oauthRequest: (id: string) => request<OAuthRequestInfo>(`/requests/${encodeURIComponent(id)}`),
     approve: (id: string) => post<{redirect_url: string}>(`/requests/${encodeURIComponent(id)}/approve`),
     deny: (id: string) => post<{redirect_url: string}>(`/requests/${encodeURIComponent(id)}/deny`)

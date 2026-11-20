@@ -63,6 +63,22 @@ export const Avatar = ({url, name, size = 40}: {url: string | null; name: string
     </span>
 );
 
+export const CopyButton = ({text, label = '复制'}: {text: string; label?: string}) => {
+    const [done, setDone] = useState(false);
+    return (
+        <button
+            type="button"
+            className="copy-button"
+            onClick={() => {
+                void navigator.clipboard?.writeText(text).then(() => {
+                    setDone(true);
+                    setTimeout(() => setDone(false), 1500);
+                });
+            }}
+        >{done ? '已复制' : label}</button>
+    );
+};
+
 /** 提交时统一处理 loading 和错误，页面只写真正要做的事。 */
 export const useSubmit = () => {
     const [busy, setBusy] = useState(false);
@@ -100,7 +116,11 @@ export const AuthShell = ({children}: {children: ReactNode}) => (
             </div>
         </aside>
         <main className="auth-main">
-            <div className="auth-top"><span className="auth-top-mark"><Wordmark /></span><ThemeToggle /></div>
+            <div className="auth-top">
+                <span className="auth-top-mark"><Wordmark /></span>
+                <a className="top-link" href="/docs">开发者文档</a>
+                <ThemeToggle />
+            </div>
             <div className="auth-form">{children}</div>
         </main>
     </div>

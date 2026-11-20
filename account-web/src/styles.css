@@ -184,7 +184,7 @@ a { color: inherit; }
     text-align: right;
 }
 
-input:not([type='file']), textarea {
+input:not([type='file']):not([type='checkbox']):not([type='radio']), textarea {
     display: block;
     width: 100%;
     height: 44px;
@@ -553,6 +553,232 @@ input:disabled { color: var(--muted); background: var(--hover); }
     padding: 16px;
 }
 
+/* ---------- 顶栏链接、复制、标签 ---------- */
+
+.top-link {
+    margin-right: 6px;
+    color: var(--muted);
+    font-size: 14px;
+    font-weight: 600;
+    text-decoration: none;
+}
+
+.top-link:hover { color: var(--fg); }
+
+.auth-top { gap: 8px; }
+
+.copy-button {
+    flex: none;
+    padding: 2px 8px;
+    background: transparent;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    color: var(--muted);
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.copy-button:hover { color: var(--fg); border-color: var(--faint); }
+
+.tag {
+    display: inline-block;
+    margin-left: 8px;
+    padding: 0 7px;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    color: var(--muted);
+    font-size: 12px;
+    font-style: normal;
+    font-weight: 600;
+    vertical-align: 2px;
+}
+
+.mono, textarea.mono { font-family: var(--mono); font-size: 13px; }
+
+code {
+    font-family: var(--mono);
+    font-size: 0.88em;
+    overflow-wrap: anywhere;
+}
+
+.third-party {
+    margin: -16px 0 22px;
+    padding: 10px 12px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    color: var(--muted);
+    font-size: 13px;
+}
+
+/* ---------- 开发者 ---------- */
+
+.actions { display: flex; flex-wrap: wrap; gap: 8px; }
+
+.panel { padding: 20px; border: 1px solid var(--line); border-radius: 10px; }
+
+.tab-body .panel-title { margin: 0 0 18px; }
+
+.rows.spaced { margin-top: 28px; }
+
+.choices { margin: 0 0 18px; padding: 0; border: 0; }
+
+.choice {
+    display: flex;
+    gap: 10px;
+    padding: 8px 0;
+    font-size: 14px;
+    cursor: pointer;
+}
+
+.choice input {
+    flex: none;
+    width: 16px;
+    height: 16px;
+    margin: 3px 0 0;
+    accent-color: var(--fg);
+}
+
+.choice code { margin-right: 8px; font-weight: 600; }
+
+.choice b { display: block; font-weight: 600; }
+
+.choice span { color: var(--muted); }
+
+.choice b, .choice code { color: var(--fg); }
+
+.secret-box {
+    margin-bottom: 20px;
+    padding: 18px;
+    border: 1px solid var(--line-strong);
+    border-radius: 10px;
+}
+
+.secret-box > b { display: block; }
+
+.secret-box > p { margin: 4px 0 14px; color: var(--muted); font-size: 14px; }
+
+.secret-box > .button { margin-top: 6px; }
+
+.kv {
+    display: grid;
+    grid-template-columns: 96px minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 0;
+    border-top: 1px solid var(--line);
+    font-size: 13px;
+}
+
+.kv:last-of-type { margin-bottom: 10px; border-bottom: 1px solid var(--line); }
+
+.kv span { color: var(--muted); font-family: var(--mono); }
+
+.facts {
+    display: grid;
+    grid-template-columns: 96px minmax(0, 1fr);
+    gap: 10px 14px;
+    margin: 0 0 20px;
+    font-size: 14px;
+}
+
+.facts dt { color: var(--muted); }
+
+.facts dd { margin: 0; min-width: 0; }
+
+.facts code.block { display: block; }
+
+/* ---------- 开发者文档 ---------- */
+
+.docs { max-width: 1120px; margin: 0 auto; padding: 0 32px 120px; }
+
+.docs-topbar { position: sticky; top: 0; z-index: 1; background: var(--bg); border-bottom: 1px solid var(--line); }
+
+.docs-brand { display: flex; align-items: baseline; gap: 12px; }
+
+.docs-brand span { color: var(--muted); font-size: 14px; }
+
+.docs-body {
+    display: grid;
+    grid-template-columns: 180px minmax(0, 1fr);
+    gap: 56px;
+    padding-top: 40px;
+}
+
+.docs-toc {
+    position: sticky;
+    top: 104px;
+    align-self: start;
+    display: flex;
+    flex-direction: column;
+}
+
+.docs-toc a {
+    padding: 5px 12px;
+    border-radius: 7px;
+    color: var(--muted);
+    font-size: 14px;
+    text-decoration: none;
+}
+
+.docs-toc a:hover { background: var(--hover); color: var(--fg); }
+
+.docs-main { max-width: 760px; min-width: 0; }
+
+.docs-main h1 { font-size: 34px; line-height: 1.25; font-weight: 700; }
+
+.docs-lead { margin: 12px 0 8px; color: var(--muted); font-size: 16px; }
+
+.doc-section { padding-top: 44px; scroll-margin-top: 72px; }
+
+.doc-section h2 { margin-bottom: 14px; font-size: 22px; font-weight: 700; }
+
+.doc-section h2 a { text-decoration: none; }
+
+.doc-section p, .doc-section ul, .doc-section ol { margin: 0 0 14px; }
+
+.doc-section ul, .doc-section ol { padding-left: 22px; }
+
+.doc-section li { margin-bottom: 6px; }
+
+.doc-section table {
+    width: 100%;
+    margin: 0 0 16px;
+    border-collapse: collapse;
+    font-size: 14px;
+}
+
+.doc-section th, .doc-section td {
+    padding: 9px 12px 9px 0;
+    border-bottom: 1px solid var(--line);
+    text-align: left;
+    vertical-align: top;
+}
+
+.doc-section thead th { border-bottom-color: var(--line-strong); }
+
+.doc-section tbody th { width: 120px; color: var(--muted); font-weight: 600; white-space: nowrap; }
+
+.doc-section td:first-child code { white-space: nowrap; }
+
+.code { margin: 0 0 16px; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+
+.code-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 10px 6px 14px;
+    background: var(--hover);
+    border-bottom: 1px solid var(--line);
+    color: var(--muted);
+    font-size: 12px;
+    font-weight: 600;
+}
+
+.code pre { margin: 0; padding: 14px; overflow-x: auto; font: 13px/1.6 var(--mono); }
+
+.code pre code { font-size: inherit; overflow-wrap: normal; }
+
 /* ---------- 窄屏 ---------- */
 
 @media (max-width: 860px) {
@@ -585,6 +811,20 @@ input:disabled { color: var(--muted); background: var(--hover); }
     }
 
     .row { flex-wrap: wrap; }
+
+    .docs { padding: 0 16px 80px; }
+
+    .docs-body { display: block; padding-top: 16px; }
+
+    .docs-toc { display: none; }
+
+    .docs-main h1 { font-size: 26px; }
+
+    .docs-brand span { display: none; }
+
+    .kv, .facts { grid-template-columns: minmax(0, 1fr); gap: 4px; }
+
+    .kv .copy-button { justify-self: start; }
 }
 
 @media (prefers-reduced-motion: reduce) {

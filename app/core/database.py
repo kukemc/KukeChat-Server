@@ -380,10 +380,14 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     # 在共创世界上的隐私开关（docs/ccw-social.md）
     ("users", "share_ccw_activity", "share_ccw_activity BOOLEAN NOT NULL DEFAULT 1"),
     ("users", "ccw_discoverable", "ccw_discoverable BOOLEAN NOT NULL DEFAULT 1"),
+    # KukeAuth 开发者自助建应用（docs/kukeauth.md）
+    ("oauth_clients", "owner_id", "owner_id INTEGER"),
+    ("oauth_clients", "homepage_url", "homepage_url VARCHAR(500)"),
 )
 
 _ADDED_INDEXES: tuple[tuple[str, str], ...] = (
     ("users", "CREATE UNIQUE INDEX IF NOT EXISTS ix_users_public_id ON users (public_id)"),
+    ("oauth_clients", "CREATE INDEX IF NOT EXISTS ix_oauth_clients_owner_id ON oauth_clients (owner_id)"),
     ("users", "CREATE UNIQUE INDEX IF NOT EXISTS ix_users_registration_ip ON users (registration_ip)"),
     ("users", "CREATE UNIQUE INDEX IF NOT EXISTS ix_users_ccw_student_oid ON users (ccw_student_oid)"),
     ("user_reports", "CREATE INDEX IF NOT EXISTS ix_user_reports_case_id ON user_reports (case_id)"),
