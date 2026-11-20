@@ -13,13 +13,22 @@ from collections.abc import Awaitable, Callable
 
 from sqlalchemy import and_, distinct, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import aliased
+from fastapi import HTTPException
+from sqlalchemy.orm import aliased, joinedload
 
 from app.models.conversation import Conversation, ConversationMember
 from app.models.enums import ConversationType, FriendRequestStatus, UserStatus
 from app.models.friend import FriendRequest, Friendship
 from app.models.user import User
-from app.schemas.ccw_social import CcwUserBrief, CcwUserCard, Friendship as FriendshipKind
+from app.schemas.ccw_social import (
+    CcwMutualsRead,
+    CcwPlayingFriend,
+    CcwUserBrief,
+    CcwUserCard,
+    CcwWorkGroup,
+    CcwWorkRead,
+    Friendship as FriendshipKind,
+)
 from app.schemas.user import UserPublic
 from app.services import ccw_activity
 
@@ -141,3 +150,93 @@ async def friend_activities(db: AsyncSession, user_id: int) -> dict:
         return {}
     result = await db.execute(select(User.id).where(User.id.in_(ids), User.share_ccw_activity.is_(True)))
     return await ccw_activity.get_activities(list(result.scalars()))
+
+
+# ------------------------------------------------------------------ 第二期：动态、互关邀请；第三期：作品页
+
+
+async def _discoverable_ids(db: AsyncSession, viewer_id: int, oids: list[str]) -> list[int]:
+    return [u.id for u in (await _visible_users(db, viewer_id, oids)).values() if u.id != viewer_id]
+
+
+async def list_ccw_feed(db: AsyncSession, viewer: User, ccw_oids: list[str], before_id: int | None, limit: int):
+    """CCW 动态页里并进来的 KukeChat 动态：我的好友、我在 CCW 上关注的人里有 KukeChat 的，以及我自己。
+
+    可见性和 KukeChat 自己的动态流一样（公开的、好友可见且我们是好友的、我自己的）。
+    CCW 关注列表由脚本从页面上读来，只用来圈定作者，不改变谁能看到什么。
+    """
+    from app.models.post import Post
+    from app.services import posts as post_service
+
+    friends = await friend_ids(db, viewer.id)
+    authors = {viewer.id, *friends, *(await _discoverable_ids(db, viewer.id, ccw_oids))}
+    query = (
+        select(Post)
+        .options(joinedload(Post.author))
+        .where(Post.deleted_at.is_(None), Post.author_id.in_(authors), post_service._visible_post_condition(viewer.id, friends))
+    )
+    if before_id is not None:
+        query = query.where(Post.id < before_id)
+    posts = list((await db.execute(query.order_by(Post.id.desc()).limit(limit))).scalars().all())
+    return await post_service.build_post_reads(db, posts, viewer.id)
+
+
+async def mutuals_to_invite(db: AsyncSession, viewer: User, ccw_oids: list[str], online: OnlineLookup, send: bool) -> CcwMutualsRead:
+    """CCW 互关里有 KukeChat、还不是好友的人；send=True 时顺手给他们发好友申请。"""
+    from app.services import friends as friend_service
+
+    users = await _visible_users(db, viewer.id, ccw_oids)
+    already = set(await friend_ids(db, viewer.id))
+    pending = await db.execute(
+        select(FriendRequest.requester_id, FriendRequest.receiver_id).where(
+            FriendRequest.status == FriendRequestStatus.PENDING,
+            or_(FriendRequest.requester_id == viewer.id, FriendRequest.receiver_id == viewer.id),
+        )
+    )
+    waiting = {a if a != viewer.id else b for a, b in pending.all()}
+    candidates = [oid for oid, u in users.items() if u.id != viewer.id and u.id not in already]
+    sent = 0
+    if send:
+        for oid in candidates:
+            target = users[oid]
+            if target.id in waiting:
+                continue
+            try:
+                await friend_service.create_friend_request(db, viewer, target.id)
+                sent += 1
+            except HTTPException:
+                continue
+    briefs = await get_briefs(db, viewer, [oid for oid in ccw_oids if oid in candidates], online)
+    return CcwMutualsRead(users=briefs, sent=sent)
+
+
+async def work_info(db: AsyncSession, viewer: User, oid: str) -> CcwWorkRead:
+    group = None
+    row = (
+        await db.execute(
+            select(Conversation)
+            .where(
+                Conversation.type == ConversationType.GROUP,
+                Conversation.game_mode_enabled.is_(True),
+                Conversation.game_creation_oid == oid,
+                Conversation.join_mode == "open",
+            )
+            .order_by(Conversation.id)
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if row is not None:
+        count = (await db.execute(select(func.count()).select_from(ConversationMember).where(ConversationMember.conversation_id == row.id))).scalar_one()
+        member = (
+            await db.execute(select(ConversationMember.id).where(ConversationMember.conversation_id == row.id, ConversationMember.user_id == viewer.id))
+        ).scalar_one_or_none()
+        group = CcwWorkGroup(conversation_id=row.id, title=row.title or "作品群", avatar_url=row.avatar_url, member_count=int(count or 0), is_member=member is not None)
+    playing: list[CcwPlayingFriend] = []
+    activities = {uid: a for uid, a in (await friend_activities(db, viewer.id)).items() if a.ccw_oid == oid and a.kind == "play"}
+    if activities:
+        users = (await db.execute(select(User).where(User.id.in_(list(activities))))).scalars().all()
+        playing = [
+            CcwPlayingFriend(user_id=u.id, nickname=u.nickname or u.username, avatar_url=u.avatar_url, activity=activities[u.id])
+            for u in sorted(users, key=lambda u: activities[u.id].started_at)
+        ]
+    return CcwWorkRead(ccw_oid=oid, group=group, playing=playing)

@@ -361,6 +361,40 @@ async def download_asset(name: str) -> Response:
     )
 
 
+# 油猴脚本 KukeChat for CCW 和它按需加载的 KukeChat 界面包（docs/ccw-social.md「发布」）。
+# 文件不进仓库：部署时从 KukeChat-Client 的 dist-userscript/、dist/ 复制到 app/static/ccw/。没有就 404。
+_CCW_ASSET_DIR = Path(__file__).resolve().parent / "static" / "ccw"
+_CCW_ASSETS = {
+    # 路径 → (文件名, 缓存)。脚本本体和头部给油猴检查更新用，不缓存；界面包靠 ETag 协商
+    "ccw.user.js": ("ccw.user.js", "no-cache"),
+    "ccw.meta.js": ("ccw.meta.js", "no-cache"),
+    "embed/kukechat.js": ("kukechat.js", "public, max-age=300"),
+}
+
+
+def _ccw_asset(path: str) -> Response:
+    name, cache = _CCW_ASSETS[path]
+    file = _CCW_ASSET_DIR / name
+    if not file.is_file():
+        return Response(status_code=404)
+    return FileResponse(file, media_type="text/javascript; charset=utf-8", headers={"Cache-Control": cache})
+
+
+@app.get("/ccw.user.js", include_in_schema=False)
+async def ccw_userscript() -> Response:
+    return _ccw_asset("ccw.user.js")
+
+
+@app.get("/ccw.meta.js", include_in_schema=False)
+async def ccw_userscript_meta() -> Response:
+    return _ccw_asset("ccw.meta.js")
+
+
+@app.get("/embed/kukechat.js", include_in_schema=False)
+async def ccw_embed_bundle() -> Response:
+    return _ccw_asset("embed/kukechat.js")
+
+
 @app.get("/desktop-update.json", include_in_schema=False)
 async def desktop_update_metadata(request: Request, db: AsyncSession = Depends(get_db)) -> dict[str, str | bool | None]:
     # 旧版桌面端 / 安卓检查更新用的元数据。发版服务里有已发布版本时优先用它（docs/releases.md 1.3）

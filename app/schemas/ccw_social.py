@@ -111,3 +111,57 @@ class CcwUserBatchRequest(BaseModel):
             if CCW_OID.match(oid) and oid not in seen:
                 seen.append(oid)
         return seen
+
+
+class CcwOidList(BaseModel):
+    """脚本从 CCW 页面上读到的一组 CCW 用户（关注列表、互关列表）。最多 500 个，重复和格式不对的丢掉。"""
+
+    ccw_oids: list[str] = Field(default_factory=list, max_length=500)
+
+    @field_validator("ccw_oids")
+    @classmethod
+    def _oids(cls, value: list[str]) -> list[str]:
+        seen: dict[str, None] = {}
+        for raw in value:
+            oid = raw.strip().lower()
+            if CCW_OID.match(oid):
+                seen.setdefault(oid, None)
+        return list(seen)
+
+
+class CcwFeedRequest(CcwOidList):
+    before_id: int | None = Field(default=None, gt=0)
+    limit: int = Field(default=20, ge=1, le=50)
+
+
+class CcwMutualsRequest(CcwOidList):
+    # true：直接给这些人发好友申请（已经发过、已经是好友的跳过）
+    send: bool = False
+
+
+class CcwMutualsRead(BaseModel):
+    users: list[CcwUserBrief]
+    sent: int = 0
+
+
+class CcwWorkGroup(BaseModel):
+    conversation_id: int
+    title: str
+    avatar_url: str | None = None
+    member_count: int = 0
+    is_member: bool = False
+
+
+class CcwPlayingFriend(BaseModel):
+    user_id: int
+    nickname: str | None = None
+    avatar_url: str | None = None
+    activity: ActivityRead
+
+
+class CcwWorkRead(BaseModel):
+    """作品页：作品群（群主开了游戏模式、绑定了这个作品的公开群）和正在玩这个作品的好友。"""
+
+    ccw_oid: str
+    group: CcwWorkGroup | None = None
+    playing: list[CcwPlayingFriend] = Field(default_factory=list)

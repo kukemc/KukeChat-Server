@@ -87,3 +87,53 @@ POST /api/v1/ccw/users/batch
 - 所有接口都要登录，并和其他 `/api/v1` 接口一样带客户端证明头；脚本用的客户端标识是 `kukechat-ccw/<版本>`。
 - 活动是用户自己上报的，和 Discord 的「正在玩」一样只代表本人愿意公开的状态；服务端只保证「只能改自己的」。
 - `ccw_oid` 和用户 CCW 账号的对应关系来自现有的绑定流程（评论口令核验），脚本不能自己声称自己是谁。
+
+## CCW 动态页里的 KukeChat 动态
+
+```http
+POST /api/v1/ccw/feed
+{ "ccw_oids": ["<我在 CCW 上关注的人>", ...], "before_id": null, "limit": 20 }
+→ [PostRead]                      // 和 GET /posts/feed 同样的结构，按 id 倒序
+```
+
+作者范围：我的好友、`ccw_oids` 里有 KukeChat 且允许被找到的人、我自己。可见性和 KukeChat 自己的动态流一样
+（公开且已审核；好友可见且我们是好友；我自己的全部）。`ccw_oids` 由脚本从 CCW 的关注列表读来，最多 500 个，
+只用来圈定作者，不放宽任何可见性。翻页用上一页最后一条的 `id` 作 `before_id`。
+
+## 互关好友邀请
+
+```http
+POST /api/v1/ccw/mutuals
+{ "ccw_oids": ["<CCW 互关的人>", ...], "send": false }
+→ { "users": [CcwUserBrief], "sent": 0 }
+```
+
+返回 `ccw_oids` 里有 KukeChat、可见、还不是我好友的人（不含自己）。`send: true` 时给其中还没有待处理申请的人
+发好友申请，`sent` 是这次发出去的数量；对方先给我发过申请的跳过（让我去通过就行）。`send` 限速每人每分钟 3 次。
+
+## 作品页
+
+```http
+GET /api/v1/ccw/works/{作品 oid}
+→ {
+    "ccw_oid": "...",
+    "group": { "conversation_id", "title", "avatar_url", "member_count", "is_member" } | null,
+    "playing": [{ "user_id", "nickname", "avatar_url", "activity": ActivityRead }]
+  }
+```
+
+- `group`：群主开了游戏模式、绑定了这个作品的**公开群**（`join_mode = open`）。审批制、邀请制的群不出现在作品页上。
+  加入走现有的 `POST /conversations/{id}/join`。
+- `playing`：我的好友里此刻在玩这个作品的人，按开始时间排。
+
+## 发布脚本和界面包
+
+后端提供三个静态地址，文件放在 `app/static/ccw/`（不进仓库，部署时从 KukeChat-Client 的构建产物复制）：
+
+| 地址 | 文件 | 来源 |
+| --- | --- | --- |
+| `/ccw.user.js` | `ccw.user.js` | `npm run build:userscript` → `dist-userscript/kukechat-ccw.user.js` |
+| `/ccw.meta.js` | `ccw.meta.js` | 同一个文件的头部注释（`// ==UserScript==` 到 `// ==/UserScript==`） |
+| `/embed/kukechat.js` | `kukechat.js` | `npm run build` → `dist/KukeChat.js`（脚本在消息中心打开私信时才加载） |
+
+没有文件时返回 404。脚本的 `@updateURL` 指向 `/ccw.meta.js`，油猴按版本号自动更新。

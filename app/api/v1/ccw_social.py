@@ -5,6 +5,9 @@
 - GET    /ccw/activity/friends   我的好友里谁正在玩什么
 - GET    /ccw/users/{oid}        CCW 主页上的 KukeChat 名片
 - POST   /ccw/users/batch        评论区等批量场景：有没有账号、在不在线、正在玩什么
+- POST   /ccw/feed               CCW 动态页里并进来的 KukeChat 动态
+- POST   /ccw/mutuals            CCW 互关里有 KukeChat 还不是好友的人，可顺手发申请
+- GET    /ccw/works/{oid}        作品页：作品群、正在玩的好友
 """
 
 from __future__ import annotations
@@ -23,11 +26,16 @@ from app.schemas.ccw_social import (
     CCW_OID,
     ActivityRead,
     ActivityUpdate,
+    CcwFeedRequest,
+    CcwMutualsRead,
+    CcwMutualsRequest,
     CcwUserBatchRequest,
     CcwUserBrief,
     CcwUserCard,
+    CcwWorkRead,
     UserActivityRead,
 )
+from app.schemas.post import PostRead
 from app.services import ccw_activity, ccw_social
 from app.websocket.manager import manager
 
@@ -103,3 +111,40 @@ async def user_batch(
 ) -> list[CcwUserBrief]:
     await rate_limit.hit(f"ccw-batch:{current_user.id}", 60, 60)
     return await ccw_social.get_briefs(db, current_user, payload.oids, _online)
+
+
+# ------------------------------------------------------------------ 第二期 / 第三期
+
+
+@router.post("/feed", response_model=list[PostRead])
+async def ccw_feed(
+    payload: CcwFeedRequest,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> list[PostRead]:
+    await rate_limit.hit(f"ccw-feed:{current_user.id}", 60, 60)
+    return await ccw_social.list_ccw_feed(db, current_user, payload.ccw_oids, payload.before_id, payload.limit)
+
+
+@router.post("/mutuals", response_model=CcwMutualsRead)
+async def ccw_mutuals(
+    payload: CcwMutualsRequest,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> CcwMutualsRead:
+    # 批量发申请比较重，单独限得紧一点
+    await rate_limit.hit(f"ccw-mutuals{'-send' if payload.send else ''}:{current_user.id}", 3 if payload.send else 30, 60)
+    return await ccw_social.mutuals_to_invite(db, current_user, payload.ccw_oids, _online, payload.send)
+
+
+@router.get("/works/{oid}", response_model=CcwWorkRead)
+async def ccw_work(
+    oid: str,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> CcwWorkRead:
+    oid = oid.strip().lower()
+    if not CCW_OID.match(oid):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid CCW work id")
+    await rate_limit.hit(f"ccw-work:{current_user.id}", 120, 60)
+    return await ccw_social.work_info(db, current_user, oid)

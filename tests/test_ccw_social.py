@@ -11,7 +11,8 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 import app.models  # noqa: F401
 from app.core.database import Base
 from app.models.conversation import Conversation, ConversationMember
-from app.models.enums import ConversationType, FriendRequestStatus, MemberRole, UserStatus
+from app.models.enums import ConversationType, FriendRequestStatus, MemberRole, PostVisibility, UserStatus
+from app.models.post import Post
 from app.models.friend import FriendRequest, Friendship
 from app.models.user import User
 from app.schemas.ccw_social import ActivityUpdate, CcwUserBatchRequest
@@ -81,7 +82,9 @@ class ActivityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(batch.oids, [OID["alice"], OID["bob"]])
 
 
-class CardTests(unittest.IsolatedAsyncioTestCase):
+class _Fixture(unittest.IsolatedAsyncioTestCase):
+    """共用的账号和关系；本身没有用例。"""
+
     async def asyncSetUp(self) -> None:
         ccw_activity.reset()
         self.engine = create_async_engine("sqlite+aiosqlite:///:memory:")
@@ -114,6 +117,9 @@ class CardTests(unittest.IsolatedAsyncioTestCase):
 
     async def _me(self, db) -> User:
         return await db.get(User, self.ids["me"])
+
+
+class CardTests(_Fixture):
 
     async def test_card_for_friend_with_activity(self) -> None:
         await ccw_activity.set_activity(self.ids["alice"], play())
@@ -183,6 +189,79 @@ class CardTests(unittest.IsolatedAsyncioTestCase):
         async with self.sessions() as db:
             activities = await ccw_social.friend_activities(db, self.ids["me"])
         self.assertEqual(set(activities), {self.ids["alice"], self.ids["carol"]})
+
+
+class SecondPhaseTests(_Fixture):
+    """CCW 动态、互关邀请、作品页。沿用 CardTests 的账号和关系。"""
+
+    async def _post(self, db, author: str, text: str, visibility: PostVisibility, approved: bool = True) -> int:
+        post = Post(author_id=self.ids[author], content=text, visibility=visibility, moderation_status="approved" if approved else "pending")
+        db.add(post)
+        await db.commit()
+        return post.id
+
+    async def test_feed_covers_friends_and_ccw_follows_with_visibility(self) -> None:
+        async with self.sessions() as db:
+            await self._post(db, "alice", "好友公开", PostVisibility.PUBLIC)
+            await self._post(db, "alice", "好友仅好友", PostVisibility.FRIENDS)
+            await self._post(db, "bob", "关注公开", PostVisibility.PUBLIC)
+            await self._post(db, "bob", "关注仅好友", PostVisibility.FRIENDS)
+            await self._post(db, "bob", "关注待审", PostVisibility.PUBLIC, approved=False)
+            await self._post(db, "hidden", "关了被找到", PostVisibility.PUBLIC)
+            await self._post(db, "me", "自己私密", PostVisibility.PRIVATE, approved=False)
+            me = await self._me(db)
+            texts = [p.content for p in await ccw_social.list_ccw_feed(db, me, [OID["bob"], OID["hidden"]], None, 20)]
+        self.assertEqual(set(texts), {"好友公开", "好友仅好友", "关注公开", "自己私密"})
+
+    async def test_feed_without_follows_is_friends_only_and_pages(self) -> None:
+        async with self.sessions() as db:
+            ids = [await self._post(db, "alice", f"第{i}条", PostVisibility.PUBLIC) for i in range(3)]
+            await self._post(db, "bob", "不在范围", PostVisibility.PUBLIC)
+            me = await self._me(db)
+            first = await ccw_social.list_ccw_feed(db, me, [], None, 2)
+            rest = await ccw_social.list_ccw_feed(db, me, [], first[-1].id, 2)
+        self.assertEqual([p.id for p in first], [ids[2], ids[1]])
+        self.assertEqual([p.id for p in rest], [ids[0]])
+
+    async def test_mutuals_skip_friends_self_hidden_and_send_once(self) -> None:
+        all_oids = [OID[n] for n in ("me", "alice", "bob", "carol", "hidden")]
+        async with self.sessions() as db:
+            me = await self._me(db)
+            listed = await ccw_social.mutuals_to_invite(db, me, all_oids, nobody_online, send=False)
+            self.assertEqual([u.ccw_oid for u in listed.users], [OID["bob"]])
+            self.assertEqual(listed.sent, 0)
+            # bob 已经给我发过申请：send 时不重复发
+            sent = await ccw_social.mutuals_to_invite(db, me, all_oids, nobody_online, send=True)
+            self.assertEqual(sent.sent, 0)
+            carol_free = await db.get(User, self.ids["carol"])
+            carol_free.ccw_student_oid = None
+            db.add(User(username="dave", hashed_password="x", ccw_student_oid="d" * 24))
+            await db.commit()
+            sent = await ccw_social.mutuals_to_invite(db, me, ["d" * 24], nobody_online, send=True)
+            self.assertEqual(sent.sent, 1)
+            again = await ccw_social.mutuals_to_invite(db, me, ["d" * 24], nobody_online, send=True)
+            self.assertEqual(again.sent, 0, "已经发过就不再发")
+
+    async def test_work_group_and_playing_friends(self) -> None:
+        async with self.sessions() as db:
+            group = Conversation(type=ConversationType.GROUP, title="灯塔归航群", join_mode="open", game_mode_enabled=True, game_creation_oid=WORK)
+            closed = Conversation(type=ConversationType.GROUP, title="私密群", join_mode="approval", game_mode_enabled=True, game_creation_oid=OTHER_WORK)
+            db.add_all([group, closed])
+            await db.flush()
+            db.add(ConversationMember(conversation_id=group.id, user_id=self.ids["alice"], role=MemberRole.OWNER))
+            await db.commit()
+            await ccw_activity.set_activity(self.ids["alice"], play())
+            await ccw_activity.set_activity(self.ids["carol"], play(OTHER_WORK, "别的"))
+            await ccw_activity.set_activity(self.ids["bob"], play())  # 不是好友
+            me = await self._me(db)
+            info = await ccw_social.work_info(db, me, WORK)
+            other = await ccw_social.work_info(db, me, OTHER_WORK)
+        self.assertEqual(info.group.title, "灯塔归航群")
+        self.assertEqual(info.group.member_count, 1)
+        self.assertFalse(info.group.is_member)
+        self.assertEqual([p.user_id for p in info.playing], [self.ids["alice"]])
+        self.assertIsNone(other.group, "审批制的群不算作品群")
+        self.assertEqual([p.user_id for p in other.playing], [self.ids["carol"]])
 
 
 if __name__ == "__main__":
