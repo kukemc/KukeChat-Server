@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import os
 import base64
+import hashlib
 from html import escape
 from contextlib import asynccontextmanager
 from collections.abc import AsyncGenerator
 from pathlib import Path, PurePosixPath
 
 from fastapi import Depends, FastAPI, Request
-from fastapi.responses import FileResponse, HTMLResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -390,9 +391,40 @@ async def ccw_userscript_meta() -> Response:
     return _ccw_asset("ccw.meta.js")
 
 
+_embed_md5_cache: tuple[tuple[int, int], str] | None = None
+
+
+def _embed_md5() -> str | None:
+    """界面包的 md5，按文件修改时间和大小缓存，不用每次请求都读 5MB。"""
+    global _embed_md5_cache
+    file = _CCW_ASSET_DIR / "kukechat.js"
+    try:
+        st = file.stat()
+    except OSError:
+        return None
+    key = (st.st_mtime_ns, st.st_size)
+    if _embed_md5_cache is None or _embed_md5_cache[0] != key:
+        _embed_md5_cache = (key, hashlib.md5(file.read_bytes()).hexdigest())
+    return _embed_md5_cache[1]
+
+
+@app.get("/embed/manifest.json", include_in_schema=False)
+async def ccw_embed_manifest() -> Response:
+    # 油猴脚本先问这里拿 md5，再按 /embed/kukechat.js?v=<md5> 加载：md5 不变浏览器就直接用缓存，不再下载也不再校验
+    md5 = _embed_md5()
+    if not md5:
+        return Response(status_code=404)
+    return JSONResponse({"md5": md5, "url": f"/embed/kukechat.js?v={md5}"}, headers={"Cache-Control": "no-cache"})
+
+
 @app.get("/embed/kukechat.js", include_in_schema=False)
-async def ccw_embed_bundle() -> Response:
-    return _ccw_asset("embed/kukechat.js")
+async def ccw_embed_bundle(request: Request) -> Response:
+    resp = _ccw_asset("embed/kukechat.js")
+    v = request.query_params.get("v")
+    if v and resp.status_code == 200 and v == _embed_md5():
+        # 地址里带着内容的 md5：内容变了地址就变，这个地址可以永久缓存
+        resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    return resp
 
 
 @app.get("/desktop-update.json", include_in_schema=False)
